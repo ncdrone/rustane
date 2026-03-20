@@ -80,10 +80,10 @@ fn test_generation_matches_hf() {
         .expect("load tokenizer");
 
     // Load HF reference
-    let ref_path = root.join("weights/references/generation_ref.json");
+    let ref_path = root.join("weights/references/greedy_generation.json");
     let ref_content = std::fs::read_to_string(&ref_path).expect("read generation ref");
     let ref_data: serde_json::Value = serde_json::from_str(&ref_content).expect("parse ref");
-    let ref_ids: Vec<u32> = ref_data["token_ids"]
+    let ref_generated: Vec<u32> = ref_data["generated_ids"]
         .as_array()
         .unwrap()
         .iter()
@@ -101,10 +101,6 @@ fn test_generation_matches_hf() {
     )
     .expect("generate");
 
-    // Compare token IDs (skip prompt tokens)
-    let encoding = tok.encode(prompt, false).expect("encode");
-    let prompt_len = encoding.get_ids().len();
-    let ref_generated = &ref_ids[prompt_len..];
     let our_generated = &output.token_ids;
 
     let match_count = ref_generated
