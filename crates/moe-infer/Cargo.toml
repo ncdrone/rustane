@@ -17,3 +17,4 @@ memmap2.workspace = true
 [dev-dependencies]
 objc2-foundation.workspace = true
 tempfile = "3"
+safetensors = "0.7"
