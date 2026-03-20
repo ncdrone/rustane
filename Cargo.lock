@@ -1213,6 +1213,7 @@ dependencies = [
  "moe-router",
  "objc2-foundation",
  "quantize",
+ "safetensors",
  "tempfile",
 ]
 
