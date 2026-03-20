@@ -46,15 +46,15 @@ pub struct AttentionSection {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct FfnSection {
-    /// Which layer index is dense (rest are MoE). Typically 0.
-    pub dense_layer: usize,
-    /// Dense FFN intermediate size.
-    pub dense_inter_size: usize,
+    /// If true, all layers are MoE (decoder_sparse_step=1).
+    #[serde(default)]
+    pub all_moe: bool,
     /// Per-expert MoE intermediate size.
     pub moe_inter_size: usize,
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
-    #[serde(default = "default_shared")]
+    /// Number of shared experts (0 = none, as in Qwen3-MoE-30B).
+    #[serde(default)]
     pub shared_expert_count: usize,
     #[serde(default)]
     pub norm_topk_prob: bool,
@@ -70,7 +70,6 @@ fn default_max_pos() -> usize { 40960 }
 fn default_bos() -> u32 { 151643 }
 fn default_eos() -> u32 { 151645 }
 fn default_rms_eps() -> f32 { 1e-6 }
-fn default_shared() -> usize { 1 }
 
 impl InferConfig {
     /// Load from a TOML file with nested [model], [attention], [ffn], [quantization] sections.
@@ -79,6 +78,12 @@ impl InferConfig {
             .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
         toml::from_str(&content)
             .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+    }
+
+    /// Whether a given layer is MoE (has experts).
+    pub fn is_moe_layer(&self, _layer: usize) -> bool {
+        // Qwen3-MoE-30B: all_moe=true, all 48 layers are MoE
+        self.ffn.all_moe
     }
 
     // Convenience accessors that flatten the nested structure
@@ -102,7 +107,6 @@ mod tests {
 
     #[test]
     fn parse_qwen3_toml() {
-        // Tests run from workspace root (cargo sets CARGO_MANIFEST_DIR)
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let ws_root = Path::new(&manifest).parent().unwrap().parent().unwrap();
         let config = InferConfig::from_toml(&ws_root.join("configs/qwen3-moe-30b.toml"))
@@ -115,14 +119,13 @@ mod tests {
         assert_eq!(config.attention.num_kv_heads, 4);
         assert_eq!(config.attention.head_dim, 128);
         assert_eq!(config.attention.rope_theta, 1_000_000.0);
-        assert_eq!(config.ffn.dense_layer, 0);
-        assert_eq!(config.ffn.dense_inter_size, 6144);
+        assert!(config.ffn.all_moe);
         assert_eq!(config.ffn.moe_inter_size, 768);
         assert_eq!(config.ffn.num_experts, 128);
         assert_eq!(config.ffn.num_experts_per_tok, 8);
-        assert_eq!(config.ffn.shared_expert_count, 1);
+        assert_eq!(config.ffn.shared_expert_count, 0);
         assert!(config.ffn.norm_topk_prob);
-        assert_eq!(config.quantization.bits, 4);
-        assert_eq!(config.quantization.group_size, 128);
+        assert!(config.is_moe_layer(0));
+        assert!(config.is_moe_layer(47));
     }
 }

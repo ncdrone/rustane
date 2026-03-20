@@ -25,7 +25,7 @@ fn test_embedding_load() {
 
 #[test]
 #[ignore = "requires converted weights"]
-fn test_layer_0_dense() {
+fn test_layer_0_moe() {
     let dir = ws_root().join(WEIGHTS_DIR);
     let weights = moe_infer::weights::BackboneWeights::load(&dir).expect("load backbone");
 
@@ -38,27 +38,19 @@ fn test_layer_0_dense() {
     assert_eq!(lw.q_norm.len(), 128); // head_dim
     assert_eq!(lw.k_norm.len(), 128);
 
-    // Layer 0 is dense
-    assert!(lw.gate_proj.is_some(), "layer 0 should have dense FFN gate_proj");
-    assert!(lw.up_proj.is_some());
-    assert!(lw.down_proj.is_some());
-    assert!(lw.router.is_none(), "layer 0 should NOT have router");
+    // ALL layers are MoE (decoder_sparse_step=1)
+    assert_eq!(lw.router.len(), 128 * 2048, "router should be [128, 2048]");
 }
 
 #[test]
 #[ignore = "requires converted weights"]
-fn test_layer_1_moe() {
+fn test_layer_47_moe() {
     let dir = ws_root().join(WEIGHTS_DIR);
     let weights = moe_infer::weights::BackboneWeights::load(&dir).expect("load backbone");
 
-    let lw = weights.layer_weights(1).expect("layer 1 weights");
+    let lw = weights.layer_weights(47).expect("layer 47 weights");
     assert_eq!(lw.input_norm.len(), 2048);
-    assert_eq!(lw.q_proj.len(), 4096 * 2048);
-
-    // Layer 1 is MoE
-    assert!(lw.router.is_some(), "MoE layer should have router");
-    assert!(lw.shared_gate_proj.is_some(), "MoE layer should have shared expert");
-    assert!(lw.gate_proj.is_none(), "MoE layer should NOT have dense FFN");
+    assert_eq!(lw.router.len(), 128 * 2048, "last layer should also have router");
 }
 
 #[test]
@@ -80,9 +72,9 @@ fn test_expert_file_exists() {
     let dir = ws_root().join(WEIGHTS_DIR);
     let weights = moe_infer::weights::BackboneWeights::load(&dir).expect("load backbone");
 
-    // Layer 1 should have an expert file
-    let mmap = weights.expert_mmap(1);
-    assert!(mmap.is_some(), "layer 1 should have expert file");
+    // Layer 0 should have an expert file (all layers are MoE)
+    let mmap = weights.expert_mmap(0);
+    assert!(mmap.is_some(), "layer 0 should have expert file");
     let mmap = mmap.unwrap();
 
     // Verify stride: 128 experts, each with gate+up+down

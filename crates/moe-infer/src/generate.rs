@@ -65,45 +65,8 @@ impl Model {
     }
 }
 
-/// Dense FFN forward: SiLU(x @ gate) * (x @ up) then @ down
-fn dense_ffn(x: &[f32], lw: &LayerWeights<'_>, hidden: usize, inter: usize) -> Vec<f32> {
-    let gate = lw.gate_proj.expect("dense layer needs gate_proj");
-    let up = lw.up_proj.expect("dense layer needs up_proj");
-    let down = lw.down_proj.expect("dense layer needs down_proj");
-
-    let gate_out = matvec_f16(gate, x, inter, hidden);
-    let up_out = matvec_f16(up, x, inter, hidden);
-
-    // SiLU(gate) * up
-    let mut activated = vec![0.0f32; inter];
-    for i in 0..inter {
-        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp()); // SiLU = x * sigmoid(x)
-        activated[i] = silu * up_out[i];
-    }
-
-    matvec_f16(down, &activated, hidden, inter)
-}
-
-/// Shared expert FFN (same structure as dense but uses shared_* weights).
-fn shared_expert_ffn(x: &[f32], lw: &LayerWeights<'_>, hidden: usize, inter: usize) -> Vec<f32> {
-    let gate = lw.shared_gate_proj.expect("MoE layer needs shared gate");
-    let up = lw.shared_up_proj.expect("MoE layer needs shared up");
-    let down = lw.shared_down_proj.expect("MoE layer needs shared down");
-
-    let gate_out = matvec_f16(gate, x, inter, hidden);
-    let up_out = matvec_f16(up, x, inter, hidden);
-
-    let mut activated = vec![0.0f32; inter];
-    for i in 0..inter {
-        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
-        activated[i] = silu * up_out[i];
-    }
-
-    matvec_f16(down, &activated, hidden, inter)
-}
-
-/// MoE FFN: route + dispatch experts + shared expert.
-/// For now, CPU-only quantized expert dispatch via pack4 GEMV.
+/// MoE FFN: route + dispatch top-k experts (all layers are MoE).
+/// CPU-only quantized expert dispatch via pack4 GEMV.
 fn moe_ffn(
     x: &[f32],
     lw: &LayerWeights<'_>,
@@ -115,8 +78,7 @@ fn moe_ffn(
     group_size: usize,
 ) -> Vec<f32> {
     // 1. Router gate logits
-    let router_w = lw.router.expect("MoE layer needs router");
-    let gate_logits = matvec_f16(router_w, x, num_experts, hidden);
+    let gate_logits = matvec_f16(lw.router, x, num_experts, hidden);
 
     // 2. Route (softmax for Qwen3)
     let route = router.route_softmax(&gate_logits);
@@ -153,12 +115,6 @@ fn moe_ffn(
                 combined[d] += weight * expert_out[d];
             }
         }
-    }
-
-    // 4. Shared expert (always runs, f16 weights in backbone)
-    let shared_out = shared_expert_ffn(x, lw, hidden, moe_inter);
-    for d in 0..hidden {
-        combined[d] += shared_out[d];
     }
 
     combined
@@ -294,23 +250,18 @@ pub fn run_layer(
     // 2. RMSNorm → FFN → Residual
     let normed2 = rmsnorm(&residual, &post_norm_gamma, eps);
 
-    let ffn_out = if layer == model.config.ffn.dense_layer {
-        // Dense FFN (layer 0)
-        dense_ffn(&normed2, &lw, hidden, model.config.ffn.dense_inter_size)
-    } else {
-        // MoE FFN (layers 1-47)
-        let expert_mmap = model.weights.expert_mmap(layer);
-        moe_ffn(
-            &normed2,
-            &lw,
-            expert_mmap,
-            router,
-            hidden,
-            model.config.moe_inter_size(),
-            model.config.num_experts(),
-            model.config.quantization.group_size,
-        )
-    };
+    // All layers are MoE (decoder_sparse_step=1)
+    let expert_mmap = model.weights.expert_mmap(layer);
+    let ffn_out = moe_ffn(
+        &normed2,
+        &lw,
+        expert_mmap,
+        router,
+        hidden,
+        model.config.moe_inter_size(),
+        model.config.num_experts(),
+        model.config.quantization.group_size,
+    );
 
     for d in 0..hidden {
         residual[d] += ffn_out[d];

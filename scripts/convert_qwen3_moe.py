@@ -385,34 +385,13 @@ def write_backbone(loader: ShardedTensorLoader, output_dir: Path, max_layers: in
             f.write(data)
             record(name, [HEAD_DIM], "f32", len(data))
 
-            # FFN weights -- dense (layer 0) vs MoE (layers 1-47)
-            if layer == 0:
-                # Dense MLP: gate_proj, up_proj, down_proj as f16
-                for proj in ["gate_proj", "up_proj", "down_proj"]:
-                    name = f"{prefix}.mlp.{proj}.weight"
-                    t = loader.get_tensor(name)
-                    data = to_f16_bytes(t)
-                    f.write(data)
-                    shape = list(t.shape)
-                    record(name, shape, "f16", len(data))
-                    print(f"    {proj}: {shape} f16")
-            else:
-                # MoE layer: gate (router) + shared expert in backbone
-                # Router gate: [num_experts, hidden_size] as f16
-                name = f"{prefix}.mlp.gate.weight"
-                t = loader.get_tensor(name)
-                data = to_f16_bytes(t)
-                f.write(data)
-                record(name, [NUM_EXPERTS, HIDDEN_SIZE], "f16", len(data))
-
-                # Shared expert: gate_proj, up_proj, down_proj as f16
-                for proj in ["gate_proj", "up_proj", "down_proj"]:
-                    name = f"{prefix}.mlp.shared_expert.{proj}.weight"
-                    t = loader.get_tensor(name)
-                    data = to_f16_bytes(t)
-                    f.write(data)
-                    shape = list(t.shape)
-                    record(name, shape, "f16", len(data))
+            # ALL layers are MoE (decoder_sparse_step=1, no shared experts)
+            # Router gate: [num_experts, hidden_size] as f16
+            name = f"{prefix}.mlp.gate.weight"
+            t = loader.get_tensor(name)
+            data = to_f16_bytes(t)
+            f.write(data)
+            record(name, [NUM_EXPERTS, HIDDEN_SIZE], "f16", len(data))
 
             print(f"    layer {layer} done, offset={offset:,}")
 
@@ -558,8 +537,8 @@ def main():
     print(f"  up_proj packed:   {up_sz:,} bytes  [{MOE_INTER_SIZE}x{HIDDEN_SIZE}]")
     print(f"  down_proj packed: {down_sz:,} bytes  [{HIDDEN_SIZE}x{MOE_INTER_SIZE}]")
     print(f"  Per-layer experts file: {NUM_EXPERTS * stride / 1e6:.1f} MB")
-    print(f"  Total expert files ({max_layers - 1} MoE layers): "
-          f"{(max_layers - 1) * NUM_EXPERTS * stride / 1e9:.2f} GB")
+    print(f"  Total expert files ({max_layers} MoE layers): "
+          f"{max_layers * NUM_EXPERTS * stride / 1e9:.2f} GB")
 
     # Validate config.json is present
     config_path = model_dir / "config.json"
@@ -629,7 +608,7 @@ def main():
     print(f"\nPhase 1 complete in {time.time() - t1:.1f}s")
 
     # -----------------------------------------------------------------------
-    # Phase 2: layer_XX_experts.bin (skip layer 0 which is dense)
+    # Phase 2: layer_XX_experts.bin (ALL layers are MoE)
     # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("Phase 2: Expert weight files (4-bit quantized)")
@@ -637,7 +616,7 @@ def main():
     t2 = time.time()
 
     all_expert_stats = []
-    for layer in range(1, max_layers):  # skip layer 0 (dense)
+    for layer in range(0, max_layers):  # all layers are MoE
         print(f"\n--- Layer {layer} ---")
         t_layer = time.time()
         stats = write_expert_layer(loader, layer, output_dir, args.verify_experts)

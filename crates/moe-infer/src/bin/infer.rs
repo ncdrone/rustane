@@ -82,9 +82,11 @@ fn main() {
         config.attention.kind, config.num_q_heads(), config.num_kv_heads(), config.head_dim());
     println!("  rope_theta: {:.0}", config.rope_theta());
     println!("  experts: {} (top-{})", config.num_experts(), config.num_experts_per_tok());
-    println!("  dense layer: {} (inter_size={})", config.ffn.dense_layer, config.ffn.dense_inter_size);
+    println!("  all layers MoE: {}", config.ffn.all_moe);
     println!("  moe expert FFN dim: {}", config.moe_inter_size());
-    println!("  shared experts: {}", config.ffn.shared_expert_count);
+    if config.ffn.shared_expert_count > 0 {
+        println!("  shared experts: {}", config.ffn.shared_expert_count);
+    }
     println!("  quantization: {}-bit, group_size={}", config.quantization.bits, config.quantization.group_size);
     println!("  vocab: {}", config.vocab_size());
     println!();

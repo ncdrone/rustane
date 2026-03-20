@@ -30,6 +30,7 @@ pub struct BackboneWeights {
 }
 
 /// Weights for a single transformer layer (zero-copy slices).
+/// All 48 layers are MoE in Qwen3-MoE-30B (decoder_sparse_step=1).
 pub struct LayerWeights<'a> {
     pub input_norm: &'a [f32],
     pub post_attn_norm: &'a [f32],
@@ -39,15 +40,8 @@ pub struct LayerWeights<'a> {
     pub o_proj: &'a [f16],
     pub q_norm: &'a [f32],
     pub k_norm: &'a [f32],
-    // Dense FFN (layer 0 only)
-    pub gate_proj: Option<&'a [f16]>,
-    pub up_proj: Option<&'a [f16]>,
-    pub down_proj: Option<&'a [f16]>,
-    // MoE (layers 1-47)
-    pub router: Option<&'a [f16]>,
-    pub shared_gate_proj: Option<&'a [f16]>,
-    pub shared_up_proj: Option<&'a [f16]>,
-    pub shared_down_proj: Option<&'a [f16]>,
+    // MoE router (all layers)
+    pub router: &'a [f16],
 }
 
 impl BackboneWeights {
@@ -158,28 +152,8 @@ impl BackboneWeights {
         let q_norm = self.tensor_f32(&format!("{prefix}.self_attn.q_norm.weight"))?;
         let k_norm = self.tensor_f32(&format!("{prefix}.self_attn.k_norm.weight"))?;
 
-        // Dense FFN (layer 0)
-        let (gate_proj, up_proj, down_proj) = if layer == 0 {
-            (
-                Some(self.tensor_f16(&format!("{prefix}.mlp.gate_proj.weight"))?),
-                Some(self.tensor_f16(&format!("{prefix}.mlp.up_proj.weight"))?),
-                Some(self.tensor_f16(&format!("{prefix}.mlp.down_proj.weight"))?),
-            )
-        } else {
-            (None, None, None)
-        };
-
-        // MoE (layers 1-47)
-        let (router, shared_gate, shared_up, shared_down) = if layer > 0 {
-            (
-                Some(self.tensor_f16(&format!("{prefix}.mlp.gate.weight"))?),
-                Some(self.tensor_f16(&format!("{prefix}.mlp.shared_expert.gate_proj.weight"))?),
-                Some(self.tensor_f16(&format!("{prefix}.mlp.shared_expert.up_proj.weight"))?),
-                Some(self.tensor_f16(&format!("{prefix}.mlp.shared_expert.down_proj.weight"))?),
-            )
-        } else {
-            (None, None, None, None)
-        };
+        // All layers are MoE — router gate weight
+        let router = self.tensor_f16(&format!("{prefix}.mlp.gate.weight"))?;
 
         Ok(LayerWeights {
             input_norm,
@@ -190,13 +164,7 @@ impl BackboneWeights {
             o_proj,
             q_norm,
             k_norm,
-            gate_proj,
-            up_proj,
-            down_proj,
             router,
-            shared_gate_proj: shared_gate,
-            shared_up_proj: shared_up,
-            shared_down_proj: shared_down,
         })
     }
 
