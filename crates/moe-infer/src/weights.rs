@@ -15,10 +15,22 @@ use std::path::Path;
 #[derive(Clone, Debug, Deserialize)]
 pub struct TensorInfo {
     pub offset: usize,
-    pub size: usize,
     /// "f16" or "f32"
     pub dtype: String,
     pub shape: Vec<usize>,
+}
+
+impl TensorInfo {
+    /// Compute byte size from shape and dtype.
+    pub fn size_bytes(&self) -> usize {
+        let elems: usize = self.shape.iter().product();
+        let elem_size = match self.dtype.as_str() {
+            "f16" => 2,
+            "f32" => 4,
+            _ => panic!("unsupported dtype: {}", self.dtype),
+        };
+        elems * elem_size
+    }
 }
 
 /// Memory-mapped backbone weights.
@@ -80,11 +92,12 @@ impl BackboneWeights {
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         let info = self.index.get(name)
             .with_context(|| format!("tensor not found: {name}"))?;
-        if info.offset + info.size > self.mmap.len() {
-            bail!("tensor {name} out of bounds: offset={} size={} file_len={}",
-                info.offset, info.size, self.mmap.len());
+        let size = info.size_bytes();
+        if info.offset + size > self.mmap.len() {
+            bail!("tensor {name} out of bounds: offset={} size={size} file_len={}",
+                info.offset, self.mmap.len());
         }
-        Ok(&self.mmap[info.offset..info.offset + info.size])
+        Ok(&self.mmap[info.offset..info.offset + size])
     }
 
     /// Get tensor as f16 slice.
