@@ -201,9 +201,9 @@
 
 ---
 
-## Stage 2 (NEW): First Tokens from Qwen3-MoE-30B — COMPLETE
+## Stage 2 Post-Mortem: First Tokens from Qwen3-MoE-30B — COMPLETE (2026-03-20)
 
-> Date: 2026-03-20. Branch: `rustane-infer` (8 new commits).
+> Date: 2026-03-20 15:51 PST. Branch: `rustane-infer` (8 new commits).
 > Goal: Generate real tokens, measure tok/s.
 > Acceptance test: greedy output matches HuggingFace for 20 tokens.
 
