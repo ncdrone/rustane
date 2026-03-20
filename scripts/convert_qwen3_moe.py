@@ -111,7 +111,7 @@ def open_shard(model_dir: Path, shard_name: str):
     path = model_dir / shard_name
     if not path.exists():
         raise FileNotFoundError(f"Shard not found: {path}")
-    return safe_open(str(path), framework="numpy")
+    return safe_open(str(path), framework="pt")
 
 
 class ShardedTensorLoader:
@@ -139,12 +139,16 @@ class ShardedTensorLoader:
         return self._shard_cache[shard_name]
 
     def get_tensor(self, name: str) -> np.ndarray:
-        """Load a tensor by name, returning numpy array."""
+        """Load a tensor by name, returning numpy float32 array.
+
+        Handles bf16 → f32 conversion (numpy doesn't support bf16).
+        """
         if name not in self.weight_map:
             raise KeyError(f"Tensor '{name}' not found in any shard")
         shard_name = self.weight_map[name]
         handle = self._get_shard(shard_name)
-        return handle.get_tensor(name)
+        tensor = handle.get_tensor(name)  # torch tensor (may be bf16)
+        return tensor.float().numpy()  # always return f32 numpy
 
     def has_tensor(self, name: str) -> bool:
         return name in self.weight_map
