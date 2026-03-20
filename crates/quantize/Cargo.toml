@@ -1,0 +1,10 @@
+[package]
+name = "quantize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+half.workspace = true
+
+[dev-dependencies]

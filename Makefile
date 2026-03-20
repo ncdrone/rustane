@@ -3,7 +3,9 @@
 # Run `make help` to see all available targets.
 
 .PHONY: help build test sweep-600m sweep-1b sweep-3b sweep-5b sweep-full \
-	forward-ladder forward-ceiling forward-7b forward-10b train-600m
+	forward-ladder forward-ceiling forward-7b forward-10b train-600m \
+	infer-test infer-bench-decode infer-bench-prefill infer-bench-dequant infer-bench-pread \
+	infer-pipeline-30b infer-quality
 
 help: ## Show this help
 	@echo "  Rustane — available commands:"
@@ -26,6 +28,15 @@ help: ## Show this help
 	@echo ""
 	@echo "  Training on real data:"
 	@echo "  make train-600m DATA=/path/to/train.bin"
+	@echo ""
+	@echo "  MoE inference:"
+	@echo "  make infer-test             Run all inference unit + integration tests"
+	@echo "  make infer-bench-decode     Decode tok/s benchmark (needs weights)"
+	@echo "  make infer-bench-prefill    Prefill tok/s benchmark (needs weights)"
+	@echo "  make infer-bench-dequant    Metal dequant GiB/s benchmark"
+	@echo "  make infer-bench-pread      SSD pread throughput benchmark"
+	@echo "  make infer-pipeline-30b     Qwen3-MoE-30B end-to-end (needs weights)"
+	@echo "  make infer-quality          Perplexity + MMLU quality checks (needs weights)"
 
 build: ## Build all crates
 	cargo build
@@ -63,6 +74,34 @@ forward-7b: ## Single forward pass at 7B (~30s, needs 31GB)
 
 forward-10b: ## Single forward pass at 10B (~45s, needs 46GB)
 	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b
+
+# ── MoE inference ──────────────────────────────────────────────────
+
+infer-test: ## Run all inference unit + integration tests
+	cargo test -p quantize --release && \
+	cargo test -p expert-pager --release && \
+	cargo test -p moe-router --release && \
+	cargo test -p moe-kernels --release && \
+	cargo test -p moe-infer --release
+
+infer-bench-decode: ## Decode tok/s benchmark (needs converted weights)
+	cargo test -p moe-infer --test bench_decode --release -- --ignored --nocapture
+
+infer-bench-prefill: ## Prefill tok/s benchmark (needs converted weights)
+	cargo test -p moe-infer --test bench_prefill --release -- --ignored --nocapture
+
+infer-bench-dequant: ## Metal dequant GiB/s benchmark
+	cargo test -p moe-infer --test bench_dequant --release -- --ignored --nocapture
+
+infer-bench-pread: ## SSD pread throughput benchmark
+	cargo test -p moe-infer --test bench_pread --release -- --ignored --nocapture
+
+infer-pipeline-30b: ## Qwen3-MoE-30B end-to-end pipeline (needs converted weights)
+	cargo test -p moe-infer --test pipeline_qwen30b --release -- --ignored --nocapture
+
+infer-quality: ## Perplexity + MMLU quality checks (needs weights + eval data)
+	cargo test -p moe-infer --test quality_perplexity --release -- --ignored --nocapture && \
+	cargo test -p moe-infer --test quality_mmlu --release -- --ignored --nocapture
 
 # ── Real data training ───────────────────────────────────────────────
 

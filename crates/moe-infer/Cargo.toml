@@ -1,0 +1,19 @@
+[package]
+name = "moe-infer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quantize = { path = "../quantize" }
+expert-pager = { path = "../expert-pager" }
+moe-router = { path = "../moe-router" }
+moe-kernels = { path = "../moe-kernels" }
+ane-bridge = { path = "../ane-bridge" }
+metal-decode = { path = "../metal-decode" }
+half.workspace = true
+memmap2.workspace = true
+
+[dev-dependencies]
+objc2-foundation.workspace = true
+tempfile = "3"

@@ -471,7 +471,6 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "ane-bridge",
- "libc",
  "memmap2",
  "metal-decode",
  "objc2",
@@ -502,6 +501,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "expert-pager"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -1193,6 +1201,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "moe-infer"
+version = "0.1.0"
+dependencies = [
+ "ane-bridge",
+ "expert-pager",
+ "half",
+ "memmap2",
+ "metal-decode",
+ "moe-kernels",
+ "moe-router",
+ "objc2-foundation",
+ "quantize",
+ "tempfile",
+]
+
+[[package]]
+name = "moe-kernels"
+version = "0.1.0"
+dependencies = [
+ "ane-bridge",
+ "half",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "quantize",
+]
+
+[[package]]
+name = "moe-router"
+version = "0.1.0"
+dependencies = [
+ "half",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1487,6 +1530,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quantize"
+version = "0.1.0"
+dependencies = [
+ "half",
 ]
 
 [[package]]

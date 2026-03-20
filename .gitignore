@@ -11,3 +11,4 @@ models/
 .env
 .DS_Store
 data/
+weights/

@@ -4,6 +4,11 @@ members = [
     "crates/ane-bridge",
     "crates/metal-decode",
     "crates/engine",
+    "crates/quantize",
+    "crates/expert-pager",
+    "crates/moe-router",
+    "crates/moe-kernels",
+    "crates/moe-infer",
 ]
 
 [workspace.package]

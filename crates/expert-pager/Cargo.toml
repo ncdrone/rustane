@@ -1,0 +1,12 @@
+[package]
+name = "expert-pager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,47 @@
+# Target 1T MoE — Kimi-K2 / DeepSeek-V3 class
+# ~1.04T total params, ~32B active per token (top-8 + 1 shared)
+# M4 Max 128GB target: 4-bit hot experts, 2-bit cold experts
+
+[model]
+name = "target-1T-moe"
+architecture = "deepseek_v3_moe"
+
+hidden_size = 7168
+intermediate_size = 18432         # shared expert FFN
+num_hidden_layers = 61
+num_attention_heads = 56
+num_key_value_heads = 8
+head_dim = 128
+vocab_size = 129280
+max_position_embeddings = 131072
+rms_norm_eps = 1e-6
+rope_theta = 10000000.0
+tie_word_embeddings = false
+
+[moe]
+num_experts = 384
+num_experts_per_tok = 8
+num_shared_experts = 1
+moe_intermediate_size = 2048     # per-expert FFN intermediate dim
+norm_topk_prob = false            # DeepSeek uses sigmoid, not softmax
+first_k_dense_replace = 3        # first 3 layers are dense (no MoE)
+
+[attention]
+# Multi-Latent Attention (MLA)
+qk_nope_head_dim = 128
+qk_rope_head_dim = 64
+kv_lora_rank = 512               # compressed KV latent dim
+v_head_dim = 128
+
+[quantization]
+bits = 4
+group_size = 128
+cold_expert_bits = 2             # 2-bit palettized for cold experts
+
+[memory]
+# Budget for M4 Max 128GB
+kv_cache_budget_gb = 8
+expert_cache_budget_gb = 40
+attention_resident_gb = 12
+shared_expert_resident_gb = 4
+# Remaining: ~64 GB for OS + page cache

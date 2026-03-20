@@ -1,0 +1,15 @@
+[package]
+name = "moe-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quantize = { path = "../quantize" }
+ane-bridge = { path = "../ane-bridge" }
+half.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+
+[dev-dependencies]
