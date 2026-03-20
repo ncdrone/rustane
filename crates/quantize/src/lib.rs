@@ -4,5 +4,7 @@
 //! Pack 8 nibbles per u32, LSB-first.
 
 pub mod pack4;
+pub mod pack2;
 
 pub use pack4::PackedWeights4Bit;
+pub use pack2::PackedWeights2Bit;
