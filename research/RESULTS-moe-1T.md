@@ -201,22 +201,79 @@
 
 ---
 
+## Stage 2 (NEW): First Tokens from Qwen3-MoE-30B — COMPLETE
+
+> Date: 2026-03-20. Branch: `rustane-infer` (8 new commits).
+> Goal: Generate real tokens, measure tok/s.
+> Acceptance test: greedy output matches HuggingFace for 20 tokens.
+
+### Architecture corrections discovered during execution:
+- **ALL 48 layers are MoE** — `decoder_sparse_step=1`, `mlp_only_layers=[]`. No dense layer 0.
+- **No shared experts** — zero `shared_expert` keys in the safetensors. The plan's shared_expert assumption was wrong.
+- **GQA confirmed** — 32 Q heads, 4 KV heads, head_dim=128, RoPE theta=1e6 neox-style.
+- **QK-norm confirmed** — per-head RMSNorm on Q and K before attention scores.
+
+### New modules:
+| Module | Lines | Function |
+|--------|-------|----------|
+| `attention.rs` | 253 | GQA forward: RoPE + QK-norm + causal mask + softmax |
+| `rmsnorm.rs` | 80 | RMSNorm + per-head QK-norm (eps=1e-6) |
+| `kv_cache.rs` | 108 | GQA KV cache (48 layers × 4 KV heads) |
+| `weights.rs` | 198 | mmap backbone loader with zero-copy f16 slices |
+| `generate.rs` | 295 | Full decode loop: embed → 48 layers → LM head → sample |
+| `config.rs` | 129 | Rewritten with toml + serde deserialization |
+| `convert_qwen3_moe.py` | 691 | Safetensors → backbone.bin + expert files (4-bit) |
+| `generate_references.py` | 275 | HF reference tensors for validation |
+
+### Test results (44 tests, all pass):
+| Group | Count | Status |
+|-------|-------|--------|
+| RMSNorm | 4 | All pass |
+| KV Cache | 4 | All pass |
+| RoPE + GQA Attention | 8 | All pass (includes real-weight forward) |
+| Config Parser | 1 | Pass |
+| Nibble Packing | 4 | All pass |
+| MoE Router | 13 | All pass (includes new softmax routing) |
+| Weight Loader | 5 | All pass (real mmap'd weights) |
+| Tokenizer | 2 | All pass (HF tokenizer roundtrip) |
+| **Generation** | **3** | **All pass** |
+
+### Acceptance test result:
+```
+Prompt: "The capital of France is"
+Output: " Paris. The capital of the United Kingdom is London.
+         The capital of the United States is Washington,"
+
+Token match: 20/20 (exact match with HuggingFace transformers greedy)
+Token IDs: [12095, 13, 576, 6722, 315, 279, 3639, 15072, 374, 7148,
+            13, 576, 6722, 315, 279, 3639, 4180, 374, 6515, 11]
+```
+
+### Benchmark:
+| Metric | Result | Notes |
+|--------|--------|-------|
+| tok/s (CPU-only) | 0.4 | 48 MoE layers × CPU dequant GEMV |
+| Quant error (full model) | 0.049 max | 4-bit asymmetric, group_size=128 |
+| Converted model size | 18.48 GB | backbone 1.32 GB + 48 × 320 MB experts |
+| Weight conversion time | ~90s | All 48 layers, bf16 → 4-bit |
+| Time to first token | ~13.7s | CPU attention + CPU expert FFN |
+
+---
+
 ## What's NOT Done (Gaps → Production)
 
-### Critical path to tok/s on real model:
-1. **Tokenizer** — need BPE encode/decode (flash-moe uses C single-header tokenizer)
-2. **Attention compute** — MLA projections exist but attention scores + softmax not wired
-3. **Full safetensors converter** — extract all 48 layers + non-expert weights (gate, shared expert, attention, embeddings, LM head)
-4. **Fused Metal kernels** — gate+up+SwiGLU in single dispatch (flash-moe: +12% from FMA kernel)
-5. **3-stage CMD buffer pipeline** — overlap GPU/CPU/SSD like flash-moe
-6. **Non-expert weight loading** — embeddings, attention weights, layer norms, LM head (5.5 GB mmap'd)
+### Critical path to 25-30 tok/s:
+1. **Metal GEMV for expert dispatch** — CPU dequant is the bottleneck (0.4 → 25-30 tok/s expected)
+2. **Fused Metal kernels** — gate+up+SwiGLU in single dispatch (flash-moe: +12% from FMA kernel)
+3. **3-stage CMD buffer pipeline** — overlap GPU/CPU/SSD
+4. **Batch expert dispatch** — all 8 experts in one Metal pass
 
 ### Important but not blocking:
 - Delta patching (Orion-style ANE weight reloading)
 - 2MB-aligned pread buffers (flash-moe: 3.6x DMA speedup)
-- Shared expert (always-active, RAM-resident)
-- Quality benchmarks (MMLU, perplexity) — need full model
+- Quality benchmarks (MMLU, perplexity)
 - Speculative decoding evaluation
+- ANE attention fusion (Stage 3 target)
 
 ### Learned from flash-moe (58 experiments):
 - **Trust OS page cache** — all custom caching was slower (delete our LRU for production)
@@ -226,6 +283,11 @@
 - **FMA kernel reorder** — `fma(nibble, scale*x, bias*x)` saves 1 mult per value (+12%)
 - **Serial GPU→SSD→GPU is optimal** — unified memory bus can't overlap DMA + GPU
 
+### Learned from Stage 2 execution:
+- **Always inspect actual safetensors** before trusting config.json commentary. `decoder_sparse_step=1` means ALL layers are MoE, but our plan assumed layer 0 was dense.
+- **bf16 requires torch for loading** — numpy can't read bfloat16 safetensors. Use `framework='pt'` with safe_open.
+- **Model fits in 128GB RAM at 4-bit** — no SSD streaming needed for Qwen3-30B. The pager/streamer infrastructure is for 700B+ models.
+
 ---
 
 ## Test Summary
@@ -234,11 +296,11 @@
 |-------|-------|--------|
 | engine | 28 unit + 40+ integration | All pass |
 | quantize | 12 (8 pack4 + 4 pack2) | All pass |
-| moe-router | 11 (3 inline + 8 integration) | All pass |
+| moe-router | 13 (5 inline + 8 integration) | All pass |
 | expert-pager | 10 (7 pool + 3 loader) | All pass |
 | moe-kernels | 0 (tests in moe-infer) | N/A |
-| moe-infer | 45+ (unit + integration + benchmark + E2E) | All pass |
-| **Total** | **100+** | **0 failures** |
+| moe-infer | 44 (13 lib + 4 nibble + 5 weights + 2 tok + 8 attn + 3 gen + 9 legacy) | All pass |
+| **Total** | **110+** | **0 failures** |
 
 ---
 
