@@ -7,6 +7,9 @@
 
 pub mod pool;
 pub mod loader;
+pub mod convert;
+pub mod prefetch;
 
 pub use pool::ExpertPool;
 pub use loader::ExpertLoader;
+pub use prefetch::ExpertPrefetcher;
