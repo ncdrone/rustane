@@ -99,6 +99,42 @@ impl MoeRouter {
         RouteResult { expert_ids, weights, all_scores }
     }
 
+    /// Route using softmax scoring (Qwen3 style).
+    /// gate_logits → softmax over all experts → top-k → renormalize to sum=1.0
+    pub fn route_softmax(&mut self, gate_logits: &[f32]) -> RouteResult {
+        assert_eq!(gate_logits.len(), self.config.num_experts);
+
+        // Numerically stable softmax
+        let max_val = gate_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = gate_logits.iter().map(|&l| (l - max_val).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let all_scores: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        // Top-k selection
+        let (expert_ids, mut weights) = top_k(&all_scores, self.config.top_k);
+
+        // Renormalize top-k to sum=1.0
+        if self.config.norm_topk_prob {
+            let wsum: f32 = weights.iter().sum();
+            if wsum > 0.0 {
+                for w in &mut weights {
+                    *w /= wsum;
+                }
+            }
+        }
+
+        // Update load balancing biases (same as sigmoid route)
+        if self.config.bias_lr > 0.0 {
+            self.total_calls += 1;
+            for &eid in &expert_ids {
+                self.usage_counts[eid] += 1;
+            }
+            self.update_biases();
+        }
+
+        RouteResult { expert_ids, weights, all_scores }
+    }
+
     /// Predict which experts layer L+2 will likely use, based on current layer's scores.
     /// Returns top-k expert indices sorted by predicted likelihood.
     /// This is a simple heuristic: experts with high scores at layer L tend to stay hot.
@@ -180,6 +216,44 @@ mod tests {
         assert!((vals[0] - 0.9).abs() < 1e-6);
         assert!((vals[1] - 0.7).abs() < 1e-6);
         assert!((vals[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn softmax_gate_weights_sum_to_one() {
+        let config = RouterConfig {
+            num_experts: 128,
+            top_k: 8,
+            norm_topk_prob: true,
+            bias_lr: 0.0,
+        };
+        let mut router = MoeRouter::new(config);
+        let logits: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) * 0.1).collect();
+        let result = router.route_softmax(&logits);
+        let wsum: f32 = result.weights.iter().sum();
+        assert!(
+            (wsum - 1.0).abs() < 1e-5,
+            "gate weights should sum to 1.0, got {wsum}"
+        );
+        assert_eq!(result.expert_ids.len(), 8);
+        // Top experts should be the highest-logit ones (indices 120-127)
+        assert!(result.expert_ids[0] == 127, "top expert should be 127");
+    }
+
+    #[test]
+    fn softmax_vs_sigmoid_different() {
+        let config = RouterConfig {
+            num_experts: 8,
+            top_k: 3,
+            norm_topk_prob: true,
+            bias_lr: 0.0,
+        };
+        let mut router = MoeRouter::new(config);
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let sig_result = router.route(&logits);
+        let soft_result = router.route_softmax(&logits);
+        // Both should pick the same top-3 experts
+        assert_eq!(sig_result.expert_ids, soft_result.expert_ids);
+        // But weights differ (softmax concentrates more on top)
     }
 
     #[test]

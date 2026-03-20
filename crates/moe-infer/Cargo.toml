@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+mla = []
+
 [dependencies]
 quantize = { path = "../quantize" }
 expert-pager = { path = "../expert-pager" }
@@ -13,6 +17,13 @@ ane-bridge = { path = "../ane-bridge" }
 metal-decode = { path = "../metal-decode" }
 half.workspace = true
 memmap2.workspace = true
+libc.workspace = true
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokenizers = "0.21"
+rand = "0.9"
 
 [dev-dependencies]
 objc2-foundation.workspace = true

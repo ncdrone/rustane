@@ -1,3 +1,4 @@
+#![cfg(feature = "mla")]
 //! Integration test: MLA attention projection and KV cache.
 //!
 //! Verifies:

@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   cargo run -p moe-infer --release --bin infer -- --config configs/qwen3-moe-30b.toml --benchmark
-//!   cargo run -p moe-infer --release --bin infer -- --config configs/target-1t.toml --interactive
+//!   cargo run -p moe-infer --release --bin infer -- --config configs/qwen3-moe-30b.toml --prompt "Hello"
 
 use moe_infer::config::InferConfig;
 use std::path::Path;
@@ -11,6 +11,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let mut config_path = None;
+    let mut weights_dir = None;
+    let mut prompt = None;
     let mut mode = "benchmark";
     let mut i = 1;
     while i < args.len() {
@@ -19,18 +21,27 @@ fn main() {
                 i += 1;
                 config_path = Some(args[i].clone());
             }
+            "--weights" => {
+                i += 1;
+                weights_dir = Some(args[i].clone());
+            }
+            "--prompt" => {
+                i += 1;
+                prompt = Some(args[i].clone());
+                mode = "generate";
+            }
             "--benchmark" => mode = "benchmark",
-            "--interactive" => mode = "interactive",
             "--help" | "-h" => {
                 println!("rustane MoE inference engine");
                 println!();
                 println!("Usage:");
-                println!("  infer --config <path.toml> [--benchmark|--interactive]");
+                println!("  infer --config <path.toml> [--benchmark|--prompt <text>]");
                 println!();
                 println!("Options:");
-                println!("  --config <path>   TOML model config file");
-                println!("  --benchmark       Run decode throughput benchmark (default)");
-                println!("  --interactive     Interactive text generation");
+                println!("  --config <path>     TOML model config file");
+                println!("  --weights <dir>     Converted weights directory");
+                println!("  --benchmark         Run decode throughput benchmark (default)");
+                println!("  --prompt <text>     Generate text from prompt");
                 return;
             }
             other => {
@@ -51,34 +62,39 @@ fn main() {
         std::process::exit(1);
     });
 
-    println!("Model: {}", config.model_name);
-    println!("  hidden_size: {}", config.hidden_size);
-    println!("  layers: {}", config.num_hidden_layers);
-    println!("  experts: {} (top-{})", config.num_experts, config.num_experts_per_tok);
-    println!("  expert FFN dim: {}", config.moe_intermediate_size);
-    println!("  quantization: {}-bit, group_size={}", config.bits, config.group_size);
-    println!("  vocab: {}", config.vocab_size);
-    if let Some(kv_rank) = config.kv_lora_rank {
-        println!("  MLA kv_lora_rank: {kv_rank}");
-    }
+    println!("Model: {}", config.model_name());
+    println!("  hidden_size: {}", config.hidden_size());
+    println!("  layers: {}", config.num_layers());
+    println!("  attention: {} ({} Q heads, {} KV heads, head_dim={})",
+        config.attention.kind, config.num_q_heads(), config.num_kv_heads(), config.head_dim());
+    println!("  rope_theta: {:.0}", config.rope_theta());
+    println!("  experts: {} (top-{})", config.num_experts(), config.num_experts_per_tok());
+    println!("  dense layer: {} (inter_size={})", config.ffn.dense_layer, config.ffn.dense_inter_size);
+    println!("  moe expert FFN dim: {}", config.moe_inter_size());
+    println!("  shared experts: {}", config.ffn.shared_expert_count);
+    println!("  quantization: {}-bit, group_size={}", config.quantization.bits, config.quantization.group_size);
+    println!("  vocab: {}", config.vocab_size());
     println!();
+
+    let _weights_dir = weights_dir.unwrap_or_else(|| "weights/rustane-qwen3".to_string());
 
     match mode {
         "benchmark" => {
-            println!("Benchmark mode — requires converted weights (not yet available).");
-            println!("Run `cargo run -p expert-pager --bin convert` first to convert weights.");
+            println!("Benchmark mode — requires converted weights.");
             println!();
+            let expert_params = config.moe_inter_size() * config.hidden_size() * 3;
+            let expert_bytes_4bit = expert_params / 2;
+            let active_bytes = config.num_experts_per_tok() * expert_bytes_4bit;
+            let total_expert_bytes = config.num_experts() * expert_bytes_4bit * config.num_layers();
             println!("Estimated memory budget:");
-            let expert_params = config.moe_intermediate_size * config.hidden_size * 3; // gate+up+down
-            let expert_bytes_4bit = expert_params / 2; // 4-bit = 0.5 bytes per param
-            let active_bytes = config.num_experts_per_tok * expert_bytes_4bit;
-            let total_expert_bytes = config.num_experts * expert_bytes_4bit * config.num_hidden_layers;
             println!("  Per-expert (4-bit): {:.1} MB", expert_bytes_4bit as f64 / 1e6);
             println!("  Active experts per token: {:.1} MB", active_bytes as f64 / 1e6);
             println!("  Total expert weights: {:.1} GB", total_expert_bytes as f64 / 1e9);
         }
-        "interactive" => {
-            println!("Interactive mode — requires converted weights + tokenizer (not yet available).");
+        "generate" => {
+            let prompt = prompt.unwrap();
+            println!("Generate mode — prompt: \"{prompt}\"");
+            println!("Requires converted weights + tokenizer (use --weights <dir>).");
         }
         _ => unreachable!(),
     }
