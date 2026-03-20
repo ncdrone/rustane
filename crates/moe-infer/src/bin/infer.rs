@@ -5,6 +5,7 @@
 //!   cargo run -p moe-infer --release --bin infer -- --config configs/qwen3-moe-30b.toml --prompt "Hello"
 
 use moe_infer::config::InferConfig;
+use moe_infer::generate::{Model, SamplingConfig};
 use std::path::Path;
 
 fn main() {
@@ -12,7 +13,9 @@ fn main() {
 
     let mut config_path = None;
     let mut weights_dir = None;
+    let mut tokenizer_path = None;
     let mut prompt = None;
+    let mut max_tokens: usize = 100;
     let mut mode = "benchmark";
     let mut i = 1;
     while i < args.len() {
@@ -25,10 +28,18 @@ fn main() {
                 i += 1;
                 weights_dir = Some(args[i].clone());
             }
+            "--tokenizer" => {
+                i += 1;
+                tokenizer_path = Some(args[i].clone());
+            }
             "--prompt" => {
                 i += 1;
                 prompt = Some(args[i].clone());
                 mode = "generate";
+            }
+            "--max-tokens" => {
+                i += 1;
+                max_tokens = args[i].parse().expect("--max-tokens must be a number");
             }
             "--benchmark" => mode = "benchmark",
             "--help" | "-h" => {
@@ -38,10 +49,12 @@ fn main() {
                 println!("  infer --config <path.toml> [--benchmark|--prompt <text>]");
                 println!();
                 println!("Options:");
-                println!("  --config <path>     TOML model config file");
-                println!("  --weights <dir>     Converted weights directory");
-                println!("  --benchmark         Run decode throughput benchmark (default)");
-                println!("  --prompt <text>     Generate text from prompt");
+                println!("  --config <path>       TOML model config file");
+                println!("  --weights <dir>       Converted weights directory (default: weights/rustane-qwen3)");
+                println!("  --tokenizer <path>    tokenizer.json path (default: weights/qwen3-30b-a3b/tokenizer.json)");
+                println!("  --prompt <text>       Generate text from prompt");
+                println!("  --max-tokens <n>      Max tokens to generate (default: 100)");
+                println!("  --benchmark           Show model config and memory estimates (default)");
                 return;
             }
             other => {
@@ -76,12 +89,12 @@ fn main() {
     println!("  vocab: {}", config.vocab_size());
     println!();
 
-    let _weights_dir = weights_dir.unwrap_or_else(|| "weights/rustane-qwen3".to_string());
+    let weights_dir = weights_dir.unwrap_or_else(|| "weights/rustane-qwen3".to_string());
+    let tokenizer_path = tokenizer_path
+        .unwrap_or_else(|| "weights/qwen3-30b-a3b/tokenizer.json".to_string());
 
     match mode {
         "benchmark" => {
-            println!("Benchmark mode — requires converted weights.");
-            println!();
             let expert_params = config.moe_inter_size() * config.hidden_size() * 3;
             let expert_bytes_4bit = expert_params / 2;
             let active_bytes = config.num_experts_per_tok() * expert_bytes_4bit;
@@ -92,9 +105,47 @@ fn main() {
             println!("  Total expert weights: {:.1} GB", total_expert_bytes as f64 / 1e9);
         }
         "generate" => {
-            let prompt = prompt.unwrap();
-            println!("Generate mode — prompt: \"{prompt}\"");
-            println!("Requires converted weights + tokenizer (use --weights <dir>).");
+            let prompt_text = prompt.unwrap();
+            println!("Loading model from {weights_dir}...");
+
+            let model = Model::load(
+                Path::new(&weights_dir),
+                Path::new(&config_path),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error loading model: {e}");
+                std::process::exit(1);
+            });
+
+            println!("Loading tokenizer from {tokenizer_path}...");
+            let tok = tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error loading tokenizer: {e}");
+                    std::process::exit(1);
+                });
+
+            println!("Generating (max {max_tokens} tokens)...\n");
+
+            let t0 = std::time::Instant::now();
+            let sampling = SamplingConfig::greedy();
+            let output = moe_infer::generate::generate(
+                &model, &tok, &prompt_text, max_tokens, &sampling,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Generation error: {e}");
+                std::process::exit(1);
+            });
+            let elapsed = t0.elapsed();
+
+            println!("{}{}", prompt_text, output.text);
+            println!("\n---");
+            let tok_per_sec = output.tokens_generated as f64 / elapsed.as_secs_f64();
+            println!(
+                "{} tokens in {:.1}s = {:.1} tok/s",
+                output.tokens_generated,
+                elapsed.as_secs_f64(),
+                tok_per_sec
+            );
         }
         _ => unreachable!(),
     }
