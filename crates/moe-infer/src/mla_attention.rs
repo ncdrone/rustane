@@ -45,7 +45,13 @@ impl MlaDecodeConfig {
 /// Pre-split MLA weights for one layer (all f32, pre-converted at load time).
 pub struct MlaLayerWeights {
     /// Q projection: [num_heads * (nope + rope), hidden] row-major
+    /// V2-Lite: used directly. V3: not used (Q LoRA path instead).
     pub q_proj: Vec<f32>,
+    /// V3 Q LoRA: W_qa [q_lora_rank, hidden], W_qb [num_heads*(nope+rope), q_lora_rank]
+    /// Both None for V2-Lite.
+    pub q_a_proj: Option<Vec<f32>>,
+    pub q_a_layernorm: Option<Vec<f32>>,
+    pub q_b_proj: Option<Vec<f32>>,
     /// KV down-projection: [kv_lora_rank + rope_dim, hidden] row-major
     pub kv_a_proj: Vec<f32>,
     /// KV layernorm weights: [kv_lora_rank]
@@ -161,10 +167,22 @@ pub fn mla_forward_decode(
     let kv_rank = cfg.kv_lora_rank;
     let hidden = cfg.hidden_size;
 
-    // 1. Q projection
+    // 1. Q projection (direct or LoRA)
     let q_total = h * (nope + rope_dim);
     let mut q = vec![0.0f32; q_total];
-    crate::blas::sgemv_f32(&weights.q_proj, x, &mut q, q_total, hidden);
+    if let (Some(q_a), Some(q_a_norm), Some(q_b)) =
+        (&weights.q_a_proj, &weights.q_a_layernorm, &weights.q_b_proj)
+    {
+        // V3 Q LoRA: x → W_qa → RMSNorm → W_qb → q
+        let q_lora_rank = q_a.len() / hidden;
+        let mut q_latent = vec![0.0f32; q_lora_rank];
+        crate::blas::sgemv_f32(q_a, x, &mut q_latent, q_lora_rank, hidden);
+        let q_latent_normed = rmsnorm(&q_latent, q_a_norm, cfg.rms_eps);
+        crate::blas::sgemv_f32(q_b, &q_latent_normed, &mut q, q_total, q_lora_rank);
+    } else {
+        // V2-Lite direct: x → W_q → q
+        crate::blas::sgemv_f32(&weights.q_proj, x, &mut q, q_total, hidden);
+    }
 
     // Split into q_nope [H * nope] and q_pe [H * rope_dim]
     let mut q_nope = vec![0.0f32; h * nope];

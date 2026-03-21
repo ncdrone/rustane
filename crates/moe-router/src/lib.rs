@@ -177,6 +177,79 @@ impl MoeRouter {
     }
 }
 
+/// DeepSeek-V3 sigmoid routing with grouped top-k.
+///
+/// Algorithm from FINAL.md:
+/// 1. scores = sigmoid(logits)
+/// 2. biased = scores + e_score_correction_bias (element-wise, bias frozen)
+/// 3. Group score = sum of top-2 biased scores within each group
+/// 4. Select top topk_group groups
+/// 5. From those groups only, select top_k experts by biased score
+/// 6. Output weights = unbiased scores[selected], normalized, scaled by routed_scaling_factor
+pub fn route_sigmoid_v3(
+    gate_logits: &[f32],
+    bias: &[f32],
+    n_group: usize,
+    topk_group: usize,
+    num_top_k: usize,
+    scaling_factor: f32,
+) -> RouteResult {
+    let num_experts = gate_logits.len();
+    assert_eq!(bias.len(), num_experts);
+    assert_eq!(num_experts % n_group, 0);
+    let group_size = num_experts / n_group;
+
+    // 1. Sigmoid scores (unbiased)
+    let scores: Vec<f32> = gate_logits.iter().map(|&l| sigmoid(l)).collect();
+
+    // 2. Biased scores (for selection only)
+    let biased: Vec<f32> = scores.iter().zip(bias.iter())
+        .map(|(&s, &b)| s + b).collect();
+
+    // 3. Group score = sum of top-2 biased scores within each group
+    let mut group_scores = vec![0.0f32; n_group];
+    for g in 0..n_group {
+        let start = g * group_size;
+        let group = &biased[start..start + group_size];
+        let (_, top2_vals) = top_k(group, 2);
+        group_scores[g] = top2_vals.iter().sum();
+    }
+
+    // 4. Select top topk_group groups
+    let (top_groups, _) = top_k(&group_scores, topk_group);
+
+    // 5. Build mask of allowed experts (from selected groups)
+    let mut allowed = vec![false; num_experts];
+    for &g in &top_groups {
+        let start = g * group_size;
+        for i in start..start + group_size {
+            allowed[i] = true;
+        }
+    }
+
+    // 6. Select num_top_k experts from allowed, by biased score
+    let mut candidates: Vec<(usize, f32)> = biased.iter().copied().enumerate()
+        .filter(|(i, _)| allowed[*i])
+        .collect();
+    candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(num_top_k);
+
+    let expert_ids: Vec<usize> = candidates.iter().map(|(i, _)| *i).collect();
+
+    // 7. Output weights = unbiased scores, normalized, scaled
+    let mut weights: Vec<f32> = expert_ids.iter().map(|&i| scores[i]).collect();
+    let wsum: f32 = weights.iter().sum::<f32>() + 1e-20;
+    for w in &mut weights {
+        *w = (*w / wsum) * scaling_factor;
+    }
+
+    RouteResult {
+        expert_ids,
+        weights,
+        all_scores: scores,
+    }
+}
+
 /// Sigmoid activation: 1 / (1 + exp(-x))
 #[inline]
 fn sigmoid(x: f32) -> f32 {

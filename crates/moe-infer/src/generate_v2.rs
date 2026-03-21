@@ -182,6 +182,9 @@ fn run_layer_v2(
 
     let attn_weights = MlaAttnWeights {
         q_proj: lf.q_proj.clone(),
+        q_a_proj: None,  // V2-Lite: direct q_proj, no LoRA
+        q_a_layernorm: None,
+        q_b_proj: None,
         kv_a_proj: lf.kv_a_proj.clone(),
         kv_a_layernorm: lf.kv_a_layernorm.clone(),
         w_uk: lf.w_uk.clone(),
