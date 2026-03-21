@@ -76,11 +76,17 @@ impl SamplingConfig {
     }
 }
 
-/// Generation output with metadata.
+/// Generation output with metadata and timing breakdown.
 pub struct GenerateOutput {
     pub token_ids: Vec<u32>,
     pub text: String,
     pub tokens_generated: usize,
+    /// Prefill time in seconds (processing input tokens).
+    pub prefill_secs: f64,
+    /// Decode time in seconds (generating new tokens).
+    pub decode_secs: f64,
+    /// Number of input tokens (prompt length).
+    pub prompt_tokens: usize,
 }
 
 impl Model {
@@ -400,7 +406,6 @@ pub fn run_layer(
     let post_norm_gamma = lw.post_attn_norm.to_vec();
 
     // 1. RMSNorm → Attention → Residual (using pre-converted f32 weights)
-    let t_attn = std::time::Instant::now();
     let normed = rmsnorm(x, &input_norm_gamma, eps);
     let af = &model.attn_f32[layer];
     let attn_out = gqa_forward_f32(
@@ -409,7 +414,6 @@ pub fn run_layer(
         lw.q_norm, lw.k_norm,
         cache, layer, pos, &model.rope, &model.gqa_config, eps,
     );
-    let attn_ms = t_attn.elapsed().as_secs_f64() * 1000.0;
     let mut residual = vec![0.0f32; hidden];
     for d in 0..hidden {
         residual[d] = x[d] + attn_out[d];
@@ -418,7 +422,6 @@ pub fn run_layer(
     // 2. RMSNorm → FFN → Residual
     let normed2 = rmsnorm(&residual, &post_norm_gamma, eps);
 
-    let t_ffn = std::time::Instant::now();
     // All layers are MoE (decoder_sparse_step=1)
     let expert_mmap = model.weights.expert_mmap(layer);
     let mmap_metal_buf = model.expert_metal_bufs.get(&layer)
@@ -435,11 +438,6 @@ pub fn run_layer(
         model.config.num_experts(),
         model.config.quantization.group_size,
     );
-    let ffn_ms = t_ffn.elapsed().as_secs_f64() * 1000.0;
-
-    if layer == 0 && pos <= 5 {
-        eprintln!("  L{layer} pos={pos}: attn={attn_ms:.1}ms ffn={ffn_ms:.1}ms");
-    }
 
     for d in 0..hidden {
         residual[d] += ffn_out[d];
@@ -488,11 +486,12 @@ pub fn generate(
 
     let embed_table = model.weights.embed_table()?;
     let final_norm = model.weights.final_norm()?;
-    let lm_head = model.weights.lm_head()?;
 
     let mut all_ids = input_ids.clone();
+    let prompt_tokens = input_ids.len();
 
     // Prefill: process all input tokens
+    let t_prefill = std::time::Instant::now();
     for (i, &token_id) in input_ids.iter().enumerate() {
         let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
         let mut x = emb;
@@ -508,8 +507,10 @@ pub fn generate(
             all_ids.push(next_token);
         }
     }
+    let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
     // Decode: generate new tokens one at a time
+    let t_decode = std::time::Instant::now();
     let mut pos = input_ids.len();
     for step in 0..max_new_tokens.saturating_sub(1) {
         if pos >= max_seq {
@@ -532,6 +533,7 @@ pub fn generate(
         all_ids.push(next_token);
         pos += 1;
     }
+    let decode_secs = t_decode.elapsed().as_secs_f64();
 
     let generated_ids = all_ids[input_ids.len()..].to_vec();
     let text = tokenizer.decode(&generated_ids, true)
@@ -541,6 +543,9 @@ pub fn generate(
         token_ids: generated_ids.clone(),
         text,
         tokens_generated: generated_ids.len(),
+        prefill_secs,
+        decode_secs,
+        prompt_tokens,
     })
 }
 

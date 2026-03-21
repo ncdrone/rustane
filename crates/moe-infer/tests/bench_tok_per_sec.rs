@@ -40,6 +40,9 @@ fn bench_tok_per_sec() {
     let elapsed = t0.elapsed();
 
     let tok_per_sec = output.tokens_generated as f64 / elapsed.as_secs_f64();
+    let decode_tok_per_sec = if output.decode_secs > 0.0 {
+        (output.tokens_generated.saturating_sub(1)) as f64 / output.decode_secs
+    } else { 0.0 };
 
     println!("=== BENCHMARK RESULTS ===");
     println!(
@@ -47,6 +50,18 @@ fn bench_tok_per_sec() {
         output.tokens_generated,
         elapsed.as_secs_f64(),
         tok_per_sec
+    );
+    println!(
+        "  Prefill: {} tokens in {:.2}s ({:.0} tok/s)",
+        output.prompt_tokens,
+        output.prefill_secs,
+        output.prompt_tokens as f64 / output.prefill_secs.max(0.001),
+    );
+    println!(
+        "  Decode: {} tokens in {:.2}s ({:.1} tok/s)",
+        output.tokens_generated.saturating_sub(1),
+        output.decode_secs,
+        decode_tok_per_sec,
     );
     println!("Output: {}", output.text);
     println!("=========================");

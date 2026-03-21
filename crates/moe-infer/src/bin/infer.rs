@@ -141,13 +141,30 @@ fn main() {
 
             println!("{}{}", prompt_text, output.text);
             println!("\n---");
-            let tok_per_sec = output.tokens_generated as f64 / elapsed.as_secs_f64();
+            let decode_tok_per_sec = if output.decode_secs > 0.0 {
+                (output.tokens_generated.saturating_sub(1)) as f64 / output.decode_secs
+            } else { 0.0 };
+            let total_tok_per_sec = output.tokens_generated as f64 / elapsed.as_secs_f64();
             println!(
-                "{} tokens in {:.1}s = {:.1} tok/s",
+                "{} tokens in {:.1}s = {:.1} tok/s (decode: {:.1} tok/s)",
                 output.tokens_generated,
                 elapsed.as_secs_f64(),
-                tok_per_sec
+                total_tok_per_sec,
+                decode_tok_per_sec,
             );
+            println!(
+                "  Prefill: {} tokens in {:.1}s ({:.0} tok/s)",
+                output.prompt_tokens,
+                output.prefill_secs,
+                output.prompt_tokens as f64 / output.prefill_secs.max(0.001),
+            );
+            println!(
+                "  Decode: {} tokens in {:.1}s ({:.1} tok/s)",
+                output.tokens_generated.saturating_sub(1),
+                output.decode_secs,
+                decode_tok_per_sec,
+            );
+            println!("  Backend: Metal GPU + Accelerate BLAS");
         }
         _ => unreachable!(),
     }
