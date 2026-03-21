@@ -220,14 +220,14 @@ pub fn mla_forward_decode(
     // 7. Absorbed attention — TWO SEPARATE DOT PRODUCTS SUMMED
 
     // 7a. q_absorbed = per-head q_nope @ W_UK: [H, nope] × [H, nope, kv_rank] → [H, kv_rank]
+    // W_UK[head] is stored as [nope, kv_rank] row-major
+    // We want q_absorbed = W_UK^T @ q_nope = [kv_rank, nope] @ [nope] → [kv_rank]
     let mut q_absorbed = vec![0.0f32; h * kv_rank];
     for head in 0..h {
         let q_head = &q_nope[head * nope..(head + 1) * nope];
         let w_uk_head = &weights.w_uk[head * nope * kv_rank..(head + 1) * nope * kv_rank];
-        // q_absorbed[head] = q_head @ W_UK[head]
-        // W_UK[head] is [nope, kv_rank] row-major
         let out = &mut q_absorbed[head * kv_rank..(head + 1) * kv_rank];
-        crate::blas::sgemv_f32(w_uk_head, q_head, out, kv_rank, nope);
+        crate::blas::sgemv_f32_trans(w_uk_head, q_head, out, kv_rank, nope);
     }
 
     // 7b. Compute attention scores

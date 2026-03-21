@@ -97,6 +97,35 @@ pub fn sgemv_f16(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: us
     }
 }
 
+/// y = W^T @ x using Accelerate cblas_sgemv (transposed).
+/// W is [cols, rows] row-major f32 (rows/cols from the TRANSPOSED perspective).
+/// Computes y[i] = sum_j W[j][i] * x[j], i.e., y = W^T @ x.
+pub fn sgemv_f32_trans(w: &[f32], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    // W is stored as [in_dim, out_dim] row-major
+    // We want y[out_dim] = W^T[out_dim, in_dim] @ x[in_dim]
+    debug_assert_eq!(w.len(), in_dim * out_dim);
+    debug_assert_eq!(x.len(), in_dim);
+    debug_assert_eq!(y.len(), out_dim);
+
+    const CBLAS_TRANS: i32 = 112;
+    unsafe {
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            in_dim as i32,    // m (rows of W)
+            out_dim as i32,   // n (cols of W)
+            1.0,
+            w.as_ptr(),
+            out_dim as i32,   // lda = out_dim (cols of W in row-major)
+            x.as_ptr(),
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            1,
+        );
+    }
+}
+
 /// C = A @ B using Accelerate cblas_sgemm.
 /// A is [m, k] row-major, B is [k, n] row-major, C is [m, n] row-major.
 pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {

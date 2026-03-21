@@ -404,7 +404,13 @@ pub fn generate_v2(
 ) -> Result<GenerateV2Output> {
     let encoding = tokenizer.encode(prompt, false)
         .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
-    let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+    let mut input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+    // Prepend BOS token if the tokenizer didn't add it
+    let bos = model.config.model.bos_token_id;
+    if input_ids.first() != Some(&bos) {
+        input_ids.insert(0, bos);
+    }
 
     if input_ids.is_empty() {
         bail!("empty prompt after tokenization");
