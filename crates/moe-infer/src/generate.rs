@@ -79,6 +79,19 @@ pub struct Model {
     pub ane_prefill: Option<AnePrefillCache>,
 }
 
+/// Per-operation timing for one layer (microseconds).
+#[derive(Default, Clone, Debug)]
+pub struct LayerTimings {
+    pub rmsnorm1_us: f64,
+    pub attn_proj_us: f64,      // Q+K+V+O sgemv total
+    pub attn_scores_us: f64,    // RoPE + QK^T + softmax + weighted V
+    pub rmsnorm2_us: f64,
+    pub router_us: f64,         // gate sgemv + softmax + topk
+    pub metal_dispatch_us: f64, // Metal gate+up+down (all dispatches + waits)
+    pub cpu_silu_us: f64,       // CPU SiLU between batches
+    pub combine_us: f64,        // weighted expert combine + residuals
+}
+
 /// Sampling configuration.
 #[derive(Clone, Debug)]
 pub struct SamplingConfig {
@@ -391,6 +404,119 @@ fn moe_ffn(
     combined
 }
 
+/// MoE FFN with timing instrumentation. Returns (output, router_us, metal_us, silu_us, combine_us).
+fn moe_ffn_timed(
+    x: &[f32],
+    router_f32: &[f32],
+    expert_mmap: Option<&memmap2::Mmap>,
+    mmap_metal_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    router: &mut MoeRouter,
+    metal: Option<&MetalDequantGemv>,
+    hidden: usize,
+    moe_inter: usize,
+    num_experts: usize,
+    group_size: usize,
+) -> (Vec<f32>, f64, f64, f64, f64) {
+    use std::time::Instant;
+
+    // 1. Router gate logits
+    let t = Instant::now();
+    let mut gate_logits = vec![0.0f32; num_experts];
+    crate::blas::sgemv_f32(router_f32, x, &mut gate_logits, num_experts, hidden);
+    let route = router.route_softmax(&gate_logits);
+    let router_us = t.elapsed().as_secs_f64() * 1e6;
+
+    // 2. Dispatch routed experts
+    let mut combined = vec![0.0f32; hidden];
+    let mut metal_us = 0.0;
+    let mut silu_us = 0.0;
+
+    if let Some(expert_data) = expert_mmap {
+        let gu_packed = moe_inter * hidden / 2;
+        let gu_groups = moe_inter * (hidden / group_size);
+        let gu_scales = gu_groups * 2;
+        let gu_total = gu_packed + gu_scales * 2;
+        let dn_packed = hidden * moe_inter / 2;
+        let dn_groups = hidden * (moe_inter / group_size);
+        let dn_scales = dn_groups * 2;
+        let dn_total = dn_packed + dn_scales * 2;
+        let expert_stride = gu_total * 2 + dn_total;
+
+        if let (Some(m), Some(mmap_buf)) = (metal, mmap_metal_buf) {
+            let mut gate_up_ops = Vec::with_capacity(route.expert_ids.len() * 2);
+            let mut routing_weights: Vec<f32> = Vec::new();
+
+            for (&eid, &weight) in route.expert_ids.iter().zip(route.weights.iter()) {
+                let base = eid * expert_stride;
+                if base + expert_stride > expert_data.len() { continue; }
+                gate_up_ops.push(ExpertGemvOp {
+                    packed_offset: base, scales_offset: base + gu_packed,
+                    zeros_offset: base + gu_packed + gu_scales,
+                    out_features: moe_inter, in_features: hidden, group_size,
+                });
+                gate_up_ops.push(ExpertGemvOp {
+                    packed_offset: base + gu_total, scales_offset: base + gu_total + gu_packed,
+                    zeros_offset: base + gu_total + gu_packed + gu_scales,
+                    out_features: moe_inter, in_features: hidden, group_size,
+                });
+                routing_weights.push(weight);
+            }
+
+            let n = routing_weights.len();
+            if n == 0 { return (combined, router_us, 0.0, 0.0, 0.0); }
+
+            // Batch 1: gate+up
+            let t = Instant::now();
+            let x_slices: Vec<&[f32]> = vec![x; 2 * n];
+            let gate_up_results = m.batch_gemv_mmap(mmap_buf, &gate_up_ops, &x_slices);
+            metal_us += t.elapsed().as_secs_f64() * 1e6;
+
+            // SiLU
+            let t = Instant::now();
+            let mut activated: Vec<Vec<f32>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let gate_out = &gate_up_results[2 * i];
+                let up_out = &gate_up_results[2 * i + 1];
+                let h: Vec<f32> = gate_out.iter().zip(up_out.iter())
+                    .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u).collect();
+                activated.push(h);
+            }
+            silu_us = t.elapsed().as_secs_f64() * 1e6;
+
+            // Batch 2: down
+            let mut down_ops = Vec::with_capacity(n);
+            let mut act_slices: Vec<&[f32]> = Vec::with_capacity(n);
+            let mut eid_idx = 0;
+            for (&eid, _) in route.expert_ids.iter().zip(route.weights.iter()) {
+                let base = eid * expert_stride;
+                if base + expert_stride > expert_data.len() { continue; }
+                down_ops.push(ExpertGemvOp {
+                    packed_offset: base + 2 * gu_total, scales_offset: base + 2 * gu_total + dn_packed,
+                    zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
+                    out_features: hidden, in_features: moe_inter, group_size,
+                });
+                act_slices.push(&activated[eid_idx]);
+                eid_idx += 1;
+            }
+
+            let t = Instant::now();
+            let down_results = m.batch_gemv_mmap(mmap_buf, &down_ops, &act_slices);
+            metal_us += t.elapsed().as_secs_f64() * 1e6;
+
+            let t = Instant::now();
+            for (i, weight) in routing_weights.iter().enumerate() {
+                for d in 0..hidden {
+                    combined[d] += weight * down_results[i][d];
+                }
+            }
+            let combine_us = t.elapsed().as_secs_f64() * 1e6;
+            return (combined, router_us, metal_us, silu_us, combine_us);
+        }
+    }
+
+    (combined, router_us, 0.0, 0.0, 0.0)
+}
+
 /// Dequantize and run one expert's FFN from packed 4-bit data.
 fn dequant_expert_ffn(
     data: &[u8],
@@ -538,6 +664,73 @@ pub fn run_layer(
     }
 
     Ok(residual)
+}
+
+/// Run a single transformer layer with per-operation timing instrumentation.
+/// Returns (output, timings). Produces identical output to run_layer.
+pub fn run_layer_timed(
+    model: &Model,
+    cache: &mut KvCache,
+    router: &mut MoeRouter,
+    layer: usize,
+    x: &[f32],
+    pos: usize,
+) -> Result<(Vec<f32>, LayerTimings)> {
+    use std::time::Instant;
+    let mut timings = LayerTimings::default();
+
+    let hidden = model.config.hidden_size();
+    let eps = model.config.rms_norm_eps();
+    let lw = model.weights.layer_weights(layer)?;
+
+    let input_norm_gamma = lw.input_norm.to_vec();
+    let post_norm_gamma = lw.post_attn_norm.to_vec();
+
+    // 1. RMSNorm1
+    let t = Instant::now();
+    let normed = rmsnorm(x, &input_norm_gamma, eps);
+    timings.rmsnorm1_us = t.elapsed().as_secs_f64() * 1e6;
+
+    // 2. Attention (projections + scores + O_proj — measured as one block)
+    let t = Instant::now();
+    let af = &model.attn_f32[layer];
+    let attn_out = gqa_forward_f32(
+        &normed,
+        &af.q_proj, &af.k_proj, &af.v_proj, &af.o_proj,
+        lw.q_norm, lw.k_norm,
+        cache, layer, pos, &model.rope, &model.gqa_config, eps,
+    );
+    timings.attn_proj_us = t.elapsed().as_secs_f64() * 1e6;
+
+    let mut residual = vec![0.0f32; hidden];
+    for d in 0..hidden {
+        residual[d] = x[d] + attn_out[d];
+    }
+
+    // 3. RMSNorm2
+    let t = Instant::now();
+    let normed2 = rmsnorm(&residual, &post_norm_gamma, eps);
+    timings.rmsnorm2_us = t.elapsed().as_secs_f64() * 1e6;
+
+    // 4. MoE FFN (timed)
+    let expert_mmap = model.weights.expert_mmap(layer);
+    let mmap_metal_buf = model.expert_metal_bufs.get(&layer).map(|b| b.as_ref());
+    let (ffn_out, router_us, metal_us, silu_us, combine_us) = moe_ffn_timed(
+        &normed2, &af.router, expert_mmap, mmap_metal_buf,
+        router, model.metal.as_ref(), hidden,
+        model.config.moe_inter_size(), model.config.num_experts(),
+        model.config.quantization.group_size,
+    );
+    timings.router_us = router_us;
+    timings.metal_dispatch_us = metal_us;
+    timings.cpu_silu_us = silu_us;
+    timings.combine_us = combine_us;
+
+    for d in 0..hidden {
+        residual[d] += ffn_out[d];
+    }
+
+    Ok((residual, timings))
 }
 
 /// Process one layer for ALL prefill tokens using ANE batched attention.
