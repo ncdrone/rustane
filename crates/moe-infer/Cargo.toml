@@ -33,3 +33,4 @@ rand = "0.9"
 objc2-foundation.workspace = true
 tempfile = "3"
 safetensors = "0.7"
+zip = "2"
