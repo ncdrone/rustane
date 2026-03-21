@@ -1,0 +1,50 @@
+# configs/deepseek-v2-lite.toml
+# Source: deepseek-ai/DeepSeek-V2-Lite config.json (verified 2026-03-21)
+
+[model]
+name = "DeepSeek-V2-Lite"
+vocab_size = 102400
+hidden_size = 2048
+num_layers = 27
+max_position_embeddings = 163840
+bos_token_id = 100000
+eos_token_id = 100001
+rms_norm_eps = 1e-6
+tie_word_embeddings = false
+
+[attention]
+kind = "mla"
+num_q_heads = 16
+num_kv_heads = 16
+head_dim = 128
+rope_theta = 10000.0
+kv_lora_rank = 512
+qk_nope_head_dim = 128
+qk_rope_head_dim = 64
+v_head_dim = 128
+# q_lora_rank omitted = None (V2-Lite uses direct q_proj)
+
+[attention.rope_scaling]
+factor = 40.0
+original_max_position_embeddings = 4096
+beta_fast = 32.0
+beta_slow = 1.0
+mscale = 0.707
+mscale_all_dim = 0.707
+
+[ffn]
+# Layer 0 is dense FFN, layers 1-26 are MoE
+all_moe = false
+first_k_dense_replace = 1
+dense_inter_size = 10944
+moe_inter_size = 1408
+num_experts = 64
+num_experts_per_tok = 6
+shared_expert_count = 2
+norm_topk_prob = false
+scoring_func = "softmax"
+routed_scaling_factor = 1.0
+
+[quantization]
+bits = 4
+group_size = 128
