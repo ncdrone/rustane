@@ -111,6 +111,85 @@ kernel void dequant_4bit_gemv(
 }
 "#;
 
+/// V2 shader: ROWS_PER_TG=8 — 8 SIMD groups share x_cache, each handles one row.
+/// Reduces threadgroup count 8x, amortizes x_cache load across 8 rows.
+/// Needs out_features buffer for bounds checking last threadgroup.
+const DEQUANT_GEMV_SHADER_V2: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void dequant_4bit_gemv_v2(
+    device const uint32_t* packed   [[buffer(0)]],
+    device const half* scales       [[buffer(1)]],
+    device const half* zeros        [[buffer(2)]],
+    device const float* x           [[buffer(3)]],
+    device float* y                 [[buffer(4)]],
+    constant uint& in_features      [[buffer(5)]],
+    constant uint& group_size       [[buffer(6)]],
+    constant uint& out_features     [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]]
+) {
+    const uint ROWS_PER_TG = 8;
+    const uint TG = 256;
+    const uint THREADS_PER_ROW = TG / ROWS_PER_TG; // 32 = one SIMD group
+
+    const uint packed_per_row = in_features / 8;
+    const uint num_groups = in_features / group_size;
+    const uint groups_per_8 = group_size / 8;
+
+    // Cache x (shared across all 8 rows)
+    threadgroup float x_cache[4096];
+    for (uint i = tid; i < in_features; i += TG) {
+        x_cache[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint local_row = tid / THREADS_PER_ROW;  // 0..7
+    uint lane = tid % THREADS_PER_ROW;       // 0..31 (SIMD lane)
+    uint row = tgid * ROWS_PER_TG + local_row;
+
+    if (row >= out_features) return;
+
+    float sum = 0.0;
+    device const uint32_t* row_packed = packed + row * packed_per_row;
+
+    for (uint pi = lane; pi < packed_per_row; pi += THREADS_PER_ROW) {
+        uint col = pi * 8;
+        uint group_idx = row * num_groups + pi / groups_per_8;
+        float scale = float(scales[group_idx]);
+        float zero = float(zeros[group_idx]);
+
+        uint32_t pack = row_packed[pi];
+
+        float sx0 = scale * x_cache[col    ]; float bx0 = zero * x_cache[col    ];
+        float sx1 = scale * x_cache[col + 1]; float bx1 = zero * x_cache[col + 1];
+        float sx2 = scale * x_cache[col + 2]; float bx2 = zero * x_cache[col + 2];
+        float sx3 = scale * x_cache[col + 3]; float bx3 = zero * x_cache[col + 3];
+        float sx4 = scale * x_cache[col + 4]; float bx4 = zero * x_cache[col + 4];
+        float sx5 = scale * x_cache[col + 5]; float bx5 = zero * x_cache[col + 5];
+        float sx6 = scale * x_cache[col + 6]; float bx6 = zero * x_cache[col + 6];
+        float sx7 = scale * x_cache[col + 7]; float bx7 = zero * x_cache[col + 7];
+
+        sum = fma(float((pack      ) & 0xF), sx0, sum) + bx0;
+        sum = fma(float((pack >>  4) & 0xF), sx1, sum) + bx1;
+        sum = fma(float((pack >>  8) & 0xF), sx2, sum) + bx2;
+        sum = fma(float((pack >> 12) & 0xF), sx3, sum) + bx3;
+        sum = fma(float((pack >> 16) & 0xF), sx4, sum) + bx4;
+        sum = fma(float((pack >> 20) & 0xF), sx5, sum) + bx5;
+        sum = fma(float((pack >> 24) & 0xF), sx6, sum) + bx6;
+        sum = fma(float((pack >> 28) & 0xF), sx7, sum) + bx7;
+    }
+
+    // SIMD reduction (within 32-thread SIMD group — no cross-SIMD needed)
+    sum = simd_sum(sum);
+
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}
+"#;
+
 /// Expert GEMV layout info for zero-copy offset-based dispatch.
 pub struct ExpertGemvOp {
     /// Byte offset into mmap buffer for packed data
@@ -130,14 +209,17 @@ pub struct MetalDequantGemv {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// V2: ROWS_PER_TG=8 shader (8 SIMD groups share x_cache).
+    pipeline_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl MetalDequantGemv {
-    /// Create and compile the dequant GEMV pipeline.
+    /// Create and compile the dequant GEMV pipelines (v1 + v2).
     pub fn new() -> Option<Self> {
         let device = MTLCreateSystemDefaultDevice()?;
         let queue = device.newCommandQueue()?;
 
+        // V1 pipeline (1 row per threadgroup)
         let source = objc2_foundation::NSString::from_str(DEQUANT_GEMV_SHADER);
         let library = device.newLibraryWithSource_options_error(&source, None).ok()?;
         let fn_name = objc2_foundation::NSString::from_str("dequant_4bit_gemv");
@@ -146,7 +228,16 @@ impl MetalDequantGemv {
             .newComputePipelineStateWithFunction_error(&function)
             .ok()?;
 
-        Some(Self { device, queue, pipeline })
+        // V2 pipeline (8 rows per threadgroup)
+        let source_v2 = objc2_foundation::NSString::from_str(DEQUANT_GEMV_SHADER_V2);
+        let library_v2 = device.newLibraryWithSource_options_error(&source_v2, None).ok()?;
+        let fn_name_v2 = objc2_foundation::NSString::from_str("dequant_4bit_gemv_v2");
+        let function_v2 = library_v2.newFunctionWithName(&fn_name_v2)?;
+        let pipeline_v2 = device
+            .newComputePipelineStateWithFunction_error(&function_v2)
+            .ok()?;
+
+        Some(Self { device, queue, pipeline, pipeline_v2 })
     }
 
     /// Compute y = packed_weights @ x on the GPU.
@@ -328,23 +419,29 @@ impl MetalDequantGemv {
             std::collections::HashMap::new();
         let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
             std::collections::HashMap::new();
+        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
 
         for op in ops {
             in_feat_bufs.entry(op.in_features as u32)
                 .or_insert_with(|| self.u32_buffer(op.in_features as u32));
             group_bufs.entry(op.group_size as u32)
                 .or_insert_with(|| self.u32_buffer(op.group_size as u32));
+            out_feat_bufs.entry(op.out_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
         }
 
-        // Encode all dispatches
+        // Encode all dispatches using V2 shader (ROWS_PER_TG=8)
+        const ROWS_PER_TG: usize = 8;
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let enc = cmd.computeCommandEncoder().expect("compute encoder");
 
-        unsafe { enc.setComputePipelineState(&self.pipeline); }
+        enc.setComputePipelineState(&self.pipeline_v2);
 
         for (i, op) in ops.iter().enumerate() {
             let ifb = &in_feat_bufs[&(op.in_features as u32)];
             let gb = &group_bufs[&(op.group_size as u32)];
+            let ofb = &out_feat_bufs[&(op.out_features as u32)];
 
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(mmap_buf), op.packed_offset, 0);
@@ -354,8 +451,10 @@ impl MetalDequantGemv {
                 enc.setBuffer_offset_atIndex(Some(&y_bufs[i]), 0, 4);
                 enc.setBuffer_offset_atIndex(Some(ifb), 0, 5);
                 enc.setBuffer_offset_atIndex(Some(gb), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 7);
 
-                let threadgroups = MTLSize { width: op.out_features, height: 1, depth: 1 };
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
                 let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
                 enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
             }
