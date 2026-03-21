@@ -344,6 +344,12 @@ pub struct MetalDequantGemv {
     pipeline_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Fused gate+up+SiLU shader.
     pipeline_fused: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Pre-allocated scratch: x input buffer (max of hidden, moe_inter).
+    scratch_x: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Pre-allocated scratch: fused output / down input (one per top-k expert).
+    scratch_activated: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Pre-allocated scratch: down output (one per top-k expert).
+    scratch_down_y: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 impl MetalDequantGemv {
@@ -379,7 +385,147 @@ impl MetalDequantGemv {
             .newComputePipelineStateWithFunction_error(&function_fused)
             .ok()?;
 
-        Some(Self { device, queue, pipeline, pipeline_v2, pipeline_fused })
+        Some(Self {
+            device, queue, pipeline, pipeline_v2, pipeline_fused,
+            scratch_x: None,
+            scratch_activated: Vec::new(),
+            scratch_down_y: Vec::new(),
+        })
+    }
+
+    /// Pre-allocate scratch buffers for zero-allocation inference hot path.
+    /// Call once at model load after knowing hidden/moe_inter/top_k.
+    pub fn init_scratch(&mut self, hidden: usize, moe_inter: usize, top_k: usize) {
+        let x_size = hidden.max(moe_inter) * 4; // f32
+        self.scratch_x = Some(
+            self.device.newBufferWithLength_options(x_size, MTLResourceOptions::StorageModeShared)
+                .expect("scratch_x")
+        );
+        self.scratch_activated = (0..top_k).map(|_| {
+            self.device.newBufferWithLength_options(moe_inter * 4, MTLResourceOptions::StorageModeShared)
+                .expect("scratch_activated")
+        }).collect();
+        self.scratch_down_y = (0..top_k).map(|_| {
+            self.device.newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
+                .expect("scratch_down_y")
+        }).collect();
+    }
+
+    /// Combined fused+down dispatch using scratch buffers, single command buffer.
+    /// Fused gate+up+SiLU writes to scratch_activated, down reads from it.
+    /// Returns down outputs (one Vec<f32> per expert).
+    pub fn fused_and_down_single_cmdbuf(
+        &self,
+        mmap_buf: &ProtocolObject<dyn MTLBuffer>,
+        fused_ops: &[FusedGateUpSiluOp],
+        down_ops: &[ExpertGemvOp],
+        x: &[f32],
+    ) -> Vec<Vec<f32>> {
+        let n = fused_ops.len();
+        assert_eq!(n, down_ops.len());
+        if n == 0 { return vec![]; }
+
+        let scratch_x = self.scratch_x.as_ref().expect("call init_scratch first");
+
+        // Copy x into scratch_x
+        unsafe {
+            let dst = scratch_x.contents().as_ptr() as *mut f32;
+            std::ptr::copy_nonoverlapping(x.as_ptr(), dst, x.len());
+        }
+
+        // Constant buffers (deduplicated)
+        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+
+        for op in fused_ops {
+            in_feat_bufs.entry(op.in_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
+            group_bufs.entry(op.group_size as u32)
+                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
+            out_feat_bufs.entry(op.out_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
+        }
+        for op in down_ops {
+            in_feat_bufs.entry(op.in_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
+            group_bufs.entry(op.group_size as u32)
+                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
+            out_feat_bufs.entry(op.out_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
+        }
+
+        const ROWS_PER_TG: usize = 8;
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+
+        // Phase 1: Fused gate+up+SiLU → scratch_activated[i]
+        enc.setComputePipelineState(&self.pipeline_fused);
+        for (i, op) in fused_ops.iter().enumerate() {
+            let ifb = &in_feat_bufs[&(op.in_features as u32)];
+            let gb = &group_bufs[&(op.group_size as u32)];
+            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_packed_offset, 3);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_scales_offset, 4);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_zeros_offset, 5);
+                enc.setBuffer_offset_atIndex(Some(scratch_x), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_activated[i]), 0, 7);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 8);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 9);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 10);
+
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
+                let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            }
+        }
+
+        // Phase 2: Down GEMV — reads from scratch_activated[i], writes to scratch_down_y[i]
+        enc.setComputePipelineState(&self.pipeline_v2);
+        for (i, op) in down_ops.iter().enumerate() {
+            let ifb = &in_feat_bufs[&(op.in_features as u32)];
+            let gb = &group_bufs[&(op.group_size as u32)];
+            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_activated[i]), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_down_y[i]), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 5);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 7);
+
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
+                let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            }
+        }
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        // Read results from scratch_down_y
+        down_ops.iter().enumerate().map(|(i, op)| {
+            let mut out = vec![0.0f32; op.out_features];
+            unsafe {
+                let src = self.scratch_down_y[i].contents().as_ptr() as *const f32;
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), op.out_features);
+            }
+            out
+        }).collect()
     }
 
     /// Compute y = packed_weights @ x on the GPU.

@@ -153,17 +153,23 @@ impl Model {
         let lm_head_f32: Vec<f32> = lm_head_f16.iter().map(|v| v.to_f32()).collect();
         eprintln!("Pre-converted attention weights to f32: {:.1}s", t_preconv.elapsed().as_secs_f64());
 
-        let metal = MetalDequantGemv::new();
+        let mut metal = MetalDequantGemv::new();
         let mut expert_metal_bufs = std::collections::HashMap::new();
-        if let Some(ref m) = metal {
+        if let Some(ref mut m) = metal {
             eprintln!("Metal GPU: enabled");
+            // Pre-allocate scratch buffers for zero-allocation decode
+            m.init_scratch(
+                config.hidden_size(),
+                config.moe_inter_size(),
+                config.num_experts_per_tok(),
+            );
             for layer in 0..num_layers {
                 if let Some(mmap) = weights.expert_mmap(layer) {
                     let buf = m.wrap_mmap(mmap);
                     expert_metal_bufs.insert(layer, buf);
                 }
             }
-            eprintln!("Metal GPU: {} layers' expert weights wrapped (zero-copy)", expert_metal_bufs.len());
+            eprintln!("Metal GPU: {} layers' expert weights wrapped (zero-copy, scratch pre-allocated)", expert_metal_bufs.len());
         } else {
             eprintln!("Metal GPU: not available, using CPU");
         }
@@ -312,9 +318,10 @@ fn moe_ffn(
         let expert_stride = gu_total * 2 + dn_total; // gate + up + down
 
         if let (Some(m), Some(mmap_buf)) = (metal, mmap_metal_buf) {
-            // ===== FUSED METAL PATH =====
-            // Fused gate+up+SiLU (1 dispatch per expert), then batched down.
+            // ===== SINGLE CMD_BUF METAL PATH =====
+            // Fused gate+up+SiLU + down in ONE command buffer commit.
             let mut fused_ops = Vec::with_capacity(route.expert_ids.len());
+            let mut down_ops = Vec::with_capacity(route.expert_ids.len());
             let mut routing_weights: Vec<f32> = Vec::new();
 
             for (&eid, &weight) in route.expert_ids.iter().zip(route.weights.iter()) {
@@ -331,36 +338,21 @@ fn moe_ffn(
                     out_features: moe_inter, in_features: hidden, group_size,
                 });
 
-                routing_weights.push(weight);
-            }
-
-            let n = routing_weights.len();
-            if n == 0 { return combined; }
-
-            // Fused batch: gate+up+SiLU (n dispatches, 1 commit)
-            let x_slices: Vec<&[f32]> = vec![x; n];
-            let activated = m.batch_fused_gate_up_silu_mmap(mmap_buf, &fused_ops, &x_slices);
-
-            // Build down ops
-            let mut down_ops = Vec::with_capacity(n);
-            let mut act_slices: Vec<&[f32]> = Vec::with_capacity(n);
-            let mut eid_idx = 0;
-            for (&eid, _) in route.expert_ids.iter().zip(route.weights.iter()) {
-                let base = eid * expert_stride;
-                if base + expert_stride > expert_data.len() { continue; }
-
                 down_ops.push(ExpertGemvOp {
                     packed_offset: base + 2 * gu_total,
                     scales_offset: base + 2 * gu_total + dn_packed,
                     zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
                     out_features: hidden, in_features: moe_inter, group_size,
                 });
-                act_slices.push(&activated[eid_idx]);
-                eid_idx += 1;
+
+                routing_weights.push(weight);
             }
 
-            // Batch 2: all down GEMVs (n dispatches, 1 commit)
-            let down_results = m.batch_gemv_mmap(mmap_buf, &down_ops, &act_slices);
+            let n = routing_weights.len();
+            if n == 0 { return combined; }
+
+            // Single cmd_buf: fused gate+up+SiLU → down (scratch buffers pipeline data)
+            let down_results = m.fused_and_down_single_cmdbuf(mmap_buf, &fused_ops, &down_ops, x);
 
             // Combine with routing weights
             for (i, weight) in routing_weights.iter().enumerate() {
@@ -427,6 +419,7 @@ fn moe_ffn_timed(
 
         if let (Some(m), Some(mmap_buf)) = (metal, mmap_metal_buf) {
             let mut fused_ops = Vec::with_capacity(route.expert_ids.len());
+            let mut down_ops = Vec::with_capacity(route.expert_ids.len());
             let mut routing_weights: Vec<f32> = Vec::new();
 
             for (&eid, &weight) in route.expert_ids.iter().zip(route.weights.iter()) {
@@ -441,38 +434,21 @@ fn moe_ffn_timed(
                     up_zeros_offset: base + gu_total + gu_packed + gu_scales,
                     out_features: moe_inter, in_features: hidden, group_size,
                 });
+                down_ops.push(ExpertGemvOp {
+                    packed_offset: base + 2 * gu_total, scales_offset: base + 2 * gu_total + dn_packed,
+                    zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
+                    out_features: hidden, in_features: moe_inter, group_size,
+                });
                 routing_weights.push(weight);
             }
 
             let n = routing_weights.len();
             if n == 0 { return (combined, router_us, 0.0, 0.0, 0.0); }
 
-            // Fused batch: gate+up+SiLU
+            // Single cmd_buf: fused + down
             let t = Instant::now();
-            let x_slices: Vec<&[f32]> = vec![x; n];
-            let activated = m.batch_fused_gate_up_silu_mmap(mmap_buf, &fused_ops, &x_slices);
-            metal_us += t.elapsed().as_secs_f64() * 1e6;
-            // silu_us stays 0 — fused on GPU
-
-            // Batch 2: down
-            let mut down_ops = Vec::with_capacity(n);
-            let mut act_slices: Vec<&[f32]> = Vec::with_capacity(n);
-            let mut eid_idx = 0;
-            for (&eid, _) in route.expert_ids.iter().zip(route.weights.iter()) {
-                let base = eid * expert_stride;
-                if base + expert_stride > expert_data.len() { continue; }
-                down_ops.push(ExpertGemvOp {
-                    packed_offset: base + 2 * gu_total, scales_offset: base + 2 * gu_total + dn_packed,
-                    zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
-                    out_features: hidden, in_features: moe_inter, group_size,
-                });
-                act_slices.push(&activated[eid_idx]);
-                eid_idx += 1;
-            }
-
-            let t = Instant::now();
-            let down_results = m.batch_gemv_mmap(mmap_buf, &down_ops, &act_slices);
-            metal_us += t.elapsed().as_secs_f64() * 1e6;
+            let down_results = m.fused_and_down_single_cmdbuf(mmap_buf, &fused_ops, &down_ops, x);
+            metal_us = t.elapsed().as_secs_f64() * 1e6;
 
             let t = Instant::now();
             for (i, weight) in routing_weights.iter().enumerate() {
