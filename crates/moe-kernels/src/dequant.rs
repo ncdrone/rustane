@@ -21,33 +21,15 @@ const DEQUANT_GEMV_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// Helper: process 8 nibbles from one u32, accumulate dot product
-inline float process_u32(uint32_t pack, float scale, float zero,
-                         device const float* xp) {
-    float sum = 0.0;
-    float n0 = float((pack      ) & 0xF);
-    float n1 = float((pack >>  4) & 0xF);
-    float n2 = float((pack >>  8) & 0xF);
-    float n3 = float((pack >> 12) & 0xF);
-    float n4 = float((pack >> 16) & 0xF);
-    float n5 = float((pack >> 20) & 0xF);
-    float n6 = float((pack >> 24) & 0xF);
-    float n7 = float((pack >> 28) & 0xF);
-
-    sum = fma(fma(n0, scale, zero), xp[0], sum);
-    sum = fma(fma(n1, scale, zero), xp[1], sum);
-    sum = fma(fma(n2, scale, zero), xp[2], sum);
-    sum = fma(fma(n3, scale, zero), xp[3], sum);
-    sum = fma(fma(n4, scale, zero), xp[4], sum);
-    sum = fma(fma(n5, scale, zero), xp[5], sum);
-    sum = fma(fma(n6, scale, zero), xp[6], sum);
-    sum = fma(fma(n7, scale, zero), xp[7], sum);
-    return sum;
-}
-
 // Fused 4-bit dequantization + GEMV: y = W_4bit @ x
+// Pre-factored FMA: pre-compute sx = scale*x[col], bx = zero*x[col]
+// per group, then use nibble as scalar: sum += nibble * sx + bx.
+// This breaks the dependent FMA chain (flash-moe pattern).
+//
+// Threadgroup x-caching: load x into shared memory once, reuse across
+// all threads computing different output rows.
+//
 // One threadgroup (256 threads) per output row.
-// Each thread processes 4 consecutive u32s (32 elements) per stride via uint4 reads.
 // Partial sums reduced via SIMD + shared memory.
 kernel void dequant_4bit_gemv(
     device const uint32_t* packed   [[buffer(0)]],
@@ -63,29 +45,54 @@ kernel void dequant_4bit_gemv(
     const uint packed_per_row = in_features / 8;
     const uint num_groups = in_features / group_size;
     const uint TG = 256;
-    const uint groups_per_8 = group_size / 8; // u32s per group
+    const uint groups_per_8 = group_size / 8;
+
+    // Cache x in threadgroup shared memory (max 4096 floats = 16KB)
+    threadgroup float x_cache[4096];
+    for (uint i = tid; i < in_features; i += TG) {
+        x_cache[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float sum = 0.0;
 
-    // Base pointer for this row's packed data
     device const uint32_t* row_packed = packed + row * packed_per_row;
 
-    // Each thread handles u32s at positions: tid, tid+TG, tid+2*TG, ...
-    // Adjacent threads read adjacent u32s = coalesced memory access
     for (uint pi = tid; pi < packed_per_row; pi += TG) {
         uint col = pi * 8;
         uint group_idx = row * num_groups + pi / groups_per_8;
         float scale = float(scales[group_idx]);
         float zero = float(zeros[group_idx]);
 
-        sum += process_u32(row_packed[pi], scale, zero, x + col);
+        uint32_t pack = row_packed[pi];
+
+        // Pre-factor: sx[i] = scale * x[col+i], bx[i] = zero * x[col+i]
+        // Then: contribution = nibble * sx + bx = (nibble * scale + zero) * x
+        // This is algebraically identical but breaks the dependent FMA chain.
+        float sx0 = scale * x_cache[col    ]; float bx0 = zero * x_cache[col    ];
+        float sx1 = scale * x_cache[col + 1]; float bx1 = zero * x_cache[col + 1];
+        float sx2 = scale * x_cache[col + 2]; float bx2 = zero * x_cache[col + 2];
+        float sx3 = scale * x_cache[col + 3]; float bx3 = zero * x_cache[col + 3];
+        float sx4 = scale * x_cache[col + 4]; float bx4 = zero * x_cache[col + 4];
+        float sx5 = scale * x_cache[col + 5]; float bx5 = zero * x_cache[col + 5];
+        float sx6 = scale * x_cache[col + 6]; float bx6 = zero * x_cache[col + 6];
+        float sx7 = scale * x_cache[col + 7]; float bx7 = zero * x_cache[col + 7];
+
+        sum = fma(float((pack      ) & 0xF), sx0, sum) + bx0;
+        sum = fma(float((pack >>  4) & 0xF), sx1, sum) + bx1;
+        sum = fma(float((pack >>  8) & 0xF), sx2, sum) + bx2;
+        sum = fma(float((pack >> 12) & 0xF), sx3, sum) + bx3;
+        sum = fma(float((pack >> 16) & 0xF), sx4, sum) + bx4;
+        sum = fma(float((pack >> 20) & 0xF), sx5, sum) + bx5;
+        sum = fma(float((pack >> 24) & 0xF), sx6, sum) + bx6;
+        sum = fma(float((pack >> 28) & 0xF), sx7, sum) + bx7;
     }
 
-    // SIMD-group reduction (hardware-accelerated on Apple Silicon)
+    // SIMD-group reduction
     sum = simd_sum(sum);
 
     // Cross-simdgroup reduction via shared memory
-    threadgroup float partial[8]; // max 8 simdgroups in 256 threads
+    threadgroup float partial[8];
     uint sg_id = tid / 32;
 
     if (tid % 32 == 0) {
@@ -93,7 +100,6 @@ kernel void dequant_4bit_gemv(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First thread writes final result
     if (tid == 0) {
         float total = 0.0;
         uint num_sgs = min(TG / 32, 8u);
