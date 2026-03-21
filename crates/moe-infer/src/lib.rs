@@ -10,6 +10,7 @@ pub mod attention;
 pub mod blas;
 pub mod config;
 pub mod generate;
+pub mod generate_v2;
 pub mod kv_cache;
 pub mod mla_attention;
 pub mod pipeline;

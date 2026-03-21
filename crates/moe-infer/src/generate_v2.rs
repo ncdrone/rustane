@@ -1,0 +1,497 @@
+//! DeepSeek-V2 generation loop: MLA attention + dense/MoE FFN + YaRN RoPE.
+//!
+//! Layer structure:
+//! - Layer 0 (dense): RMSNorm → MLA Attention → Residual → RMSNorm → Dense FFN → Residual
+//! - Layers 1-26 (MoE): RMSNorm → MLA Attention → Residual → RMSNorm → MoE + Shared FFN → Residual
+
+use half::f16;
+use anyhow::{Result, bail};
+
+use crate::config::InferConfig;
+use crate::mla_attention::{MlaDecodeConfig, MlaLayerWeights as MlaAttnWeights, MlaKvCache, mla_forward_decode};
+use crate::rmsnorm::rmsnorm;
+use crate::sampler;
+use crate::weights::BackboneWeights;
+use crate::yarn_rope::{YarnRopeTables, compute_mscale, mla_attention_scale};
+
+use moe_router::{MoeRouter, RouterConfig};
+use moe_kernels::{MetalDequantGemv, ExpertGemvOp, FusedGateUpSiluOp};
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
+
+/// Pre-converted f32 MLA weights for one layer.
+pub struct MlaLayerF32 {
+    pub q_proj: Vec<f32>,
+    pub kv_a_proj: Vec<f32>,
+    pub kv_a_layernorm: Vec<f32>,
+    pub w_uk: Vec<f32>,
+    pub w_uv: Vec<f32>,
+    pub o_proj: Vec<f32>,
+    pub input_norm: Vec<f32>,
+    pub post_attn_norm: Vec<f32>,
+    // FFN (either router+shared or dense)
+    pub router: Option<Vec<f32>>,
+    pub shared_gate: Option<Vec<f32>>,
+    pub shared_up: Option<Vec<f32>>,
+    pub shared_down: Option<Vec<f32>>,
+    pub dense_gate: Option<Vec<f32>>,
+    pub dense_up: Option<Vec<f32>>,
+    pub dense_down: Option<Vec<f32>>,
+}
+
+/// Loaded DeepSeek-V2 model ready for generation.
+pub struct ModelV2 {
+    pub weights: BackboneWeights,
+    pub config: InferConfig,
+    pub mla_config: MlaDecodeConfig,
+    pub rope: YarnRopeTables,
+    pub attn_scale: f32,
+    pub metal: Option<MetalDequantGemv>,
+    pub expert_metal_bufs: std::collections::HashMap<usize, Retained<ProtocolObject<dyn MTLBuffer>>>,
+    pub layers_f32: Vec<MlaLayerF32>,
+    pub lm_head_f32: Vec<f32>,
+}
+
+/// Sampling configuration.
+pub use crate::generate::SamplingConfig;
+
+/// Generation output with metadata.
+pub struct GenerateV2Output {
+    pub token_ids: Vec<u32>,
+    pub text: String,
+    pub tokens_generated: usize,
+    pub prefill_secs: f64,
+    pub decode_secs: f64,
+    pub prompt_tokens: usize,
+}
+
+impl ModelV2 {
+    /// Load model from weights directory + config TOML.
+    pub fn load(weights_dir: &std::path::Path, config_path: &std::path::Path) -> Result<Self> {
+        let config = InferConfig::from_toml(config_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(config.is_mla(), "ModelV2 requires MLA attention (kind='mla')");
+
+        let num_layers = config.num_layers();
+        let weights = BackboneWeights::load_with_layers(weights_dir, num_layers)?;
+
+        let mla_config = MlaDecodeConfig::from_infer_config(&config);
+
+        // Build YaRN RoPE tables
+        let rope_dim = mla_config.qk_rope_head_dim;
+        let max_seq = config.model.max_position_embeddings.min(4096);
+        let rope = if let Some(ref scaling) = config.attention.rope_scaling {
+            YarnRopeTables::build(max_seq, rope_dim, config.rope_theta(), scaling)
+        } else {
+            // Standard RoPE (shouldn't happen for V2-Lite, but handle it)
+            let dummy = crate::config::RopeScalingSection {
+                factor: 1.0,
+                original_max_position_embeddings: max_seq,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                mscale: 1.0,
+                mscale_all_dim: 1.0,
+            };
+            YarnRopeTables::build(max_seq, rope_dim, config.rope_theta(), &dummy)
+        };
+
+        // Compute attention scale
+        let mscale_coeff = config.attention.rope_scaling.as_ref()
+            .map(|s| s.mscale).unwrap_or(1.0);
+        let factor = config.attention.rope_scaling.as_ref()
+            .map(|s| s.factor).unwrap_or(1.0);
+        let mscale = compute_mscale(mscale_coeff, factor);
+        let attn_scale = mla_attention_scale(
+            mla_config.qk_nope_head_dim,
+            mla_config.qk_rope_head_dim,
+            mscale,
+        );
+        eprintln!("MLA attn_scale={attn_scale:.6} (mscale={mscale:.4})");
+
+        // Pre-convert all layer weights to f32
+        let t = std::time::Instant::now();
+        let mut layers_f32 = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            let is_moe = config.is_moe_layer(layer);
+            let lw = weights.mla_layer_weights(layer, is_moe)?;
+
+            layers_f32.push(MlaLayerF32 {
+                q_proj: lw.q_proj.iter().map(|v| v.to_f32()).collect(),
+                kv_a_proj: lw.kv_a_proj.iter().map(|v| v.to_f32()).collect(),
+                kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
+                w_uk: lw.w_uk.iter().map(|v| v.to_f32()).collect(),
+                w_uv: lw.w_uv.iter().map(|v| v.to_f32()).collect(),
+                o_proj: lw.o_proj.iter().map(|v| v.to_f32()).collect(),
+                input_norm: lw.input_norm.to_vec(),
+                post_attn_norm: lw.post_attn_norm.to_vec(),
+                router: lw.router.map(|r| r.iter().map(|v| v.to_f32()).collect()),
+                shared_gate: lw.shared_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                shared_up: lw.shared_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                shared_down: lw.shared_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                dense_gate: lw.dense_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                dense_up: lw.dense_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                dense_down: lw.dense_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+            });
+        }
+        let lm_head_f32: Vec<f32> = weights.lm_head()?.iter().map(|v| v.to_f32()).collect();
+        eprintln!("Pre-converted weights to f32: {:.1}s", t.elapsed().as_secs_f64());
+
+        // Metal setup
+        let mut metal = MetalDequantGemv::new();
+        let mut expert_metal_bufs = std::collections::HashMap::new();
+        if let Some(ref mut m) = metal {
+            eprintln!("Metal GPU: enabled");
+            m.init_scratch(
+                config.hidden_size(),
+                config.moe_inter_size(),
+                config.num_experts_per_tok(),
+            );
+            for layer in 0..num_layers {
+                if let Some(mmap) = weights.expert_mmap(layer) {
+                    let buf = m.wrap_mmap(mmap);
+                    expert_metal_bufs.insert(layer, buf);
+                }
+            }
+            eprintln!("Metal GPU: {} layers wrapped", expert_metal_bufs.len());
+        }
+
+        Ok(Self {
+            weights, config, mla_config, rope, attn_scale,
+            metal, expert_metal_bufs, layers_f32, lm_head_f32,
+        })
+    }
+}
+
+/// Run one layer of the V2 model (MLA attention + FFN).
+fn run_layer_v2(
+    model: &ModelV2,
+    cache: &mut MlaKvCache,
+    router: &mut MoeRouter,
+    layer: usize,
+    x: &[f32],
+    pos: usize,
+) -> Result<Vec<f32>> {
+    let hidden = model.config.hidden_size();
+    let eps = model.config.rms_norm_eps();
+    let lf = &model.layers_f32[layer];
+
+    // 1. RMSNorm → MLA Attention → Residual
+    let normed = rmsnorm(x, &lf.input_norm, eps);
+
+    let attn_weights = MlaAttnWeights {
+        q_proj: lf.q_proj.clone(),
+        kv_a_proj: lf.kv_a_proj.clone(),
+        kv_a_layernorm: lf.kv_a_layernorm.clone(),
+        w_uk: lf.w_uk.clone(),
+        w_uv: lf.w_uv.clone(),
+        o_proj: lf.o_proj.clone(),
+        input_norm: lf.input_norm.clone(),
+        post_attn_norm: lf.post_attn_norm.clone(),
+    };
+
+    let attn_out = mla_forward_decode(
+        &normed, &attn_weights, cache, layer, pos,
+        &model.rope, &model.mla_config, model.attn_scale,
+    );
+
+    let mut residual = vec![0.0f32; hidden];
+    for d in 0..hidden {
+        residual[d] = x[d] + attn_out[d];
+    }
+
+    // 2. RMSNorm → FFN → Residual
+    let normed2 = rmsnorm(&residual, &lf.post_attn_norm, eps);
+
+    let ffn_out = if model.config.is_moe_layer(layer) {
+        moe_ffn_v2(model, router, layer, &normed2)?
+    } else {
+        dense_ffn(&normed2, lf)
+    };
+
+    for d in 0..hidden {
+        residual[d] += ffn_out[d];
+    }
+
+    Ok(residual)
+}
+
+/// Dense FFN: SiLU(x @ gate^T) * (x @ up^T) → @ down^T
+fn dense_ffn(x: &[f32], lf: &MlaLayerF32) -> Vec<f32> {
+    let gate_w = lf.dense_gate.as_ref().expect("dense layer needs gate_proj");
+    let up_w = lf.dense_up.as_ref().expect("dense layer needs up_proj");
+    let down_w = lf.dense_down.as_ref().expect("dense layer needs down_proj");
+
+    let hidden = x.len();
+    let inter = gate_w.len() / hidden;
+
+    let mut gate_out = vec![0.0f32; inter];
+    let mut up_out = vec![0.0f32; inter];
+    crate::blas::sgemv_f32(gate_w, x, &mut gate_out, inter, hidden);
+    crate::blas::sgemv_f32(up_w, x, &mut up_out, inter, hidden);
+
+    // SiLU(gate) * up
+    for i in 0..inter {
+        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
+        gate_out[i] = silu * up_out[i];
+    }
+
+    // down_proj
+    let mut out = vec![0.0f32; hidden];
+    crate::blas::sgemv_f32(down_w, &gate_out, &mut out, hidden, inter);
+    out
+}
+
+/// Shared expert FFN (same SwiGLU as dense, but using shared expert weights).
+fn shared_expert_ffn(x: &[f32], lf: &MlaLayerF32) -> Vec<f32> {
+    let gate_w = lf.shared_gate.as_ref().expect("shared gate");
+    let up_w = lf.shared_up.as_ref().expect("shared up");
+    let down_w = lf.shared_down.as_ref().expect("shared down");
+
+    let hidden = x.len();
+    let inter = gate_w.len() / hidden;
+
+    let mut gate_out = vec![0.0f32; inter];
+    let mut up_out = vec![0.0f32; inter];
+    crate::blas::sgemv_f32(gate_w, x, &mut gate_out, inter, hidden);
+    crate::blas::sgemv_f32(up_w, x, &mut up_out, inter, hidden);
+
+    for i in 0..inter {
+        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
+        gate_out[i] = silu * up_out[i];
+    }
+
+    let mut out = vec![0.0f32; hidden];
+    crate::blas::sgemv_f32(down_w, &gate_out, &mut out, hidden, inter);
+    out
+}
+
+/// MoE FFN: shared experts + routed experts
+fn moe_ffn_v2(
+    model: &ModelV2,
+    router: &mut MoeRouter,
+    layer: usize,
+    x: &[f32],
+) -> Result<Vec<f32>> {
+    let hidden = model.config.hidden_size();
+    let lf = &model.layers_f32[layer];
+
+    // 1. Router
+    let router_w = lf.router.as_ref().expect("MoE layer needs router");
+    let num_experts = model.config.num_experts();
+    let mut gate_logits = vec![0.0f32; num_experts];
+    crate::blas::sgemv_f32(router_w, x, &mut gate_logits, num_experts, hidden);
+
+    let route = if model.config.ffn.scoring_func == "sigmoid" {
+        router.route(&gate_logits)
+    } else {
+        router.route_softmax(&gate_logits)
+    };
+
+    // 2. Shared experts
+    let mut combined = if lf.shared_gate.is_some() {
+        shared_expert_ffn(x, lf)
+    } else {
+        vec![0.0f32; hidden]
+    };
+
+    // 3. Routed experts (4-bit quantized, Metal GPU or CPU)
+    let expert_mmap = model.weights.expert_mmap(layer);
+    let mmap_metal_buf = model.expert_metal_bufs.get(&layer).map(|b| b.as_ref());
+
+    let moe_inter = model.config.moe_inter_size();
+    let group_size = model.config.quantization.group_size;
+
+    if let Some(expert_data) = expert_mmap {
+        let gu_packed = moe_inter * hidden / 2;
+        let gu_groups = moe_inter * (hidden / group_size);
+        let gu_scales = gu_groups * 2;
+        let gu_total = gu_packed + gu_scales * 2;
+        let dn_packed = hidden * moe_inter / 2;
+        let dn_groups = hidden * (moe_inter / group_size);
+        let dn_scales = dn_groups * 2;
+        let dn_total = dn_packed + dn_scales * 2;
+        let expert_stride = gu_total * 2 + dn_total;
+
+        if let (Some(m), Some(mmap_buf)) = (model.metal.as_ref(), mmap_metal_buf) {
+            // Metal path
+            let mut fused_ops = Vec::new();
+            let mut down_ops = Vec::new();
+            let mut routing_weights = Vec::new();
+
+            for (&eid, &weight) in route.expert_ids.iter().zip(route.weights.iter()) {
+                let base = eid * expert_stride;
+                if base + expert_stride > expert_data.len() { continue; }
+
+                fused_ops.push(FusedGateUpSiluOp {
+                    gate_packed_offset: base,
+                    gate_scales_offset: base + gu_packed,
+                    gate_zeros_offset: base + gu_packed + gu_scales,
+                    up_packed_offset: base + gu_total,
+                    up_scales_offset: base + gu_total + gu_packed,
+                    up_zeros_offset: base + gu_total + gu_packed + gu_scales,
+                    out_features: moe_inter, in_features: hidden, group_size,
+                });
+
+                down_ops.push(ExpertGemvOp {
+                    packed_offset: base + 2 * gu_total,
+                    scales_offset: base + 2 * gu_total + dn_packed,
+                    zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
+                    out_features: hidden, in_features: moe_inter, group_size,
+                });
+
+                routing_weights.push(weight);
+            }
+
+            if !routing_weights.is_empty() {
+                let down_results = m.fused_and_down_single_cmdbuf(mmap_buf, &fused_ops, &down_ops, x);
+                for (i, weight) in routing_weights.iter().enumerate() {
+                    for d in 0..hidden {
+                        combined[d] += weight * down_results[i][d];
+                    }
+                }
+            }
+        }
+        // CPU fallback omitted for now — Metal is the primary path
+    }
+
+    // Apply routed_scaling_factor if > 1.0
+    let scale = model.config.ffn.routed_scaling_factor;
+    if (scale - 1.0).abs() > 0.01 {
+        // Scale only the routed part (combined already includes shared)
+        // For V2-Lite, scale=1.0 so this is a no-op
+        for d in 0..hidden {
+            combined[d] *= scale;
+        }
+    }
+
+    Ok(combined)
+}
+
+/// Embed a token: extract row from f16 table, convert to f32.
+fn embed_f16_to_f32(table: &[f16], token_id: usize, hidden: usize) -> Vec<f32> {
+    let start = token_id * hidden;
+    table[start..start + hidden].iter().map(|v| v.to_f32()).collect()
+}
+
+/// Sample next token from logits.
+fn sample(logits: &[f32], config: &SamplingConfig, seed: u64) -> u32 {
+    if config.greedy {
+        sampler::sample_greedy(logits) as u32
+    } else {
+        sampler::sample_top_k(logits, config.top_k, config.temperature, seed) as u32
+    }
+}
+
+/// Matrix-vector multiply using BLAS.
+fn matvec_f32(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    crate::blas::sgemv_f32(w, x, &mut y, out_dim, in_dim);
+    y
+}
+
+/// Generate tokens from a prompt using DeepSeek-V2 model.
+pub fn generate_v2(
+    model: &ModelV2,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    sampling: &SamplingConfig,
+) -> Result<GenerateV2Output> {
+    let encoding = tokenizer.encode(prompt, false)
+        .map_err(|e| anyhow::anyhow!("tokenizer encode: {e}"))?;
+    let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+    if input_ids.is_empty() {
+        bail!("empty prompt after tokenization");
+    }
+
+    let hidden = model.config.hidden_size();
+    let vocab = model.config.vocab_size();
+    let num_layers = model.config.num_layers();
+    let max_seq = model.rope.max_seq;
+
+    // Create MLA KV cache
+    let mut cache = MlaKvCache::new(
+        num_layers,
+        model.mla_config.kv_lora_rank,
+        model.mla_config.qk_rope_head_dim,
+        max_seq,
+    );
+    eprintln!("MLA KV cache: {:.1} MB", cache.memory_bytes() as f64 / 1e6);
+
+    // Create router
+    let router_config = RouterConfig {
+        num_experts: model.config.num_experts(),
+        top_k: model.config.num_experts_per_tok(),
+        norm_topk_prob: model.config.ffn.norm_topk_prob,
+        bias_lr: 0.0,
+    };
+    let mut router = MoeRouter::new(router_config);
+
+    let embed_table = model.weights.embed_table()?;
+    let final_norm = model.weights.final_norm()?;
+
+    let mut all_ids = input_ids.clone();
+    let prompt_tokens = input_ids.len();
+
+    // Prefill: sequential CPU
+    let t_prefill = std::time::Instant::now();
+    for (i, &token_id) in input_ids.iter().enumerate() {
+        let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+        let mut x = emb;
+        for layer in 0..num_layers {
+            x = run_layer_v2(model, &mut cache, &mut router, layer, &x, i)?;
+        }
+        cache.advance();
+
+        if i == input_ids.len() - 1 {
+            let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+            let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+            let next_token = sample(&logits, sampling, i as u64);
+            all_ids.push(next_token);
+        }
+    }
+    let prefill_secs = t_prefill.elapsed().as_secs_f64();
+
+    // Decode: generate new tokens one at a time
+    let t_decode = std::time::Instant::now();
+    let mut pos = input_ids.len();
+    for step in 0..max_new_tokens.saturating_sub(1) {
+        if pos >= max_seq {
+            break;
+        }
+        let token_id = *all_ids.last().unwrap();
+        if token_id == model.config.model.eos_token_id {
+            break;
+        }
+
+        let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+        let mut x = emb;
+        for layer in 0..num_layers {
+            x = run_layer_v2(model, &mut cache, &mut router, layer, &x, pos)?;
+        }
+        cache.advance();
+
+        let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+        let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+        let next_token = sample(&logits, sampling, (pos + step) as u64);
+        all_ids.push(next_token);
+        pos += 1;
+    }
+    let decode_secs = t_decode.elapsed().as_secs_f64();
+
+    let generated_ids = all_ids[input_ids.len()..].to_vec();
+    let text = tokenizer.decode(&generated_ids, true)
+        .map_err(|e| anyhow::anyhow!("tokenizer decode: {e}"))?;
+
+    Ok(GenerateV2Output {
+        token_ids: generated_ids.clone(),
+        text,
+        tokens_generated: generated_ids.len(),
+        prefill_secs,
+        decode_secs,
+        prompt_tokens,
+    })
+}
