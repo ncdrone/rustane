@@ -2,6 +2,7 @@
 
 pub mod dequant;
 pub mod expert_ffn;
+pub mod gqa_prefill;
 pub mod mla;
 pub mod sparse_attn;
 

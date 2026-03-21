@@ -274,6 +274,115 @@ fn f32_from_f32_slice(s: &[f32]) -> Vec<f32> {
     s.to_vec()
 }
 
+// ---------- Batched GQA (for ANE prefill comparison) ----------
+
+/// Output from batched GQA attention (before O_proj).
+pub struct BatchGqaOutput {
+    /// Raw attention output [seq * q_dim] row-major (before O_proj).
+    pub attn_out: Vec<f32>,
+    /// K after QK-norm + RoPE [seq * kv_dim] row-major.
+    pub k_rope: Vec<f32>,
+    /// V after projection [seq * kv_dim] row-major (no norm/RoPE).
+    pub v: Vec<f32>,
+}
+
+/// Batched GQA forward: all tokens at once with causal masking.
+/// Returns raw attention output (before O_proj) + K/V for cache.
+/// This is the CPU reference for the ANE prefill graph.
+pub fn gqa_forward_batch_f32(
+    xs: &[f32],       // [seq * hidden] row-major
+    seq: usize,
+    q_proj: &[f32],   // [q_dim, hidden] row-major
+    k_proj: &[f32],   // [kv_dim, hidden] row-major
+    v_proj: &[f32],   // [kv_dim, hidden] row-major
+    q_norm_w: &[f32], // [head_dim]
+    k_norm_w: &[f32], // [head_dim]
+    rope: &RopeTables,
+    cfg: &GqaConfig,
+    eps: f32,
+) -> BatchGqaOutput {
+    let hidden = xs.len() / seq;
+    let q_dim = cfg.num_q_heads * cfg.head_dim;
+    let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    let hd = cfg.head_dim;
+
+    // 1. Project all tokens
+    let mut all_q = vec![0.0f32; seq * q_dim];
+    let mut all_k = vec![0.0f32; seq * kv_dim];
+    let mut all_v = vec![0.0f32; seq * kv_dim];
+    for s in 0..seq {
+        let x = &xs[s * hidden..(s + 1) * hidden];
+        let q_out = matvec_f32(q_proj, x, q_dim, hidden);
+        all_q[s * q_dim..(s + 1) * q_dim].copy_from_slice(&q_out);
+        let k_out = matvec_f32(k_proj, x, kv_dim, hidden);
+        all_k[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&k_out);
+        let v_out = matvec_f32(v_proj, x, kv_dim, hidden);
+        all_v[s * kv_dim..(s + 1) * kv_dim].copy_from_slice(&v_out);
+    }
+
+    // 2. QK-norm
+    for s in 0..seq {
+        per_head_rmsnorm(&mut all_q[s * q_dim..(s + 1) * q_dim], q_norm_w, cfg.num_q_heads, eps);
+        per_head_rmsnorm(&mut all_k[s * kv_dim..(s + 1) * kv_dim], k_norm_w, cfg.num_kv_heads, eps);
+    }
+
+    // 3. RoPE
+    for s in 0..seq {
+        rope.apply_all_heads(&mut all_q[s * q_dim..(s + 1) * q_dim], cfg.num_q_heads, s);
+        rope.apply_all_heads(&mut all_k[s * kv_dim..(s + 1) * kv_dim], cfg.num_kv_heads, s);
+    }
+
+    let k_rope_out = all_k.clone();
+    let v_out = all_v.clone();
+
+    // 4. Batched causal attention
+    let scale = 1.0 / (hd as f32).sqrt();
+    let group_size = cfg.group_size();
+    let mut attn_out = vec![0.0f32; seq * q_dim];
+
+    for qh in 0..cfg.num_q_heads {
+        let kv_h = qh / group_size;
+        for s in 0..seq {
+            let q_off = s * q_dim + qh * hd;
+            let q_head = &all_q[q_off..q_off + hd];
+
+            let causal_len = s + 1;
+            let mut scores = vec![0.0f32; causal_len];
+            for t in 0..causal_len {
+                let k_off = t * kv_dim + kv_h * hd;
+                let k_t = &all_k[k_off..k_off + hd];
+                let mut dot = 0.0f64;
+                for d in 0..hd {
+                    dot += q_head[d] as f64 * k_t[d] as f64;
+                }
+                scores[t] = dot as f32 * scale;
+            }
+
+            // Softmax
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut exps: Vec<f32> = scores.iter().map(|&v| (v - max_s).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for e in &mut exps { *e /= sum; }
+
+            // Weighted V
+            let out_off = s * q_dim + qh * hd;
+            for t in 0..causal_len {
+                let v_off = t * kv_dim + kv_h * hd;
+                let v_t = &all_v[v_off..v_off + hd];
+                for d in 0..hd {
+                    attn_out[out_off + d] += exps[t] * v_t[d];
+                }
+            }
+        }
+    }
+
+    BatchGqaOutput {
+        attn_out,
+        k_rope: k_rope_out,
+        v: v_out,
+    }
+}
+
 /// Prefill: process multiple input tokens at once (sequential, not parallel).
 /// Returns the hidden state after the last token.
 pub fn gqa_prefill(

@@ -30,8 +30,9 @@ use crate::rmsnorm::rmsnorm;
 use crate::sampler;
 use crate::weights::{BackboneWeights, LayerWeights};
 
+use ane_bridge::ane::TensorData;
 use moe_router::{MoeRouter, RouterConfig};
-use moe_kernels::{MetalDequantGemv, ExpertGemvOp};
+use moe_kernels::{MetalDequantGemv, ExpertGemvOp, gqa_prefill};
 use quantize::PackedWeights4Bit;
 
 use objc2::rc::Retained;
@@ -47,6 +48,20 @@ pub struct LayerAttnF32 {
     pub router: Vec<f32>,
 }
 
+/// Pre-compiled ANE graphs for batched prefill attention.
+pub struct AnePrefillCache {
+    /// One compiled graph per layer (q_norm_w/k_norm_w baked as constants).
+    exes: Vec<ane_bridge::ane::Executable>,
+    /// Shared activation IOSurface [1, hidden, 1, seq] — re-staged per layer (tiny).
+    acts_td: TensorData,
+    /// Per-layer weight IOSurfaces [1, hidden, 1, wts_sp] — pre-staged at load time.
+    wts_tds: Vec<TensorData>,
+    /// Shared output IOSurface [1, out_ch, 1, seq].
+    output_td: TensorData,
+    /// Compiled sequence length (64, 128, or 256).
+    pub seq: usize,
+}
+
 /// Loaded model ready for generation.
 pub struct Model {
     pub weights: BackboneWeights,
@@ -60,6 +75,8 @@ pub struct Model {
     pub attn_f32: Vec<LayerAttnF32>,
     /// LM head pre-converted to f32.
     pub lm_head_f32: Vec<f32>,
+    /// Pre-compiled ANE prefill graphs (None if ANE unavailable).
+    pub ane_prefill: Option<AnePrefillCache>,
 }
 
 /// Sampling configuration.
@@ -138,8 +155,85 @@ impl Model {
             eprintln!("Metal GPU: not available, using CPU");
         }
 
-        Ok(Self { weights, config, rope, gqa_config, metal, expert_metal_bufs, attn_f32, lm_head_f32 })
+        // Pre-compile ANE prefill graphs (one per layer, seq=64)
+        let ane_prefill = {
+            let t = std::time::Instant::now();
+            let cache = compile_ane_prefill(&config, &weights, &attn_f32, 64);
+            if cache.is_some() {
+                eprintln!("ANE prefill: compiled {} graphs for seq=64 in {:.1}s",
+                    num_layers, t.elapsed().as_secs_f64());
+            } else {
+                eprintln!("ANE prefill: compilation failed, using sequential CPU");
+            }
+            cache
+        };
+
+        Ok(Self { weights, config, rope, gqa_config, metal, expert_metal_bufs, attn_f32, lm_head_f32, ane_prefill })
     }
+}
+
+fn compile_ane_prefill(
+    config: &InferConfig,
+    weights: &BackboneWeights,
+    attn_f32: &[LayerAttnF32],
+    seq: usize,
+) -> Option<AnePrefillCache> {
+    use objc2_foundation::NSQualityOfService;
+
+    let hidden = config.hidden_size();
+    let num_q_heads = config.num_q_heads();
+    let num_kv_heads = config.num_kv_heads();
+    let head_dim = config.head_dim();
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let num_layers = config.num_layers();
+    let wts_sp = gqa_prefill::weight_spatial_width(q_dim, kv_dim);
+
+    let mut exes = Vec::with_capacity(num_layers);
+    let mut wts_tds = Vec::with_capacity(num_layers);
+
+    for layer in 0..num_layers {
+        let lw = weights.layer_weights(layer).ok()?;
+        let graph = gqa_prefill::build_gqa_prefill(
+            hidden, num_q_heads, num_kv_heads, head_dim,
+            seq, config.rope_theta(), config.rms_norm_eps(),
+            lw.q_norm, lw.k_norm,
+        );
+        let exe = graph.compile(NSQualityOfService::UserInteractive).ok()?;
+        exes.push(exe);
+
+        // Pre-stage weights (transposed, done once at load time)
+        let af = &attn_f32[layer];
+        let wts_td = TensorData::new(ane_bridge::ane::Shape {
+            batch: 1, channels: hidden, height: 1, width: wts_sp,
+        });
+        {
+            let mut locked = wts_td.as_f32_slice_mut();
+            let buf = &mut *locked;
+            for c in 0..hidden {
+                for i in 0..q_dim {
+                    buf[c * wts_sp + i] = af.q_proj[i * hidden + c];
+                }
+                for i in 0..kv_dim {
+                    buf[c * wts_sp + q_dim + i] = af.k_proj[i * hidden + c];
+                }
+                for i in 0..kv_dim {
+                    buf[c * wts_sp + q_dim + kv_dim + i] = af.v_proj[i * hidden + c];
+                }
+            }
+        }
+        wts_tds.push(wts_td);
+    }
+
+    let out_ch = gqa_prefill::output_channels(q_dim, kv_dim);
+    let acts_td = TensorData::new(ane_bridge::ane::Shape {
+        batch: 1, channels: hidden, height: 1, width: seq,
+    });
+    let output_td = TensorData::new(ane_bridge::ane::Shape {
+        batch: 1, channels: out_ch, height: 1, width: seq,
+    });
+
+    Some(AnePrefillCache { exes, acts_td, wts_tds, output_td, seq })
 }
 
 /// Parse raw expert bytes into a PackedWeights4Bit for Metal GEMV.
@@ -446,6 +540,99 @@ pub fn run_layer(
     Ok(residual)
 }
 
+/// Process one layer for ALL prefill tokens using ANE batched attention.
+/// Modifies xs in place (accumulates residuals).
+fn prefill_layer_ane(
+    model: &Model,
+    cache: &mut KvCache,
+    router: &mut MoeRouter,
+    layer: usize,
+    xs: &mut [Vec<f32>],
+    ane: &AnePrefillCache,
+) -> Result<()> {
+    let hidden = model.config.hidden_size();
+    let eps = model.config.rms_norm_eps();
+    let q_dim = model.gqa_config.num_q_heads * model.gqa_config.head_dim;
+    let kv_dim = model.gqa_config.num_kv_heads * model.gqa_config.head_dim;
+    let lw = model.weights.layer_weights(layer)?;
+    let af = &model.attn_f32[layer];
+    let prompt_len = xs.len();
+    let seq = ane.seq;
+
+    let input_norm_gamma = lw.input_norm.to_vec();
+    let post_norm_gamma = lw.post_attn_norm.to_vec();
+
+    // 1. RMSNorm all tokens
+    let normed: Vec<Vec<f32>> = xs.iter()
+        .map(|x| rmsnorm(x, &input_norm_gamma, eps))
+        .collect();
+
+    // 2. Stage activations into IOSurface (tiny: hidden × seq = 512 KB)
+    {
+        let mut locked = ane.acts_td.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..hidden {
+            for t in 0..seq {
+                buf[c * seq + t] = if t < prompt_len { normed[t][c] } else { 0.0 };
+            }
+        }
+    }
+
+    // 3. ANE dispatch (weights pre-staged at load time)
+    ane.exes[layer].run(&[&ane.acts_td, &ane.wts_tds[layer]], &[&ane.output_td])
+        .map_err(|e| anyhow::anyhow!("ANE prefill L{layer}: {e:?}"))?;
+
+    // 4. Read output and apply O_proj + cache write per token
+    let output_data: Vec<f32>;
+    {
+        let locked = ane.output_td.as_f32_slice();
+        output_data = locked.to_vec();
+    }
+
+    for t in 0..prompt_len {
+        // Raw attention output [q_dim] from channels [0:q_dim]
+        let mut attn_concat = vec![0.0f32; q_dim];
+        for i in 0..q_dim {
+            attn_concat[i] = output_data[i * seq + t];
+        }
+
+        // O_proj via BLAS (CPU)
+        let attn_out = matvec_f32_direct(&af.o_proj, &attn_concat, hidden, q_dim);
+
+        // K/V for cache from channels [q_dim:q_dim+kv_dim] and [q_dim+kv_dim:]
+        let mut k_rope = vec![0.0f32; kv_dim];
+        let mut v_vals = vec![0.0f32; kv_dim];
+        for i in 0..kv_dim {
+            k_rope[i] = output_data[(q_dim + i) * seq + t];
+            v_vals[i] = output_data[(q_dim + kv_dim + i) * seq + t];
+        }
+        cache.store(layer, t, &k_rope, &v_vals);
+
+        // Residual add (attention)
+        for d in 0..hidden {
+            xs[t][d] += attn_out[d];
+        }
+    }
+
+    // 5. Per-token: RMSNorm → MoE FFN → Residual
+    for t in 0..prompt_len {
+        let normed2 = rmsnorm(&xs[t], &post_norm_gamma, eps);
+        let expert_mmap = model.weights.expert_mmap(layer);
+        let mmap_metal_buf = model.expert_metal_bufs.get(&layer).map(|b| b.as_ref());
+        let ffn_out = moe_ffn(
+            &normed2, &af.router, expert_mmap, mmap_metal_buf,
+            router, model.metal.as_ref(),
+            hidden, model.config.moe_inter_size(),
+            model.config.num_experts(), model.config.quantization.group_size,
+        );
+        for d in 0..hidden {
+            xs[t][d] += ffn_out[d];
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate tokens from a prompt.
 pub fn generate(
     model: &Model,
@@ -492,19 +679,37 @@ pub fn generate(
 
     // Prefill: process all input tokens
     let t_prefill = std::time::Instant::now();
-    for (i, &token_id) in input_ids.iter().enumerate() {
-        let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-        let mut x = emb;
-        for layer in 0..num_layers {
-            x = run_layer(model, &mut cache, &mut router, layer, &x, i)?;
-        }
+    let use_ane = model.ane_prefill.as_ref()
+        .is_some_and(|ane| input_ids.len() <= ane.seq);
 
-        // Only sample from last prefill token
-        if i == input_ids.len() - 1 {
-            let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-            let logits = matvec_f32_direct(&model.lm_head_f32, &normed, vocab, hidden);
-            let next_token = sample(&logits, sampling, i as u64);
-            all_ids.push(next_token);
+    if use_ane {
+        // ANE batched prefill: all tokens through each layer together
+        let ane = model.ane_prefill.as_ref().unwrap();
+        let mut xs: Vec<Vec<f32>> = input_ids.iter()
+            .map(|&id| embed_f16_to_f32(embed_table, id as usize, hidden))
+            .collect();
+        for layer in 0..num_layers {
+            prefill_layer_ane(model, &mut cache, &mut router, layer, &mut xs, ane)?;
+        }
+        let last = &xs[xs.len() - 1];
+        let normed = rmsnorm(last, &final_norm.to_vec(), model.config.rms_norm_eps());
+        let logits = matvec_f32_direct(&model.lm_head_f32, &normed, vocab, hidden);
+        let next_token = sample(&logits, sampling, (input_ids.len() - 1) as u64);
+        all_ids.push(next_token);
+    } else {
+        // Sequential CPU prefill (fallback for long prompts or no ANE)
+        for (i, &token_id) in input_ids.iter().enumerate() {
+            let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+            let mut x = emb;
+            for layer in 0..num_layers {
+                x = run_layer(model, &mut cache, &mut router, layer, &x, i)?;
+            }
+            if i == input_ids.len() - 1 {
+                let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+                let logits = matvec_f32_direct(&model.lm_head_f32, &normed, vocab, hidden);
+                let next_token = sample(&logits, sampling, i as u64);
+                all_ids.push(next_token);
+            }
         }
     }
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
