@@ -471,7 +471,6 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "ane-bridge",
- "libc",
  "memmap2",
  "metal-decode",
  "objc2",
