@@ -718,8 +718,8 @@ fn prefill_layer_ane(
         }
     }
 
-    // 3. ANE dispatch (weights pre-staged at load time)
-    ane.exes[layer].run(&[&ane.acts_td, &ane.wts_tds[layer]], &[&ane.output_td])
+    // 3. ANE dispatch (direct evaluation bypasses XPC daemon)
+    ane.exes[layer].run_cached_direct(&[&ane.acts_td, &ane.wts_tds[layer]], &[&ane.output_td])
         .map_err(|e| anyhow::anyhow!("ANE prefill L{layer}: {e:?}"))?;
 
     // 4. Read output and apply O_proj + cache write per token
