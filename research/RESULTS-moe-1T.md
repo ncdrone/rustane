@@ -260,20 +260,81 @@ Token IDs: [12095, 13, 576, 6722, 315, 279, 3639, 15072, 374, 7148,
 
 ---
 
+## Stage 3 Post-Mortem: Decode Optimization + ANE Prefill — COMPLETE (2026-03-20)
+
+> Date: 2026-03-20. Branch: `rustane-infer`.
+> Goal: Maximize tok/s through hardware acceleration.
+> Result: **0.4 → 14.0 tok/s decode (35x), 0.80s → 0.71s prefill, 20/20 HF match preserved.**
+
+### Optimization journey (4 commits):
+
+| Step | Change | tok/s | Speedup |
+|------|--------|-------|---------|
+| Baseline | CPU dequant GEMV for everything | 0.4 | 1x |
+| +BLAS attention | cblas_sgemv for Q/K/V/O projections (AMX hardware) | 1.0 | 2.5x |
+| +Metal expert FFN | Zero-copy mmap'd 4-bit weights, batched dispatch | 1.0 → 3.5 | 8.8x |
+| +FMA kernel | Pre-factored `scale*x` + threadgroup x-cache | 3.5 → 4.5 | 11x |
+| +Zero-copy + f32 pre-conv | Eliminate per-token f16→f32 conversion (5ms/layer) | 4.5 → 11.7 | 29x |
+| Final (with timing) | Timing breakdown instrumentation | 14.0 | **35x** |
+
+### Architecture (decode, seq=1):
+
+```
+Per layer (48 total):
+  Attention:  BLAS sgemv (Q/K/V/O projections) + CPU softmax
+  Expert FFN: Metal GEMV (zero-copy mmap'd 4-bit weights, batched gate+up+down)
+  Everything else: CPU (RMSNorm, residuals, MoE routing)
+```
+
+### ANE batched prefill attention:
+
+Replaced sequential token-by-token attention with a fused ANE graph that processes all prompt tokens in one dispatch per layer.
+
+**Graph:** Two-input design (activations re-staged per layer at 512KB; weights pre-staged once at load time at 20MB/layer). Fuses QKV projection → QK-norm (pow(-0.5), not rsqrt) → neox RoPE → grouped causal SDPA. O_proj + expert FFN remain on CPU/Metal.
+
+**ANE accuracy:** attn max_diff=0.0016, K max_diff=0.013, V max_diff=0.0009 (all well under 0.05 fp16 tolerance).
+
+| Metric | Before | After | Notes |
+|--------|--------|-------|-------|
+| Prefill (13 tokens) | 0.80s | 0.71s | ANE attention fast, expert FFN dominates (~500ms) |
+| Decode | 14.0 tok/s | 14.1 tok/s | Unchanged |
+| HF match | 20/20 | 20/20 | Greedy output identical |
+| ANE graph compile | — | 8.8s (48 graphs) | One-time cost at model load |
+
+**Why prefill improvement is modest:** Expert FFN runs per-token on Metal (~0.5s of 0.8s total). ANE attention replaced ~0.3s of compute with ~0.01s dispatch, but the FFN bottleneck remains. To get prefill under 0.2s would require batched expert FFN on ANE (blocked by variable routing + 4-bit weights).
+
+### New modules (Stage 3):
+
+| Module | Lines | Function |
+|--------|-------|----------|
+| `gqa_prefill.rs` | 226 | ANE fused GQA graph: QKV proj + QK-norm + neox RoPE + grouped causal SDPA |
+| `test_ane_prefill.rs` | 163 | ANE vs CPU correctness (seq=64, seq=128) |
+| `attention.rs` additions | +109 | `BatchGqaOutput`, `gqa_forward_batch_f32()` CPU reference |
+| `generate.rs` additions | +218 | `AnePrefillCache`, `compile_ane_prefill()`, `prefill_layer_ane()` |
+
+### Key decisions:
+
+1. **Grouped attention over K/V expansion** — matmul broadcast [1,8,seq,hd] @ [1,1,hd,seq] works on ANE, avoids 64 identity slices for GQA dedup.
+2. **Two-input graph** — pre-staging weights eliminates 40MB/layer cache-unfriendly transpose during generation. Initial single-input design was 3.4x *slower* than sequential CPU.
+3. **pow(-0.5) not rsqrt** — ANE compiler fails on rsqrt after reduce ops (confirmed in CLAUDE.md gotchas).
+4. **Expert FFN stays on Metal** — different tokens route to different experts (can't batch on ANE) + 4-bit weights need CPU dequant.
+
+---
+
 ## What's NOT Done (Gaps → Production)
 
 ### Critical path to 25-30 tok/s:
-1. **Metal GEMV for expert dispatch** — CPU dequant is the bottleneck (0.4 → 25-30 tok/s expected)
-2. **Fused Metal kernels** — gate+up+SwiGLU in single dispatch (flash-moe: +12% from FMA kernel)
+1. ~~**Metal GEMV for expert dispatch**~~ DONE — 0.4 → 14 tok/s
+2. ~~**FMA kernel reorder**~~ DONE — +12% from pre-factored scale*x
 3. **3-stage CMD buffer pipeline** — overlap GPU/CPU/SSD
-4. **Batch expert dispatch** — all 8 experts in one Metal pass
+4. **Speculative decoding** — draft model + verify (2-4x potential)
 
 ### Important but not blocking:
 - Delta patching (Orion-style ANE weight reloading)
 - 2MB-aligned pread buffers (flash-moe: 3.6x DMA speedup)
 - Quality benchmarks (MMLU, perplexity)
-- Speculative decoding evaluation
-- ANE attention fusion (Stage 3 target)
+- Batched expert FFN for faster prefill (currently bottlenecked at ~500ms)
+- Pre-compile ANE graphs for seq=128, 256 (currently only seq=64)
 
 ### Learned from flash-moe (58 experiments):
 - **Trust OS page cache** — all custom caching was slower (delete our LRU for production)
@@ -288,6 +349,29 @@ Token IDs: [12095, 13, 576, 6722, 315, 279, 3639, 15072, 374, 7148,
 - **bf16 requires torch for loading** — numpy can't read bfloat16 safetensors. Use `framework='pt'` with safe_open.
 - **Model fits in 128GB RAM at 4-bit** — no SSD streaming needed for Qwen3-30B. The pager/streamer infrastructure is for 700B+ models.
 
+### Learned from Stage 3 execution:
+- **Weight staging is the ANE bottleneck** — initial single-IOSurface design caused 40MB/layer cache-unfriendly transpose per dispatch, making ANE prefill 3.4x *slower* than CPU. Two-input design (pre-staged weights) fixed it.
+- **ANE matmul supports batch broadcasting** — [1,8,seq,hd] @ [1,1,hd,seq] works for grouped attention, avoiding expensive K/V head expansion via concat.
+- **f32 pre-conversion is crucial** — eliminating per-token f16→f32 conversion (5ms/layer × 48 layers = 240ms) gave 2.6x speedup.
+- **Expert FFN dominates prefill** — ANE attention is fast (~10ms total), but per-token Metal expert FFN takes ~500ms for 13 tokens × 48 layers. Prefill optimization requires batched expert dispatch.
+
+---
+
+## Measured Benchmarks
+
+| Metric | Result | Target | Status |
+|--------|--------|--------|--------|
+| **Decode tok/s** | **14.0** | 25-30 | **35x from baseline (0.4)** |
+| **Prefill (13 tokens)** | **0.71s** | 0.1-0.2s | Attention fast, FFN dominates |
+| **HF greedy match** | **20/20** | 20/20 | Exact match maintained |
+| Metal dequant bandwidth (8Kx8K) | 143.5 GiB/s | 400 GiB/s | 36% — needs fused kernels |
+| pread throughput (8 threads) | 59.9 GB/s | >5 GB/s | 12x exceeded |
+| 4-bit quant error (real weights) | 0.023 max | <0.2 | Excellent |
+| Metal vs CPU (real weights) | <1e-6 diff | <1e-3 | Near-perfect |
+| ANE attn vs CPU (fp16 tolerance) | 0.013 max | <0.05 | Well within bounds |
+| MLA KV cache (8K ctx, 61L) | 0.95 GB | <1 GB | On budget |
+| Expert usage balance | 0.956-1.048 | ~1.0 | Excellent |
+
 ---
 
 ## Test Summary
@@ -299,14 +383,20 @@ Token IDs: [12095, 13, 576, 6722, 315, 279, 3639, 15072, 374, 7148,
 | moe-router | 13 (5 inline + 8 integration) | All pass |
 | expert-pager | 10 (7 pool + 3 loader) | All pass |
 | moe-kernels | 0 (tests in moe-infer) | N/A |
-| moe-infer | 44 (13 lib + 4 nibble + 5 weights + 2 tok + 8 attn + 3 gen + 9 legacy) | All pass |
-| **Total** | **110+** | **0 failures** |
+| moe-infer | 46+ (13 lib + 4 nibble + 5 weights + 2 tok + 8 attn + 3 gen + 2 ANE prefill + 9 legacy) | All pass |
+| **Total** | **112+** | **0 failures** |
 
 ---
 
 ## Commits on rustane-infer
 
 ```
+2541b68 feat: ANE batched prefill attention — fused GQA graph + pipeline wiring
+9256bc5 feat: timing breakdown (prefill/decode) + CLI output
+0ce7326 perf: zero-copy Metal + f32 pre-conversion → 0.4 → 11.7 tok/s (29x)
+3dc9c16 perf: FMA kernel upgrade — pre-factored scale*x + threadgroup x-cache
+3fe70b0 perf: BLAS attention + Metal GEMV for expert FFN (0.4 → 1.0 tok/s)
+0d84c90 plan: Stage 3 ANE-first inference (8 tasks, reviewed)
 cd5a700 Update Cargo.lock for safetensors dev-dependency
 78f589f E2E inference: real Qwen3-MoE-30B weights streamed from SSD via pread
 a874757 Validate quantization pipeline on real Qwen3-MoE-30B weights
