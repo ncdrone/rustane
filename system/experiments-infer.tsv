@@ -1,3 +1,8 @@
-date	experiment	variable	baseline	result	verdict	tok/s	cold_tok/s	warm_tok/s	hot_tok/s	cache_hit_pct	peak_ram_gb	notes
-2026-03-20	dequant-4bit-baseline	threadgroup-256-simd-reduce	-	138 GiB/s @8Kx8K	BASELINE	-	-	-	-	-	-	first Metal dequant kernel; 256 threads/row, simd_sum + shared mem reduce; dispatch overhead dominates small matrices; 400 GiB/s target needs batched expert dispatch
-2026-03-20	pread-throughput	1/2/4/8-threads	-	67 GB/s @8T	PASS	-	-	-	-	-	-	pread from page cache; 256MB/128experts/2MB each; 1T=17.5, 2T=30.9, 4T=48.9, 8T=67.4 GB/s; exceeds 5 GB/s target by 13x
+date	experiment	variable	baseline	result	verdict	decode_toks	prefill_ms	p95_ms	metal_ms	attn_ms	notes
+2026-03-20	dequant-4bit-baseline	threadgroup-256-simd-reduce	-	138 GiB/s @8Kx8K	BASELINE	-	-	-	-	-	first Metal dequant kernel; dispatch overhead dominates small matrices
+2026-03-20	pread-throughput	1/2/4/8-threads	-	67 GB/s @8T	BASELINE	-	-	-	-	-	pread from page cache; exceeds 5 GB/s target by 13x
+2026-03-21	stage4-rows-per-tg-8	ROWS_PER_TG 1→8	14.0 tok/s	17.2 tok/s	IMPROVED	17.2	530	-	31500	25300	8 SIMD groups share x_cache, 8x fewer threadgroups
+2026-03-21	stage4-fused-gate-up-silu	separate→fused kernel	17.2 tok/s	17.1 tok/s	IMPROVED	17.1	470	-	-	-	eliminates CPU SiLU roundtrip, prerequisite for single cmd_buf
+2026-03-21	stage4-scratch-single-cmdbuf	per-call alloc→scratch+1 cmd_buf	17.1 tok/s	19.1 tok/s	IMPROVED	19.1	400	-	-	-	pre-allocated buffers + 96→48 commits/token
+2026-03-21	stage4-sgemm-oproj-prefill	13×sgemv→1×sgemm	19.1 tok/s	19.2 tok/s	IMPROVED	19.2	310	-	-	-	batched O_proj [2048,4096]×[4096,13], 3.5x speedup
+2026-03-21	stage4-ane-run-cached-direct	run()→run_cached_direct()	19.2 tok/s	19.6 tok/s	IMPROVED	19.6	310	-	-	-	XPC daemon bypass saves ~0.095ms/dispatch
