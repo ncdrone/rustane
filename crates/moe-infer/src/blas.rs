@@ -25,6 +25,23 @@ unsafe extern "C" {
         y: *mut f32,
         incy: i32,
     );
+
+    fn cblas_sgemm(
+        order: i32,
+        transa: i32,
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
 }
 
 /// y = W @ x using Accelerate cblas_sgemv.
@@ -80,6 +97,33 @@ pub fn sgemv_f16(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: us
     }
 }
 
+/// C = A @ B using Accelerate cblas_sgemm.
+/// A is [m, k] row-major, B is [k, n] row-major, C is [m, n] row-major.
+pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), k * n);
+    debug_assert_eq!(c.len(), m * n);
+
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,          // alpha
+            a.as_ptr(),
+            k as i32,     // lda
+            b.as_ptr(),
+            n as i32,     // ldb
+            0.0,          // beta
+            c.as_mut_ptr(),
+            n as i32,     // ldc
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +153,34 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-3, "BLAS vs naive max_diff={max_diff}");
+    }
+
+    #[test]
+    fn sgemm_matches_naive() {
+        let m = 2048;
+        let n = 13;
+        let k = 4096;
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.0001).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.001).cos()).collect();
+        let mut blas_out = vec![0.0f32; m * n];
+        sgemm(&a, &b, &mut blas_out, m, n, k);
+
+        // Naive reference
+        let mut naive_out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a[i * k + p] as f64 * b[p * n + j] as f64;
+                }
+                naive_out[i * n + j] = sum as f32;
+            }
+        }
+
+        let max_diff = blas_out.iter().zip(naive_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-2, "BLAS sgemm vs naive max_diff={max_diff}");
     }
 
     #[test]
