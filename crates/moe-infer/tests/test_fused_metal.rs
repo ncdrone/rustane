@@ -1,6 +1,6 @@
 //! Metal kernel correctness tests (v2 shader, fused kernels).
 
-use moe_kernels::{MetalDequantGemv, ExpertGemvOp};
+use moe_kernels::{MetalDequantGemv, ExpertGemvOp, FusedGateUpSiluOp};
 use half::f16;
 use quantize::PackedWeights4Bit;
 
@@ -198,4 +198,64 @@ fn v2_shader_multiple_sizes() {
         assert!(max_diff < 1e-3,
             "V2 diverges at [{out_features},{in_features}]: max_diff={max_diff}");
     }
+}
+
+#[test]
+fn fused_gate_up_silu_matches_sequential() {
+    let metal = MetalDequantGemv::new().expect("Metal GPU required");
+
+    let out_features = 768;
+    let in_features = 2048;
+    let group_size = 32;
+
+    // Create gate and up weights
+    let gate_w: Vec<f32> = (0..out_features * in_features)
+        .map(|i| (i as f32 * 0.001).sin() * 0.5)
+        .collect();
+    let up_w: Vec<f32> = (0..out_features * in_features)
+        .map(|i| (i as f32 * 0.0013 + 0.5).cos() * 0.5)
+        .collect();
+    let x: Vec<f32> = (0..in_features)
+        .map(|i| (i as f32 * 0.01).cos())
+        .collect();
+
+    let gate_bytes = pack_test_weights(&gate_w, out_features, in_features, group_size);
+    let up_bytes = pack_test_weights(&up_w, out_features, in_features, group_size);
+
+    // Sequential: gate GEMV → CPU SiLU → up GEMV → element-wise multiply
+    let gate_out = cpu_dequant_gemv(&gate_bytes, &x, out_features, in_features, group_size);
+    let up_out = cpu_dequant_gemv(&up_bytes, &x, out_features, in_features, group_size);
+    let sequential: Vec<f32> = gate_out.iter().zip(up_out.iter())
+        .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+        .collect();
+
+    // Fused: combine gate+up into one mmap buffer and use fused kernel
+    let packed_u32s = out_features * in_features / 8;
+    let num_groups = out_features * (in_features / group_size);
+    let matrix_bytes = packed_u32s * 4 + num_groups * 2 + num_groups * 2;
+
+    let mut combined_mmap = Vec::new();
+    combined_mmap.extend_from_slice(&gate_bytes);
+    combined_mmap.extend_from_slice(&up_bytes);
+    let mmap_buf = metal.wrap_mmap(&combined_mmap);
+
+    let fused_op = FusedGateUpSiluOp {
+        gate_packed_offset: 0,
+        gate_scales_offset: packed_u32s * 4,
+        gate_zeros_offset: packed_u32s * 4 + num_groups * 2,
+        up_packed_offset: matrix_bytes,
+        up_scales_offset: matrix_bytes + packed_u32s * 4,
+        up_zeros_offset: matrix_bytes + packed_u32s * 4 + num_groups * 2,
+        out_features, in_features, group_size,
+    };
+
+    let fused_result = metal.batch_fused_gate_up_silu_mmap(&mmap_buf, &[fused_op], &[&x]);
+    let fused_out = &fused_result[0];
+
+    let max_diff = sequential.iter().zip(fused_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+
+    eprintln!("Fused vs sequential: max_diff={max_diff:.6}");
+    assert!(max_diff < 1e-3, "Fused gate+up+SiLU diverges from sequential: max_diff={max_diff}");
 }

@@ -6,7 +6,7 @@ pub mod gqa_prefill;
 pub mod mla;
 pub mod sparse_attn;
 
-pub use dequant::{MetalDequantGemv, ExpertGemvOp};
+pub use dequant::{MetalDequantGemv, ExpertGemvOp, FusedGateUpSiluOp};
 pub use expert_ffn::ExpertWeights;
 pub use mla::{MlaConfig, MlaKvCache};
 pub use sparse_attn::{SparseAttnConfig, TieredKvCache};

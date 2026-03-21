@@ -190,6 +190,137 @@ kernel void dequant_4bit_gemv_v2(
 }
 "#;
 
+/// Fused gate+up+SiLU kernel: computes SiLU(gate @ x) * (up @ x) in one pass.
+/// Eliminates GPU→CPU→GPU roundtrip for SiLU. Uses ROWS_PER_TG=8.
+/// gate and up weights are at separate offsets in the same mmap buffer.
+const FUSED_GATE_UP_SILU_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void fused_gate_up_silu(
+    device const uint32_t* gate_packed [[buffer(0)]],
+    device const half* gate_scales     [[buffer(1)]],
+    device const half* gate_zeros      [[buffer(2)]],
+    device const uint32_t* up_packed   [[buffer(3)]],
+    device const half* up_scales       [[buffer(4)]],
+    device const half* up_zeros        [[buffer(5)]],
+    device const float* x              [[buffer(6)]],
+    device float* y                    [[buffer(7)]],
+    constant uint& in_features         [[buffer(8)]],
+    constant uint& group_size          [[buffer(9)]],
+    constant uint& out_features        [[buffer(10)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]
+) {
+    const uint ROWS_PER_TG = 8;
+    const uint TG = 256;
+    const uint THREADS_PER_ROW = TG / ROWS_PER_TG; // 32
+
+    const uint packed_per_row = in_features / 8;
+    const uint num_groups = in_features / group_size;
+    const uint groups_per_8 = group_size / 8;
+
+    // Cache x (shared across all 8 rows)
+    threadgroup float x_cache[4096];
+    for (uint i = tid; i < in_features; i += TG) {
+        x_cache[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint local_row = tid / THREADS_PER_ROW;
+    uint lane = tid % THREADS_PER_ROW;
+    uint row = tgid * ROWS_PER_TG + local_row;
+
+    if (row >= out_features) return;
+
+    float gate_sum = 0.0;
+    float up_sum = 0.0;
+
+    device const uint32_t* gate_row_packed = gate_packed + row * packed_per_row;
+    device const uint32_t* up_row_packed = up_packed + row * packed_per_row;
+
+    for (uint pi = lane; pi < packed_per_row; pi += THREADS_PER_ROW) {
+        uint col = pi * 8;
+        uint group_idx = row * num_groups + pi / groups_per_8;
+
+        float g_scale = float(gate_scales[group_idx]);
+        float g_zero = float(gate_zeros[group_idx]);
+        float u_scale = float(up_scales[group_idx]);
+        float u_zero = float(up_zeros[group_idx]);
+
+        uint32_t g_pack = gate_row_packed[pi];
+        uint32_t u_pack = up_row_packed[pi];
+
+        // Pre-factor x values (shared between gate and up)
+        float xv0 = x_cache[col    ]; float xv1 = x_cache[col + 1];
+        float xv2 = x_cache[col + 2]; float xv3 = x_cache[col + 3];
+        float xv4 = x_cache[col + 4]; float xv5 = x_cache[col + 5];
+        float xv6 = x_cache[col + 6]; float xv7 = x_cache[col + 7];
+
+        // Gate GEMV
+        float gsx0 = g_scale * xv0; float gbx0 = g_zero * xv0;
+        float gsx1 = g_scale * xv1; float gbx1 = g_zero * xv1;
+        float gsx2 = g_scale * xv2; float gbx2 = g_zero * xv2;
+        float gsx3 = g_scale * xv3; float gbx3 = g_zero * xv3;
+        float gsx4 = g_scale * xv4; float gbx4 = g_zero * xv4;
+        float gsx5 = g_scale * xv5; float gbx5 = g_zero * xv5;
+        float gsx6 = g_scale * xv6; float gbx6 = g_zero * xv6;
+        float gsx7 = g_scale * xv7; float gbx7 = g_zero * xv7;
+
+        gate_sum = fma(float((g_pack      ) & 0xF), gsx0, gate_sum) + gbx0;
+        gate_sum = fma(float((g_pack >>  4) & 0xF), gsx1, gate_sum) + gbx1;
+        gate_sum = fma(float((g_pack >>  8) & 0xF), gsx2, gate_sum) + gbx2;
+        gate_sum = fma(float((g_pack >> 12) & 0xF), gsx3, gate_sum) + gbx3;
+        gate_sum = fma(float((g_pack >> 16) & 0xF), gsx4, gate_sum) + gbx4;
+        gate_sum = fma(float((g_pack >> 20) & 0xF), gsx5, gate_sum) + gbx5;
+        gate_sum = fma(float((g_pack >> 24) & 0xF), gsx6, gate_sum) + gbx6;
+        gate_sum = fma(float((g_pack >> 28) & 0xF), gsx7, gate_sum) + gbx7;
+
+        // Up GEMV
+        float usx0 = u_scale * xv0; float ubx0 = u_zero * xv0;
+        float usx1 = u_scale * xv1; float ubx1 = u_zero * xv1;
+        float usx2 = u_scale * xv2; float ubx2 = u_zero * xv2;
+        float usx3 = u_scale * xv3; float ubx3 = u_zero * xv3;
+        float usx4 = u_scale * xv4; float ubx4 = u_zero * xv4;
+        float usx5 = u_scale * xv5; float ubx5 = u_zero * xv5;
+        float usx6 = u_scale * xv6; float ubx6 = u_zero * xv6;
+        float usx7 = u_scale * xv7; float ubx7 = u_zero * xv7;
+
+        up_sum = fma(float((u_pack      ) & 0xF), usx0, up_sum) + ubx0;
+        up_sum = fma(float((u_pack >>  4) & 0xF), usx1, up_sum) + ubx1;
+        up_sum = fma(float((u_pack >>  8) & 0xF), usx2, up_sum) + ubx2;
+        up_sum = fma(float((u_pack >> 12) & 0xF), usx3, up_sum) + ubx3;
+        up_sum = fma(float((u_pack >> 16) & 0xF), usx4, up_sum) + ubx4;
+        up_sum = fma(float((u_pack >> 20) & 0xF), usx5, up_sum) + ubx5;
+        up_sum = fma(float((u_pack >> 24) & 0xF), usx6, up_sum) + ubx6;
+        up_sum = fma(float((u_pack >> 28) & 0xF), usx7, up_sum) + ubx7;
+    }
+
+    // SIMD reduction
+    gate_sum = simd_sum(gate_sum);
+    up_sum = simd_sum(up_sum);
+
+    // SiLU(gate) * up — applied inline on lane 0
+    if (lane == 0) {
+        float silu_gate = gate_sum / (1.0 + exp(-gate_sum));
+        y[row] = silu_gate * up_sum;
+    }
+}
+"#;
+
+/// Expert gate+up+SiLU fused operation layout.
+pub struct FusedGateUpSiluOp {
+    pub gate_packed_offset: usize,
+    pub gate_scales_offset: usize,
+    pub gate_zeros_offset: usize,
+    pub up_packed_offset: usize,
+    pub up_scales_offset: usize,
+    pub up_zeros_offset: usize,
+    pub out_features: usize,
+    pub in_features: usize,
+    pub group_size: usize,
+}
+
 /// Expert GEMV layout info for zero-copy offset-based dispatch.
 pub struct ExpertGemvOp {
     /// Byte offset into mmap buffer for packed data
@@ -211,6 +342,8 @@ pub struct MetalDequantGemv {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// V2: ROWS_PER_TG=8 shader (8 SIMD groups share x_cache).
     pipeline_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Fused gate+up+SiLU shader.
+    pipeline_fused: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl MetalDequantGemv {
@@ -237,7 +370,16 @@ impl MetalDequantGemv {
             .newComputePipelineStateWithFunction_error(&function_v2)
             .ok()?;
 
-        Some(Self { device, queue, pipeline, pipeline_v2 })
+        // Fused gate+up+SiLU pipeline
+        let source_fused = objc2_foundation::NSString::from_str(FUSED_GATE_UP_SILU_SHADER);
+        let library_fused = device.newLibraryWithSource_options_error(&source_fused, None).ok()?;
+        let fn_name_fused = objc2_foundation::NSString::from_str("fused_gate_up_silu");
+        let function_fused = library_fused.newFunctionWithName(&fn_name_fused)?;
+        let pipeline_fused = device
+            .newComputePipelineStateWithFunction_error(&function_fused)
+            .ok()?;
+
+        Some(Self { device, queue, pipeline, pipeline_v2, pipeline_fused })
     }
 
     /// Compute y = packed_weights @ x on the GPU.
@@ -465,6 +607,107 @@ impl MetalDequantGemv {
         cmd.waitUntilCompleted();
 
         // Read back results
+        ops.iter().enumerate().map(|(i, op)| {
+            let mut out = vec![0.0f32; op.out_features];
+            unsafe {
+                let src = y_bufs[i].contents().as_ptr() as *const f32;
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), op.out_features);
+            }
+            out
+        }).collect()
+    }
+
+    /// Batched fused gate+up+SiLU: computes SiLU(gate@x) * (up@x) for each expert.
+    /// Returns one activated vector per expert (ready for down GEMV).
+    /// Uses single cmd_buf for all experts.
+    pub fn batch_fused_gate_up_silu_mmap(
+        &self,
+        mmap_buf: &ProtocolObject<dyn MTLBuffer>,
+        ops: &[FusedGateUpSiluOp],
+        x_slices: &[&[f32]],
+    ) -> Vec<Vec<f32>> {
+        if ops.is_empty() { return vec![]; }
+        assert_eq!(ops.len(), x_slices.len());
+
+        // Deduplicate x_bufs
+        let mut x_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> = Vec::new();
+        let mut x_buf_map: Vec<(*const f32, usize)> = Vec::new();
+        let mut x_buf_indices: Vec<usize> = Vec::with_capacity(ops.len());
+
+        for x in x_slices {
+            let ptr = x.as_ptr();
+            if let Some(&(_, idx)) = x_buf_map.iter().find(|&&(p, _)| p == ptr) {
+                x_buf_indices.push(idx);
+            } else {
+                let idx = x_bufs.len();
+                x_bufs.push(self.make_buffer(ptr as *const u8, x.len() * 4));
+                x_buf_map.push((ptr, idx));
+                x_buf_indices.push(idx);
+            }
+        }
+
+        // Create y buffers
+        let y_bufs: Vec<_> = ops.iter().map(|op| {
+            self.device
+                .newBufferWithLength_options(
+                    op.out_features * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("y_buf")
+        }).collect();
+
+        // Constant buffers
+        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+
+        for op in ops {
+            in_feat_bufs.entry(op.in_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
+            group_bufs.entry(op.group_size as u32)
+                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
+            out_feat_bufs.entry(op.out_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
+        }
+
+        const ROWS_PER_TG: usize = 8;
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+
+        enc.setComputePipelineState(&self.pipeline_fused);
+
+        for (i, op) in ops.iter().enumerate() {
+            let ifb = &in_feat_bufs[&(op.in_features as u32)];
+            let gb = &group_bufs[&(op.group_size as u32)];
+            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_packed_offset, 3);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_scales_offset, 4);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_zeros_offset, 5);
+                enc.setBuffer_offset_atIndex(Some(&x_bufs[x_buf_indices[i]]), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(&y_bufs[i]), 0, 7);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 8);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 9);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 10);
+
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
+                let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            }
+        }
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
         ops.iter().enumerate().map(|(i, op)| {
             let mut out = vec![0.0f32; op.out_features];
             unsafe {
