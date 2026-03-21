@@ -111,11 +111,24 @@ kernel void dequant_4bit_gemv(
 }
 "#;
 
+/// Expert GEMV layout info for zero-copy offset-based dispatch.
+pub struct ExpertGemvOp {
+    /// Byte offset into mmap buffer for packed data
+    pub packed_offset: usize,
+    /// Byte offset into mmap buffer for scales
+    pub scales_offset: usize,
+    /// Byte offset into mmap buffer for zeros
+    pub zeros_offset: usize,
+    pub out_features: usize,
+    pub in_features: usize,
+    pub group_size: usize,
+}
+
 /// Metal-accelerated fused 4-bit dequant + GEMV.
 /// Compile once, reuse for all inference steps.
 pub struct MetalDequantGemv {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    pub device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
@@ -211,6 +224,156 @@ impl MetalDequantGemv {
         }
 
         (y, elapsed)
+    }
+
+    /// Encode a GEMV dispatch into an existing command encoder (no commit).
+    /// Caller manages command buffer lifecycle for batching.
+    /// Returns the output buffer for reading results after commit.
+    pub fn encode_into(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        weights: &PackedWeights4Bit,
+        x_buf: &ProtocolObject<dyn MTLBuffer>,
+        y_buf: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let packed_buf = self.make_buffer(
+            weights.data.as_ptr() as *const u8,
+            weights.data.len() * 4,
+        );
+        let scales_buf = self.make_buffer(
+            weights.scales.as_ptr() as *const u8,
+            weights.scales.len() * 2,
+        );
+        let zeros_buf = self.make_buffer(
+            weights.zeros.as_ptr() as *const u8,
+            weights.zeros.len() * 2,
+        );
+        let in_feat_buf = self.u32_buffer(weights.in_features as u32);
+        let group_buf = self.u32_buffer(weights.group_size as u32);
+
+        self.encode_dispatch(
+            enc, &packed_buf, &scales_buf, &zeros_buf,
+            x_buf, y_buf, &in_feat_buf, &group_buf,
+            weights.out_features,
+        );
+    }
+
+    /// Wrap an mmap'd byte slice as a zero-copy Metal buffer.
+    /// Falls back to copy-based buffer if alignment requirements aren't met.
+    pub fn wrap_mmap(&self, data: &[u8]) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        const PAGE_SIZE: usize = 16384; // Apple Silicon uses 16KB pages
+        let ptr = data.as_ptr() as usize;
+        let len = data.len();
+        // Round up length to page boundary for Metal
+        let padded_len = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        if ptr % PAGE_SIZE == 0 && padded_len >= PAGE_SIZE {
+            // Zero-copy: wrap existing memory
+            if let Some(buf) = unsafe {
+                self.device.newBufferWithBytesNoCopy_length_options_deallocator(
+                    NonNull::new(data.as_ptr() as *mut c_void).expect("non-null"),
+                    padded_len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            } {
+                return buf;
+            }
+        }
+        // Fallback: copy-based
+        self.make_buffer(data.as_ptr() as *const u8, len)
+    }
+
+    /// Batched GEMV using pre-wrapped mmap buffer (zero-copy weights).
+    /// All expert weights come from `mmap_buf` at different offsets.
+    /// Deduplicates x_bufs and u32 constant buffers for minimal allocation overhead.
+    pub fn batch_gemv_mmap(
+        &self,
+        mmap_buf: &ProtocolObject<dyn MTLBuffer>,
+        ops: &[ExpertGemvOp],
+        x_slices: &[&[f32]],
+    ) -> Vec<Vec<f32>> {
+        if ops.is_empty() { return vec![]; }
+        assert_eq!(ops.len(), x_slices.len());
+
+        // Deduplicate x_bufs by pointer identity (gate+up share same x)
+        let mut x_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> = Vec::new();
+        let mut x_buf_map: Vec<(*const f32, usize)> = Vec::new(); // (ptr, buf_index)
+        let mut x_buf_indices: Vec<usize> = Vec::with_capacity(ops.len());
+
+        for x in x_slices {
+            let ptr = x.as_ptr();
+            if let Some(&(_, idx)) = x_buf_map.iter().find(|&&(p, _)| p == ptr) {
+                x_buf_indices.push(idx);
+            } else {
+                let idx = x_bufs.len();
+                x_bufs.push(self.make_buffer(ptr as *const u8, x.len() * 4));
+                x_buf_map.push((ptr, idx));
+                x_buf_indices.push(idx);
+            }
+        }
+
+        // Create y buffers (one per op, small)
+        let y_bufs: Vec<_> = ops.iter().map(|op| {
+            self.device
+                .newBufferWithLength_options(
+                    op.out_features * 4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("y_buf")
+        }).collect();
+
+        // Pre-create constant buffers (deduplicated by value)
+        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+
+        for op in ops {
+            in_feat_bufs.entry(op.in_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
+            group_bufs.entry(op.group_size as u32)
+                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
+        }
+
+        // Encode all dispatches
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+
+        unsafe { enc.setComputePipelineState(&self.pipeline); }
+
+        for (i, op) in ops.iter().enumerate() {
+            let ifb = &in_feat_bufs[&(op.in_features as u32)];
+            let gb = &group_bufs[&(op.group_size as u32)];
+
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(&x_bufs[x_buf_indices[i]]), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&y_bufs[i]), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 5);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 6);
+
+                let threadgroups = MTLSize { width: op.out_features, height: 1, depth: 1 };
+                let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            }
+        }
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        // Read back results
+        ops.iter().enumerate().map(|(i, op)| {
+            let mut out = vec![0.0f32; op.out_features];
+            unsafe {
+                let src = y_bufs[i].contents().as_ptr() as *const f32;
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), op.out_features);
+            }
+            out
+        }).collect()
     }
 
     #[allow(clippy::too_many_arguments)]

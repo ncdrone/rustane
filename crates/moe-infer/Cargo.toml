@@ -18,6 +18,8 @@ ane-bridge = { path = "../ane-bridge" }
 metal-decode = { path = "../metal-decode" }
 half.workspace = true
 memmap2.workspace = true
+objc2.workspace = true
+objc2-metal.workspace = true
 libc.workspace = true
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

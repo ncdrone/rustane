@@ -98,6 +98,13 @@ fn matvec_f16(w: &[f16], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     y
 }
 
+/// Matrix-vector multiply: y = W @ x using Accelerate BLAS (f32 weights, no conversion).
+fn matvec_f32(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    crate::blas::sgemv_f32(w, x, &mut y, out_dim, in_dim);
+    y
+}
+
 /// Single-head attention: Q @ K^T / sqrt(d) + causal_mask → softmax → @ V
 /// q: [head_dim], k_cache: [seq_len * head_dim], v_cache: [seq_len * head_dim]
 /// Returns: [head_dim]
@@ -203,6 +210,61 @@ pub fn gqa_forward(
 
     // 6. Output projection
     matvec_f16(lw.o_proj, &concat, hidden, q_dim)
+}
+
+/// GQA forward with pre-converted f32 projection weights (no f16→f32 per call).
+pub fn gqa_forward_f32(
+    x: &[f32],
+    q_proj: &[f32],
+    k_proj: &[f32],
+    v_proj: &[f32],
+    o_proj: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    cache: &mut KvCache,
+    layer: usize,
+    pos: usize,
+    rope: &RopeTables,
+    cfg: &GqaConfig,
+    eps: f32,
+) -> Vec<f32> {
+    let hidden = x.len();
+    let q_dim = cfg.num_q_heads * cfg.head_dim;
+    let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+
+    // 1. Q/K/V projections (f32 → f32, no conversion)
+    let mut q = matvec_f32(q_proj, x, q_dim, hidden);
+    let mut k = matvec_f32(k_proj, x, kv_dim, hidden);
+    let v = matvec_f32(v_proj, x, kv_dim, hidden);
+
+    // 2. QK-norm
+    per_head_rmsnorm(&mut q, &f32_from_f32_slice(q_norm_w), cfg.num_q_heads, eps);
+    per_head_rmsnorm(&mut k, &f32_from_f32_slice(k_norm_w), cfg.num_kv_heads, eps);
+
+    // 3. RoPE
+    rope.apply_all_heads(&mut q, cfg.num_q_heads, pos);
+    rope.apply_all_heads(&mut k, cfg.num_kv_heads, pos);
+
+    // 4. Store K, V in cache
+    cache.store(layer, pos, &k, &v);
+    let seq_len = pos + 1;
+
+    // 5. Per Q head: attend to corresponding KV head
+    let group_size = cfg.group_size();
+    let mut concat = vec![0.0f32; q_dim];
+
+    for qh in 0..cfg.num_q_heads {
+        let kv_h = qh / group_size;
+        let q_head = &q[qh * cfg.head_dim..(qh + 1) * cfg.head_dim];
+        let k_cache = cache.get_k(layer, kv_h, seq_len);
+        let v_cache = cache.get_v(layer, kv_h, seq_len);
+
+        let head_out = single_head_attention(q_head, k_cache, v_cache, cfg.head_dim, seq_len, pos);
+        concat[qh * cfg.head_dim..(qh + 1) * cfg.head_dim].copy_from_slice(&head_out);
+    }
+
+    // 6. Output projection
+    matvec_f32(o_proj, &concat, hidden, q_dim)
 }
 
 /// Helper: q_norm and k_norm are already f32 from weights.rs, just copy the slice ref.
