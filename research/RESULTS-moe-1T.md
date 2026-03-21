@@ -357,12 +357,54 @@ Replaced sequential token-by-token attention with a fused ANE graph that process
 
 ---
 
+## Stage 4 Post-Mortem: Decode Optimization II — 14 → 19.6 tok/s (2026-03-21)
+
+> Date: 2026-03-21. Branch: `rustane-infer` (8 new commits).
+> Goal: 14 → 25+ tok/s through Metal shader improvements + dispatch batching.
+> Result: **14.0 → 19.6 tok/s decode (40%), prefill 710ms → 310ms (56%), 20/20 HF match preserved.**
+
+### Optimization journey (8 commits):
+
+| Step | Change | Decode tok/s | Prefill |
+|------|--------|-------------|---------|
+| Baseline | Stage 3 final | 14.0 | 710ms |
+| +Observability | Per-layer timing: Metal=60%, attn=38% | 14.9 | 710ms |
+| +Metal dispatch bench | 85µs/commit, 4µs/dispatch overhead | — | — |
+| +cblas_sgemm | O_proj batching available (3.5x speedup) | — | — |
+| +ROWS_PER_TG=8 | 8 SIMD groups share x_cache, 8x fewer TGs | **17.2** | 530ms |
+| +Fused gate+up+SiLU | Single kernel, eliminate CPU roundtrip | 17.1 | 470ms |
+| +Scratch + single cmd_buf | Pre-allocated buffers, 96→48 commits/token | **19.1** | 400ms |
+| +sgemm O_proj prefill | Batched [2048,4096]×[4096,13] | 19.2 | **310ms** |
+| +ANE run_cached_direct | XPC daemon bypass | **19.6** | 310ms |
+
+### Key insight from observability (Task 1):
+CPU SiLU was only 0.5% of decode — NOT the bottleneck we expected. Metal dispatch at 60% was the clear target. This redirected the entire optimization strategy.
+
+### Remaining bottleneck analysis (19.6 tok/s = 51ms/token):
+- Metal MoE dispatch: ~27ms compute + ~4ms overhead = ~31ms (60%)
+- CPU attention: ~25ms (38%) — 4 sgemv calls × 48 layers + softmax/scores
+- Everything else: ~1ms (2%)
+
+### Next optimization targets (from research):
+
+| # | Optimization | Expected | Risk |
+|---|-------------|----------|------|
+| R1 | Batched QKV sgemv (3→1 call) | -2.4ms → 20.6 tok/s | Very low |
+| R2 | Single cmd_buf ALL 48 layers | -4ms → 22.4 tok/s | Medium |
+| R3 | Eliminate 240 allocs/token in attn | -1.5ms → 23.2 tok/s | Low |
+| R4 | Metal f32 sgemv for attn projs (ane-infer pattern) | -5-10ms → 26-30 tok/s | Medium |
+| R5 | Metal attention scores kernel (uzu pattern) | -2-4ms → 28-34 tok/s | Medium |
+
+R4 is the highest-leverage single change: move ALL per-layer compute (attention + MoE) into one Metal cmd_buf per token. Eliminates all CPU-GPU sync points. This is what ane-infer does for 32 tok/s.
+
+---
+
 ## Measured Benchmarks
 
 | Metric | Result | Target | Status |
 |--------|--------|--------|--------|
-| **Decode tok/s** | **14.0** | 25-30 | **35x from baseline (0.4)** |
-| **Prefill (13 tokens)** | **0.71s** | 0.1-0.2s | Attention fast, FFN dominates |
+| **Decode tok/s** | **19.6** | 25-30 | **49x from baseline (0.4)** |
+| **Prefill (13 tokens)** | **0.31s** | 0.1-0.2s | sgemm O_proj + ANE cached_direct |
 | **HF greedy match** | **20/20** | 20/20 | Exact match maintained |
 | Metal dequant bandwidth (8Kx8K) | 143.5 GiB/s | 400 GiB/s | 36% — needs fused kernels |
 | pread throughput (8 threads) | 59.9 GB/s | >5 GB/s | 12x exceeded |
@@ -391,6 +433,15 @@ Replaced sequential token-by-token attention with a fused ANE graph that process
 ## Commits on rustane-infer
 
 ```
+13a3379 perf: ANE run_cached_direct for prefill — XPC bypass
+b478a61 perf: sgemm batched O_proj in prefill — 400ms → 310ms (22%)
+709131c perf: scratch buffers + single cmd_buf — 17 → 19.1 tok/s (12%)
+512aaf6 feat: fused gate+up+SiLU Metal kernel — eliminate CPU roundtrip
+43d17da perf: ROWS_PER_TG=8 Metal shader — 14 → 17.2 tok/s decode (23%)
+e787917 feat: add cblas_sgemm FFI — 3.5x O_proj prefill speedup
+13af373 feat: Metal dispatch latency isolation — 85µs/commit, 4µs/dispatch
+8d21209 feat: per-layer decode timing breakdown — Metal 60%, attention 38%
+0ecf93b docs: Stage 3 results — 0.4 → 14 tok/s decode (35x), ANE prefill
 2541b68 feat: ANE batched prefill attention — fused GQA graph + pipeline wiring
 9256bc5 feat: timing breakdown (prefill/decode) + CLI output
 0ce7326 perf: zero-copy Metal + f32 pre-conversion → 0.4 → 11.7 tok/s (29x)
