@@ -7,6 +7,7 @@
 //! 4. Output projection + sampling
 
 pub mod attention;
+pub mod blas;
 pub mod config;
 pub mod generate;
 pub mod kv_cache;

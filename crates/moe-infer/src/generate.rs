@@ -7,6 +7,22 @@
 use half::f16;
 use anyhow::{Result, bail};
 
+/// Compare accelerated output against CPU reference.
+/// Only active with `--features dual-path`.
+#[cfg(feature = "dual-path")]
+#[allow(dead_code)]
+fn validate_output(accel: &[f32], cpu: &[f32], layer: usize, op: &str) -> Vec<f32> {
+    let max_diff = accel.iter().zip(cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    if max_diff > 1e-2 {
+        eprintln!("WARN: L{layer} [{op}] max_diff={max_diff:.6} — using CPU fallback");
+        cpu.to_vec()
+    } else {
+        accel.to_vec()
+    }
+}
+
 use crate::attention::{GqaConfig, RopeTables, gqa_forward};
 use crate::config::InferConfig;
 use crate::kv_cache::KvCache;
@@ -15,6 +31,8 @@ use crate::sampler;
 use crate::weights::{BackboneWeights, LayerWeights};
 
 use moe_router::{MoeRouter, RouterConfig};
+use moe_kernels::MetalDequantGemv;
+use quantize::PackedWeights4Bit;
 
 /// Loaded model ready for generation.
 pub struct Model {
@@ -22,6 +40,7 @@ pub struct Model {
     pub config: InferConfig,
     pub rope: RopeTables,
     pub gqa_config: GqaConfig,
+    pub metal: Option<MetalDequantGemv>,
 }
 
 /// Sampling configuration.
@@ -61,17 +80,78 @@ impl Model {
             max_seq,
         };
 
-        Ok(Self { weights, config, rope, gqa_config })
+        let metal = MetalDequantGemv::new();
+        if metal.is_some() {
+            eprintln!("Metal GPU: enabled");
+        } else {
+            eprintln!("Metal GPU: not available, using CPU");
+        }
+
+        Ok(Self { weights, config, rope, gqa_config, metal })
     }
 }
 
-/// MoE FFN: route + dispatch top-k experts (all layers are MoE).
-/// CPU-only quantized expert dispatch via pack4 GEMV.
+/// Parse raw expert bytes into a PackedWeights4Bit for Metal GEMV.
+fn parse_packed_weights(
+    data: &[u8], out_features: usize, in_features: usize, group_size: usize,
+) -> PackedWeights4Bit {
+    let packed_u32s = out_features * in_features / 8;
+    let packed_bytes = packed_u32s * 4;
+    let num_groups = out_features * (in_features / group_size);
+
+    let data_u32 = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u32, packed_u32s)
+    }.to_vec();
+    let scales = unsafe {
+        std::slice::from_raw_parts(data[packed_bytes..].as_ptr() as *const f16, num_groups)
+    }.to_vec();
+    let zeros = unsafe {
+        std::slice::from_raw_parts(
+            data[packed_bytes + num_groups * 2..].as_ptr() as *const f16, num_groups
+        )
+    }.to_vec();
+
+    PackedWeights4Bit { data: data_u32, scales, zeros, out_features, in_features, group_size }
+}
+
+/// Run one expert's FFN on Metal GPU: gate_proj → SiLU → up_proj → down_proj.
+fn metal_gemv_expert(
+    metal: &MetalDequantGemv,
+    data: &[u8], x: &[f32], hidden: usize, inter: usize, group_size: usize,
+) -> Vec<f32> {
+    let matrix_packed = inter * hidden / 2;
+    let num_groups = inter * (hidden / group_size);
+    let scales_size = num_groups * 2;
+    let matrix_total = matrix_packed + scales_size * 2;
+
+    let gate = parse_packed_weights(&data[0..matrix_total], inter, hidden, group_size);
+    let up = parse_packed_weights(&data[matrix_total..2 * matrix_total], inter, hidden, group_size);
+
+    // down_proj: [hidden, inter]
+    let down_packed = inter * hidden / 2;
+    let down_groups = hidden * (inter / group_size);
+    let down_scales = down_groups * 2;
+    let down_total = down_packed + down_scales * 2;
+    let down = parse_packed_weights(&data[2 * matrix_total..2 * matrix_total + down_total], hidden, inter, group_size);
+
+    let gate_out = metal.gemv(&gate, x);
+    let up_out = metal.gemv(&up, x);
+
+    // SiLU(gate) * up
+    let h: Vec<f32> = gate_out.iter().zip(up_out.iter())
+        .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u).collect();
+
+    metal.gemv(&down, &h)
+}
+
+/// MoE FFN: route + dispatch top-k experts.
+/// Uses Metal GPU when available, falls back to CPU scalar dequant.
 fn moe_ffn(
     x: &[f32],
     lw: &LayerWeights<'_>,
     expert_mmap: Option<&memmap2::Mmap>,
     router: &mut MoeRouter,
+    metal: Option<&MetalDequantGemv>,
     hidden: usize,
     moe_inter: usize,
     num_experts: usize,
@@ -102,14 +182,11 @@ fn moe_ffn(
                 continue; // Skip if out of bounds (safety)
             }
 
-            // Dequantize and compute each expert's FFN
-            let expert_out = dequant_expert_ffn(
-                &expert_data[base..base + expert_stride],
-                x,
-                hidden,
-                moe_inter,
-                group_size,
-            );
+            let expert_out = if let Some(m) = metal {
+                metal_gemv_expert(m, &expert_data[base..base + expert_stride], x, hidden, moe_inter, group_size)
+            } else {
+                dequant_expert_ffn(&expert_data[base..base + expert_stride], x, hidden, moe_inter, group_size)
+            };
 
             for d in 0..hidden {
                 combined[d] += weight * expert_out[d];
@@ -204,19 +281,11 @@ fn dequant_gemv(
     y
 }
 
-/// Matrix-vector multiply: y = W @ x. W is [out, in] row-major as f16.
+/// Matrix-vector multiply: y = W @ x using Accelerate BLAS.
+/// W is [out, in] row-major as f16, x is [in] as f32.
 fn matvec_f16(w: &[f16], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
-    debug_assert_eq!(w.len(), out_dim * in_dim);
-    debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
-    for i in 0..out_dim {
-        let row = &w[i * in_dim..(i + 1) * in_dim];
-        let mut sum = 0.0f64;
-        for j in 0..in_dim {
-            sum += row[j].to_f32() as f64 * x[j] as f64;
-        }
-        y[i] = sum as f32;
-    }
+    crate::blas::sgemv_f16(w, x, &mut y, out_dim, in_dim);
     y
 }
 
@@ -257,6 +326,7 @@ pub fn run_layer(
         &lw,
         expert_mmap,
         router,
+        model.metal.as_ref(),
         hidden,
         model.config.moe_inter_size(),
         model.config.num_experts(),

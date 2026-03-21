@@ -90,20 +90,11 @@ impl RopeTables {
 
 // ---------- GQA Forward ----------
 
-/// Matrix-vector multiply: y = W @ x.
+/// Matrix-vector multiply: y = W @ x using Accelerate BLAS.
 /// W is [out, in] row-major as f16, x is [in] as f32.
 fn matvec_f16(w: &[f16], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
-    debug_assert_eq!(w.len(), out_dim * in_dim);
-    debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
-    for i in 0..out_dim {
-        let row = &w[i * in_dim..(i + 1) * in_dim];
-        let mut sum = 0.0f64;
-        for j in 0..in_dim {
-            sum += row[j].to_f32() as f64 * x[j] as f64;
-        }
-        y[i] = sum as f32;
-    }
+    crate::blas::sgemv_f16(w, x, &mut y, out_dim, in_dim);
     y
 }
 
