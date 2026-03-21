@@ -729,17 +729,21 @@ fn prefill_layer_ane(
         output_data = locked.to_vec();
     }
 
+    // 4a. Batch O_proj: collect all attn_concat, run single sgemm
+    // attn_concat_batch is [q_dim, prompt_len] row-major (each column = one token's attn output)
+    let mut attn_concat_batch = vec![0.0f32; q_dim * prompt_len];
     for t in 0..prompt_len {
-        // Raw attention output [q_dim] from channels [0:q_dim]
-        let mut attn_concat = vec![0.0f32; q_dim];
         for i in 0..q_dim {
-            attn_concat[i] = output_data[i * seq + t];
+            attn_concat_batch[i * prompt_len + t] = output_data[i * seq + t];
         }
+    }
 
-        // O_proj via BLAS (CPU)
-        let attn_out = matvec_f32_direct(&af.o_proj, &attn_concat, hidden, q_dim);
+    // O_proj [hidden, q_dim] × attn_concat_batch [q_dim, prompt_len] → attn_out_batch [hidden, prompt_len]
+    let mut attn_out_batch = vec![0.0f32; hidden * prompt_len];
+    crate::blas::sgemm(&af.o_proj, &attn_concat_batch, &mut attn_out_batch, hidden, prompt_len, q_dim);
 
-        // K/V for cache from channels [q_dim:q_dim+kv_dim] and [q_dim+kv_dim:]
+    // 4b. K/V cache write + residual add (per-token)
+    for t in 0..prompt_len {
         let mut k_rope = vec![0.0f32; kv_dim];
         let mut v_vals = vec![0.0f32; kv_dim];
         for i in 0..kv_dim {
@@ -748,9 +752,9 @@ fn prefill_layer_ane(
         }
         cache.store(layer, t, &k_rope, &v_vals);
 
-        // Residual add (attention)
+        // Residual add (from batched O_proj result)
         for d in 0..hidden {
-            xs[t][d] += attn_out[d];
+            xs[t][d] += attn_out_batch[d * prompt_len + t];
         }
     }
 
