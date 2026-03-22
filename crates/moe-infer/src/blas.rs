@@ -69,31 +69,80 @@ pub fn sgemv_f32(w: &[f32], x: &[f32], y: &mut [f32], rows: usize, cols: usize) 
     }
 }
 
-/// y = W @ x where W is f16 (converted to f32 on the fly).
-/// W is [out_dim, in_dim] row-major f16, x is [in_dim] f32, y is [out_dim] f32.
+/// y = W @ x where W is f16 — chunked convert+sgemv for minimal memory traffic.
+///
+/// Converts 64 rows at a time into an L2-sized f32 buffer, then uses AMX-optimized
+/// cblas_sgemv on the chunk. Main memory reads only f16 weights (half of f32).
+/// The f32 chunk lives in L2 cache — sgemv reads it at ~1 TB/s, not ~200 GB/s.
 pub fn sgemv_f16(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
     debug_assert_eq!(w.len(), out_dim * in_dim);
     debug_assert_eq!(x.len(), in_dim);
     debug_assert_eq!(y.len(), out_dim);
 
-    // Convert f16 weights to f32 for BLAS
-    let w_f32: Vec<f32> = w.iter().map(|v| v.to_f32()).collect();
+    const CHUNK_ROWS: usize = 64; // 64 rows × 16384 cols × 4B = 4 MB — fits in L2
+    let mut chunk_buf = vec![0.0f32; CHUNK_ROWS * in_dim];
 
-    unsafe {
-        cblas_sgemv(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            out_dim as i32,
-            in_dim as i32,
-            1.0,
-            w_f32.as_ptr(),
-            in_dim as i32,
-            x.as_ptr(),
-            1,
-            0.0,
-            y.as_mut_ptr(),
-            1,
-        );
+    for chunk_start in (0..out_dim).step_by(CHUNK_ROWS) {
+        let chunk_end = (chunk_start + CHUNK_ROWS).min(out_dim);
+        let chunk_rows = chunk_end - chunk_start;
+        let w_chunk = &w[chunk_start * in_dim..chunk_end * in_dim];
+        let y_chunk = &mut y[chunk_start..chunk_end];
+
+        // Convert chunk from f16 to f32 (FCVTL auto-vectorized, writes to L2)
+        let buf = &mut chunk_buf[..chunk_rows * in_dim];
+        for i in 0..buf.len() {
+            buf[i] = w_chunk[i].to_f32();
+        }
+
+        // AMX-optimized sgemv on the L2-resident chunk
+        sgemv_f32(buf, x, y_chunk, chunk_rows, in_dim);
+    }
+}
+
+/// y = W^T @ x where W is f16 — chunked convert+sgemv_trans.
+pub fn sgemv_f16_trans(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    debug_assert_eq!(w.len(), in_dim * out_dim);
+    debug_assert_eq!(x.len(), in_dim);
+    debug_assert_eq!(y.len(), out_dim);
+
+    // For transposed sgemv, we need the full matrix converted since each output
+    // depends on ALL rows. Use chunked conversion for cache efficiency.
+    // W is stored [in_dim, out_dim]. We compute y = W^T @ x.
+    const CHUNK_ROWS: usize = 64;
+    let mut chunk_buf = vec![0.0f32; CHUNK_ROWS * out_dim];
+
+    // Zero output first (we accumulate)
+    for d in 0..out_dim { y[d] = 0.0; }
+
+    for chunk_start in (0..in_dim).step_by(CHUNK_ROWS) {
+        let chunk_end = (chunk_start + CHUNK_ROWS).min(in_dim);
+        let chunk_rows = chunk_end - chunk_start;
+        let w_chunk = &w[chunk_start * out_dim..chunk_end * out_dim];
+        let x_chunk = &x[chunk_start..chunk_end];
+
+        let buf = &mut chunk_buf[..chunk_rows * out_dim];
+        for i in 0..buf.len() {
+            buf[i] = w_chunk[i].to_f32();
+        }
+
+        // Accumulate: y += chunk^T @ x_chunk
+        // Using sgemv with beta=1.0 to accumulate
+        unsafe {
+            cblas_sgemv(
+                CBLAS_ROW_MAJOR,
+                112, // CblasTrans
+                chunk_rows as i32,
+                out_dim as i32,
+                1.0,
+                buf.as_ptr(),
+                out_dim as i32,
+                x_chunk.as_ptr(),
+                1,
+                1.0, // beta=1.0 to accumulate
+                y.as_mut_ptr(),
+                1,
+            );
+        }
     }
 }
 

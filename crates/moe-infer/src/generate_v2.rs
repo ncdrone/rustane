@@ -458,6 +458,189 @@ fn run_layer_v2(
     Ok(result)
 }
 
+/// Run one layer using f16 weights directly from backbone mmap — NO conversion pass.
+/// Uses sgemv_f16 (chunked convert+AMX) for half the memory traffic.
+fn run_layer_f16(
+    model: &ModelV2,
+    cache: &mut MlaKvCache,
+    router: &mut MoeRouter,
+    layer: usize,
+    x: &[f32],
+    pos: usize,
+) -> Result<Vec<f32>> {
+    let hidden = model.config.hidden_size();
+    let eps = model.config.rms_norm_eps();
+
+    let is_moe = model.config.is_moe_layer(layer);
+    let lw = model.weights.mla_layer_weights(layer, is_moe)?;
+
+    // 1. RMSNorm → MLA Attention (f16 weights) → Residual
+    let normed = rmsnorm(x, lw.input_norm, eps);
+    let attn_out = crate::mla_attention::mla_forward_decode_f16(
+        &normed, &lw, cache, layer, pos,
+        &model.rope, &model.mla_config, model.attn_scale,
+    );
+
+    let mut residual = vec![0.0f32; hidden];
+    for d in 0..hidden { residual[d] = x[d] + attn_out[d]; }
+
+    // 2. RMSNorm → FFN → Residual
+    let normed2 = rmsnorm(&residual, lw.post_attn_norm, eps);
+
+    let ffn_out = if is_moe {
+        // Need MlaLayerF32 for router/shared/dense weights + MoE dispatch
+        // Router and shared FFN use sgemv_f16 directly
+        moe_ffn_f16(model, router, layer, &normed2, &lw)?
+    } else {
+        dense_ffn_f16(&normed2, &lw)
+    };
+
+    for d in 0..hidden { residual[d] += ffn_out[d]; }
+    Ok(residual)
+}
+
+/// Dense FFN with f16 weights: SiLU(x @ gate^T) * (x @ up^T) → @ down^T
+fn dense_ffn_f16(x: &[f32], lw: &crate::weights::MlaLayerWeights) -> Vec<f32> {
+    let gate_w = lw.dense_gate_proj.expect("dense gate");
+    let up_w = lw.dense_up_proj.expect("dense up");
+    let down_w = lw.dense_down_proj.expect("dense down");
+
+    let hidden = x.len();
+    let inter = gate_w.len() / hidden;
+
+    let mut gate_out = vec![0.0f32; inter];
+    let mut up_out = vec![0.0f32; inter];
+    crate::blas::sgemv_f16(gate_w, x, &mut gate_out, inter, hidden);
+    crate::blas::sgemv_f16(up_w, x, &mut up_out, inter, hidden);
+
+    for i in 0..inter {
+        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
+        gate_out[i] = silu * up_out[i];
+    }
+
+    let mut out = vec![0.0f32; hidden];
+    crate::blas::sgemv_f16(down_w, &gate_out, &mut out, hidden, inter);
+    out
+}
+
+/// MoE FFN with f16 shared expert weights.
+fn moe_ffn_f16(
+    model: &ModelV2,
+    router: &mut MoeRouter,
+    layer: usize,
+    x: &[f32],
+    lw: &crate::weights::MlaLayerWeights,
+) -> Result<Vec<f32>> {
+    let hidden = model.config.hidden_size();
+
+    // Router (f16 weights)
+    let router_w = lw.router.expect("MoE router");
+    let num_experts = model.config.num_experts();
+    let mut gate_logits = vec![0.0f32; num_experts];
+    crate::blas::sgemv_f16(router_w, x, &mut gate_logits, num_experts, hidden);
+
+    let route = if model.config.ffn.scoring_func == "sigmoid" {
+        if let Some(bias) = lw.e_score_correction_bias {
+            moe_router::route_sigmoid_v3(
+                &gate_logits, bias,
+                model.config.ffn.n_group, model.config.ffn.topk_group,
+                model.config.num_experts_per_tok(), 1.0,
+            )
+        } else {
+            router.route(&gate_logits)
+        }
+    } else {
+        router.route_softmax(&gate_logits)
+    };
+
+    // Shared expert FFN (f16 weights)
+    let mut combined = if let (Some(sg), Some(su), Some(sd)) =
+        (lw.shared_gate_proj, lw.shared_up_proj, lw.shared_down_proj)
+    {
+        let inter = sg.len() / hidden;
+        let mut gate_out = vec![0.0f32; inter];
+        let mut up_out = vec![0.0f32; inter];
+        crate::blas::sgemv_f16(sg, x, &mut gate_out, inter, hidden);
+        crate::blas::sgemv_f16(su, x, &mut up_out, inter, hidden);
+        for i in 0..inter {
+            let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
+            gate_out[i] = silu * up_out[i];
+        }
+        let mut out = vec![0.0f32; hidden];
+        crate::blas::sgemv_f16(sd, &gate_out, &mut out, hidden, inter);
+        out
+    } else {
+        vec![0.0f32; hidden]
+    };
+
+    // Routed experts (same pread+Metal dispatch as moe_ffn_v2)
+    let routed_scale = model.config.ffn.routed_scaling_factor;
+    let moe_inter = model.config.moe_inter_size();
+    let group_size = model.config.quantization.group_size;
+
+    let gu_packed = moe_inter * hidden / 2;
+    let gu_groups = moe_inter * (hidden / group_size);
+    let gu_scales = gu_groups * 2;
+    let gu_total = gu_packed + gu_scales * 2;
+    let dn_packed = hidden * moe_inter / 2;
+    let dn_groups = hidden * (moe_inter / group_size);
+    let dn_scales = dn_groups * 2;
+    let dn_total = dn_packed + dn_scales * 2;
+    let expert_stride = gu_total * 2 + dn_total;
+
+    if let Some(m) = model.metal.as_ref() {
+        if let Some(loader) = model.expert_loaders.get(&layer) {
+            let staging = &model.expert_staging;
+            let staging_ptr = staging.as_ptr() as *mut u8;
+
+            let expert_ids: Vec<(usize, usize, f32)> = route.expert_ids.iter()
+                .zip(route.weights.iter()).enumerate()
+                .map(|(i, (&eid, &w))| (i, eid, w)).collect();
+
+            use rayon::prelude::*;
+            let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
+            staging_mut[..expert_ids.len() * expert_stride]
+                .chunks_mut(expert_stride)
+                .zip(expert_ids.iter())
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .for_each(|(chunk, &(_, eid, _))| {
+                    loader.load_expert(eid as u32, chunk).unwrap();
+                });
+
+            let mut fused_ops = Vec::new();
+            let mut down_ops = Vec::new();
+            let mut routing_weights = Vec::new();
+            for &(i, _, weight) in &expert_ids {
+                let p = i * expert_stride;
+                fused_ops.push(FusedGateUpSiluOp {
+                    gate_packed_offset: p, gate_scales_offset: p + gu_packed,
+                    gate_zeros_offset: p + gu_packed + gu_scales,
+                    up_packed_offset: p + gu_total, up_scales_offset: p + gu_total + gu_packed,
+                    up_zeros_offset: p + gu_total + gu_packed + gu_scales,
+                    out_features: moe_inter, in_features: hidden, group_size,
+                });
+                down_ops.push(ExpertGemvOp {
+                    packed_offset: p + 2 * gu_total, scales_offset: p + 2 * gu_total + dn_packed,
+                    zeros_offset: p + 2 * gu_total + dn_packed + dn_scales,
+                    out_features: hidden, in_features: moe_inter, group_size,
+                });
+                routing_weights.push(weight);
+            }
+
+            if !routing_weights.is_empty() {
+                let metal_buf = model.expert_staging_metal.as_ref().unwrap();
+                let down_results = m.fused_and_down_single_cmdbuf(metal_buf, &fused_ops, &down_ops, x);
+                for (i, weight) in routing_weights.iter().enumerate() {
+                    let sw = weight * routed_scale;
+                    for d in 0..hidden { combined[d] += sw * down_results[i][d]; }
+                }
+            }
+        }
+    }
+    Ok(combined)
+}
+
 /// Dense FFN: SiLU(x @ gate^T) * (x @ up^T) → @ down^T
 fn dense_ffn(x: &[f32], lf: &MlaLayerF32) -> Vec<f32> {
     let gate_w = lf.dense_gate.as_ref().expect("dense layer needs gate_proj");
@@ -781,14 +964,13 @@ pub fn generate_v2(
         eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers)",
             t_warmup.elapsed().as_secs_f64(), num_layers);
 
-        // --- Prefill ---
+        // --- Prefill (f16 direct — no conversion pass) ---
         let t_prefill = std::time::Instant::now();
         for (i, &token_id) in input_ids.iter().enumerate() {
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
             for layer in 0..num_layers {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &buf_a)?;
+                x = run_layer_f16(model, &mut cache, &mut router, layer, &x, i)?;
             }
             cache.advance();
             if i == input_ids.len() - 1 {
@@ -800,7 +982,7 @@ pub fn generate_v2(
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // --- Decode (sequential: convert + compute per layer, no pipeline overhead) ---
+        // --- Decode (f16 direct — no conversion pass, half memory traffic) ---
         let t_decode = std::time::Instant::now();
         let mut pos = input_ids.len();
         let mut first_token_logged = false;
@@ -814,8 +996,7 @@ pub fn generate_v2(
             let mut x = emb;
 
             for layer in 0..num_layers {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &buf_a)?;
+                x = run_layer_f16(model, &mut cache, &mut router, layer, &x, pos)?;
             }
             cache.advance();
 

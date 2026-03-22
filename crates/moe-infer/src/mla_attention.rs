@@ -305,6 +305,129 @@ pub fn mla_forward_decode(
     output
 }
 
+/// MLA forward decode using f16 weights directly (no f32 conversion pass).
+/// Uses chunked sgemv_f16 for half the memory traffic.
+pub fn mla_forward_decode_f16(
+    x: &[f32],
+    weights: &crate::weights::MlaLayerWeights<'_>,
+    cache: &mut MlaKvCache,
+    layer: usize,
+    pos: usize,
+    rope: &YarnRopeTables,
+    cfg: &MlaDecodeConfig,
+    attn_scale: f32,
+) -> Vec<f32> {
+    let h = cfg.num_heads;
+    let nope = cfg.qk_nope_head_dim;
+    let rope_dim = cfg.qk_rope_head_dim;
+    let v_dim = cfg.v_head_dim;
+    let kv_rank = cfg.kv_lora_rank;
+    let hidden = cfg.hidden_size;
+
+    // 1. Q projection (direct or LoRA) — f16 weights, sgemv_f16
+    let q_total = h * (nope + rope_dim);
+    let mut q = vec![0.0f32; q_total];
+    if let (Some(q_a), Some(q_a_norm), Some(q_b)) =
+        (weights.q_a_proj, weights.q_a_layernorm, weights.q_b_proj)
+    {
+        let q_lora_rank = q_a.len() / hidden;
+        let mut q_latent = vec![0.0f32; q_lora_rank];
+        crate::blas::sgemv_f16(q_a, x, &mut q_latent, q_lora_rank, hidden);
+        let q_latent_normed = rmsnorm(&q_latent, q_a_norm, cfg.rms_eps);
+        crate::blas::sgemv_f16(q_b, &q_latent_normed, &mut q, q_total, q_lora_rank);
+    } else {
+        crate::blas::sgemv_f16(weights.q_proj, x, &mut q, q_total, hidden);
+    }
+
+    // Split q_nope + q_pe (same as f32 version)
+    let mut q_nope = vec![0.0f32; h * nope];
+    let mut q_pe = vec![0.0f32; h * rope_dim];
+    for head in 0..h {
+        let src = head * (nope + rope_dim);
+        q_nope[head * nope..(head + 1) * nope].copy_from_slice(&q[src..src + nope]);
+        q_pe[head * rope_dim..(head + 1) * rope_dim].copy_from_slice(&q[src + nope..src + nope + rope_dim]);
+    }
+
+    rope.apply_all_heads(&mut q_pe, h, pos);
+
+    // 3. KV compression — f16 weights
+    let kv_out_dim = kv_rank + rope_dim;
+    let mut kv_out = vec![0.0f32; kv_out_dim];
+    crate::blas::sgemv_f16(weights.kv_a_proj, x, &mut kv_out, kv_out_dim, hidden);
+
+    let kv_latent_raw = &kv_out[..kv_rank];
+    let k_pe_raw = &kv_out[kv_rank..];
+
+    let kv_latent = rmsnorm(kv_latent_raw, weights.kv_a_layernorm, cfg.rms_eps);
+    let mut k_pe = k_pe_raw.to_vec();
+    rope.apply(&mut k_pe, pos);
+
+    cache.write(layer, pos, &kv_latent, &k_pe);
+    let seq_len = pos + 1;
+
+    // 7. W_UK absorption — f16 weights, sgemv_f16_trans
+    let mut q_absorbed = vec![0.0f32; h * kv_rank];
+    for head in 0..h {
+        let q_head = &q_nope[head * nope..(head + 1) * nope];
+        let w_uk_head = &weights.w_uk[head * nope * kv_rank..(head + 1) * nope * kv_rank];
+        let out = &mut q_absorbed[head * kv_rank..(head + 1) * kv_rank];
+        crate::blas::sgemv_f16_trans(w_uk_head, q_head, out, kv_rank, nope);
+    }
+
+    // 7b-c. Attention scores + softmax (same as f32 — works on cached f32 latents)
+    let latent_cache = cache.get_latents(layer, seq_len);
+    let rope_cache = cache.get_rope_keys(layer, seq_len);
+
+    let mut scores = vec![0.0f32; h * seq_len];
+    for head in 0..h {
+        let q_abs = &q_absorbed[head * kv_rank..(head + 1) * kv_rank];
+        let q_rope = &q_pe[head * rope_dim..(head + 1) * rope_dim];
+        for t in 0..seq_len {
+            let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
+            let rope_t = &rope_cache[t * rope_dim..(t + 1) * rope_dim];
+            let mut dot_nope = 0.0f64;
+            for d in 0..kv_rank { dot_nope += q_abs[d] as f64 * lat_t[d] as f64; }
+            let mut dot_rope = 0.0f64;
+            for d in 0..rope_dim { dot_rope += q_rope[d] as f64 * rope_t[d] as f64; }
+            scores[head * seq_len + t] = (dot_nope + dot_rope) as f32 * attn_scale;
+        }
+    }
+
+    let mut attn_weights = vec![0.0f32; h * seq_len];
+    for head in 0..h {
+        let s = &scores[head * seq_len..(head + 1) * seq_len];
+        let w = &mut attn_weights[head * seq_len..(head + 1) * seq_len];
+        let max_s = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for t in 0..seq_len { w[t] = (s[t] - max_s).exp(); sum += w[t]; }
+        for t in 0..seq_len { w[t] /= sum; }
+    }
+
+    // 8. Value combination — f16 W_UV
+    let mut v_concat = vec![0.0f32; h * v_dim];
+    for head in 0..h {
+        let w = &attn_weights[head * seq_len..(head + 1) * seq_len];
+        let mut v_latent = vec![0.0f32; kv_rank];
+        for t in 0..seq_len {
+            let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
+            let wt = w[t];
+            for d in 0..kv_rank { v_latent[d] += wt * lat_t[d]; }
+        }
+        let w_uv_head = &weights.w_uv[head * v_dim * kv_rank..(head + 1) * v_dim * kv_rank];
+        let v_out = &mut v_concat[head * v_dim..(head + 1) * v_dim];
+        // W_UV sgemv: [v_dim, kv_rank] × [kv_rank] — small, f16 → f32
+        crate::blas::sgemv_f16(w_uv_head, &v_latent, v_out, v_dim, kv_rank);
+    }
+
+    // 9. O projection — f16 weights
+    let out_dim = hidden;
+    let v_total = h * v_dim;
+    let mut output = vec![0.0f32; out_dim];
+    crate::blas::sgemv_f16(weights.o_proj, &v_concat, &mut output, out_dim, v_total);
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
