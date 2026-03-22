@@ -156,37 +156,91 @@ impl ModelV2 {
     }
 }
 
-/// Convert f16 slice to f32 Vec (auto-vectorizes to FCVTL on aarch64).
+/// Convert f16 slice to f32 Vec using rayon for large slices.
+/// Auto-vectorizes to Neon FCVTL on aarch64. For large tensors (>1M elements),
+/// uses rayon par_iter to saturate memory bandwidth across P-cores.
 #[inline]
 fn f16_to_f32_vec(src: &[f16]) -> Vec<f32> {
-    src.iter().map(|v| v.to_f32()).collect()
+    use rayon::prelude::*;
+    const PAR_THRESHOLD: usize = 1_000_000; // ~4 MB in f16 = worth parallelizing
+    if src.len() >= PAR_THRESHOLD {
+        src.par_iter().map(|v| v.to_f32()).collect()
+    } else {
+        src.iter().map(|v| v.to_f32()).collect()
+    }
 }
 
 /// Convert one layer's weights from f16 mmap to f32.
 /// Takes `&BackboneWeights` + `&InferConfig` directly so it can be called from a background thread.
+/// Uses rayon to parallelize conversion of large tensors across CPU cores.
 fn convert_layer_f32(weights: &BackboneWeights, config: &InferConfig, layer: usize) -> Result<MlaLayerF32> {
+    use rayon::prelude::*;
     let is_moe = config.is_moe_layer(layer);
     let lw = weights.mla_layer_weights(layer, is_moe)?;
+
+    // Convert all large f16 fields in parallel using rayon join chains.
+    // Each field is independent — saturate memory bandwidth across cores.
+    let (q_proj, (kv_a_proj, (w_uk, (w_uv, o_proj)))) = rayon::join(
+        || f16_to_f32_vec(lw.q_proj),
+        || rayon::join(
+            || f16_to_f32_vec(lw.kv_a_proj),
+            || rayon::join(
+                || f16_to_f32_vec(lw.w_uk),
+                || rayon::join(
+                    || f16_to_f32_vec(lw.w_uv),
+                    || f16_to_f32_vec(lw.o_proj),
+                ),
+            ),
+        ),
+    );
+
+    // V3 Q LoRA fields (large)
+    let (q_a_proj, (q_b_proj, _)) = rayon::join(
+        || lw.q_a_proj.map(f16_to_f32_vec),
+        || rayon::join(
+            || lw.q_b_proj.map(f16_to_f32_vec),
+            || (), // placeholder
+        ),
+    );
+
+    // FFN fields (shared or dense — one set per layer)
+    let (shared_gate, (shared_up, shared_down)) = rayon::join(
+        || lw.shared_gate_proj.map(f16_to_f32_vec),
+        || rayon::join(
+            || lw.shared_up_proj.map(f16_to_f32_vec),
+            || lw.shared_down_proj.map(f16_to_f32_vec),
+        ),
+    );
+
+    let (dense_gate, (dense_up, dense_down)) = rayon::join(
+        || lw.dense_gate_proj.map(f16_to_f32_vec),
+        || rayon::join(
+            || lw.dense_up_proj.map(f16_to_f32_vec),
+            || lw.dense_down_proj.map(f16_to_f32_vec),
+        ),
+    );
+
+    // Small tensors — convert on calling thread (not worth parallelizing)
     Ok(MlaLayerF32 {
-        q_proj: f16_to_f32_vec(lw.q_proj),
-        kv_a_proj: f16_to_f32_vec(lw.kv_a_proj),
+        q_proj,
+        kv_a_proj,
         kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
-        w_uk: f16_to_f32_vec(lw.w_uk),
-        w_uv: f16_to_f32_vec(lw.w_uv),
-        o_proj: f16_to_f32_vec(lw.o_proj),
+        w_uk,
+        w_uv,
+        o_proj,
         input_norm: lw.input_norm.to_vec(),
         post_attn_norm: lw.post_attn_norm.to_vec(),
-        q_a_proj: lw.q_a_proj.map(f16_to_f32_vec),
+        q_a_proj,
         q_a_layernorm: lw.q_a_layernorm.map(|w| w.to_vec()),
-        q_b_proj: lw.q_b_proj.map(f16_to_f32_vec),
+        q_b_proj,
         router: lw.router.map(f16_to_f32_vec),
         e_score_correction_bias: lw.e_score_correction_bias.map(|b| b.to_vec()),
-        shared_gate: lw.shared_gate_proj.map(f16_to_f32_vec),
-        shared_up: lw.shared_up_proj.map(f16_to_f32_vec),
-        shared_down: lw.shared_down_proj.map(f16_to_f32_vec),
-        dense_gate: lw.dense_gate_proj.map(f16_to_f32_vec),
-        dense_up: lw.dense_up_proj.map(f16_to_f32_vec),
-        dense_down: lw.dense_down_proj.map(f16_to_f32_vec),
+        shared_gate,
+        shared_up,
+        shared_down,
+        dense_gate,
+        dense_up,
+        dense_down,
     })
 }
 
