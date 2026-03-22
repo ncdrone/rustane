@@ -585,17 +585,13 @@ fn moe_ffn_v2(
                 .map(|(i, (&eid, &w))| (i, eid, w))
                 .collect();
 
-            // Parallel pread: load all 8 experts concurrently (NVMe needs QD>1)
-            let expert_id_list: Vec<u32> = expert_ids.iter().map(|&(_, eid, _)| eid as u32).collect();
-            let mut expert_bufs: Vec<Vec<u8>> = (0..expert_id_list.len()).map(|_| Vec::new()).collect();
-            loader.load_experts_parallel(&expert_id_list, &mut expert_bufs, 4)
-                .map_err(|e| anyhow::anyhow!("pread experts layer {layer}: {e}"))?;
-
-            // Pack loaded experts into staging buffer at contiguous offsets
+            // Load experts directly into staging buffer (zero extra allocation)
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
-            for (i, buf) in expert_bufs.iter().enumerate() {
+            for &(i, eid, _) in &expert_ids {
                 let pack_offset = i * expert_stride;
-                staging_mut[pack_offset..pack_offset + expert_stride].copy_from_slice(&buf[..expert_stride]);
+                let expert_buf = &mut staging_mut[pack_offset..pack_offset + expert_stride];
+                loader.load_expert(eid as u32, expert_buf)
+                    .map_err(|e| anyhow::anyhow!("pread expert {eid} layer {layer}: {e}"))?;
             }
 
             // Build Metal ops with packed offsets

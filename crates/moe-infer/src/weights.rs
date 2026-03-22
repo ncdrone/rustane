@@ -107,11 +107,18 @@ impl BackboneWeights {
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmap {}", bin_path.display()))?;
 
-        // Pre-fault backbone pages into page cache (async kernel readahead).
-        // Without this, every f16→f32 conversion hits SSD page faults.
+        // Pre-fault backbone pages and lock them in memory.
+        // madvise(WILLNEED) triggers async readahead.
+        // mlock prevents the kernel from evicting backbone pages when expert data fills the page cache.
         #[cfg(target_os = "macos")]
         unsafe {
             libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_WILLNEED);
+            let ret = libc::mlock(mmap.as_ptr() as *const _, mmap.len());
+            if ret == 0 {
+                eprintln!("backbone: mlock'd {:.1} GB", mmap.len() as f64 / 1e9);
+            } else {
+                eprintln!("backbone: mlock failed (errno={}), pages may be evicted", *libc::__error());
+            }
         }
 
         // Try to load expert files
