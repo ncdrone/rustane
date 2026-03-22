@@ -9,3 +9,5 @@ date	experiment	variable	baseline	result	verdict	decode_toks	notes
 2026-03-22	v3-rayon-pread	rayon-direct-staging	0.7	22.4ms/layer, rayon pread, no alloc overhead	keep	0.7	current architecture baseline
 2026-03-22	v3-f16-sgemv	chunked-f16-sgemv	0.7	86ms/layer, per-chunk overhead dominates	reverted	0.2	DEAD END: 4x slower than convert+sgemv_f32
 2026-03-22	v3-final	convert+sgemv+pread+rayon	0.03	22ms/layer avg, 1000x from baseline	current-best	0.7	Phase 1 final state
+2026-03-22	v3-manual-gemv	manual-loops-vs-blas-perhead	0.7	manual 3x slower than AMX BLAS (520μs vs 170μs)	REVERTED	0.67	AMX dispatch overhead only ~1.3μs/call, AMX compute >> NEON fmla for [128,512] matrices
+2026-03-22	v3-pipeline-decode	thread-scope-double-buffer	0.7	overlap convert(N+1) with compute(N), 21.5→20.6ms/layer	keep	0.8	14% improvement, 1.4ms/layer saved, thread::scope 21μs overhead

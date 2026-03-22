@@ -980,7 +980,10 @@ pub fn generate_v2(
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // --- Decode (sequential convert+compute, single reusable buffer) ---
+        // --- Decode (pipelined convert+compute, double-buffered) ---
+        // Overlap f16→f32 conversion of layer N+1 with compute of layer N.
+        // Uses std::thread::scope for safe scoped thread with zero unsafe code.
+        // Expected savings: ~7ms conversion hidden behind ~15ms compute per layer.
         let t_decode = std::time::Instant::now();
         let mut pos = input_ids.len();
         let mut first_token_logged = false;
@@ -993,9 +996,31 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
 
+            // Pre-convert layer 0, then pipeline convert(N+1) with compute(N)
+            // Extract field refs so spawn closure doesn't capture &ModelV2 (which has !Sync Metal bufs)
+            let weights_ref = &model.weights;
+            let config_ref = &model.config;
+            convert_layer_into(&mut buf_a, weights_ref, config_ref, 0)?;
             for layer in 0..num_layers {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &buf_a)?;
+                if layer + 1 < num_layers {
+                    let next = layer + 1;
+                    x = std::thread::scope(|s| -> Result<Vec<f32>> {
+                        let h = s.spawn(|| {
+                            convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
+                        });
+                        let result = run_layer_compute(
+                            model, &mut cache, &mut router, layer, &x, pos, &buf_a,
+                        )?;
+                        h.join().unwrap()?;
+                        Ok(result)
+                    })?;
+                    std::mem::swap(&mut buf_a, &mut buf_b);
+                } else {
+                    // Last layer: no next to pipeline
+                    x = run_layer_compute(
+                        model, &mut cache, &mut router, layer, &x, pos, &buf_a,
+                    )?;
+                }
             }
             cache.advance();
 
