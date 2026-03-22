@@ -120,19 +120,19 @@ fn ws_root() -> std::path::PathBuf {
 // Helper: build MlaAttnWeights from MlaLayerF32
 // ---------------------------------------------------------------------------
 
-fn build_attn_weights(lf: &MlaLayerF32) -> MlaAttnWeights {
+fn build_attn_weights<'a>(lf: &'a MlaLayerF32) -> MlaAttnWeights<'a> {
     MlaAttnWeights {
-        q_proj: lf.q_proj.clone(),
+        q_proj: &lf.q_proj,
         q_a_proj: None,       // V2-Lite: direct q_proj, no LoRA
         q_a_layernorm: None,
         q_b_proj: None,
-        kv_a_proj: lf.kv_a_proj.clone(),
-        kv_a_layernorm: lf.kv_a_layernorm.clone(),
-        w_uk: lf.w_uk.clone(),
-        w_uv: lf.w_uv.clone(),
-        o_proj: lf.o_proj.clone(),
-        input_norm: lf.input_norm.clone(),
-        post_attn_norm: lf.post_attn_norm.clone(),
+        kv_a_proj: &lf.kv_a_proj,
+        kv_a_layernorm: &lf.kv_a_layernorm,
+        w_uk: &lf.w_uk,
+        w_uv: &lf.w_uv,
+        o_proj: &lf.o_proj,
+        input_norm: &lf.input_norm,
+        post_attn_norm: &lf.post_attn_norm,
     }
 }
 

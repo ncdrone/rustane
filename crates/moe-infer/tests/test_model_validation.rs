@@ -163,17 +163,17 @@ fn level2_layer0_output_matches_hf() {
         let normed = moe_infer::rmsnorm::rmsnorm(&emb, &lf.input_norm, eps);
 
         let attn_weights = moe_infer::mla_attention::MlaLayerWeights {
-            q_proj: lf.q_proj.clone(),
+            q_proj: &lf.q_proj,
             q_a_proj: None,
             q_a_layernorm: None,
             q_b_proj: None,
-            kv_a_proj: lf.kv_a_proj.clone(),
-            kv_a_layernorm: lf.kv_a_layernorm.clone(),
-            w_uk: lf.w_uk.clone(),
-            w_uv: lf.w_uv.clone(),
-            o_proj: lf.o_proj.clone(),
-            input_norm: lf.input_norm.clone(),
-            post_attn_norm: lf.post_attn_norm.clone(),
+            kv_a_proj: &lf.kv_a_proj,
+            kv_a_layernorm: &lf.kv_a_layernorm,
+            w_uk: &lf.w_uk,
+            w_uv: &lf.w_uv,
+            o_proj: &lf.o_proj,
+            input_norm: &lf.input_norm,
+            post_attn_norm: &lf.post_attn_norm,
         };
 
         let attn_out = moe_infer::mla_attention::mla_forward_decode(

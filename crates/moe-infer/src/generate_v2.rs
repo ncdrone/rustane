@@ -31,8 +31,13 @@ pub struct MlaLayerF32 {
     pub o_proj: Vec<f32>,
     pub input_norm: Vec<f32>,
     pub post_attn_norm: Vec<f32>,
+    // V3 Q LoRA (None for V2-Lite)
+    pub q_a_proj: Option<Vec<f32>>,
+    pub q_a_layernorm: Option<Vec<f32>>,
+    pub q_b_proj: Option<Vec<f32>>,
     // FFN (either router+shared or dense)
     pub router: Option<Vec<f32>>,
+    pub e_score_correction_bias: Option<Vec<f32>>,
     pub shared_gate: Option<Vec<f32>>,
     pub shared_up: Option<Vec<f32>>,
     pub shared_down: Option<Vec<f32>>,
@@ -110,33 +115,42 @@ impl ModelV2 {
         );
         eprintln!("MLA attn_scale={attn_scale:.6} (mscale={mscale:.4})");
 
-        // Pre-convert all layer weights to f32
-        let t = std::time::Instant::now();
-        let mut layers_f32 = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            let is_moe = config.is_moe_layer(layer);
-            let lw = weights.mla_layer_weights(layer, is_moe)?;
-
-            layers_f32.push(MlaLayerF32 {
-                q_proj: lw.q_proj.iter().map(|v| v.to_f32()).collect(),
-                kv_a_proj: lw.kv_a_proj.iter().map(|v| v.to_f32()).collect(),
-                kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
-                w_uk: lw.w_uk.iter().map(|v| v.to_f32()).collect(),
-                w_uv: lw.w_uv.iter().map(|v| v.to_f32()).collect(),
-                o_proj: lw.o_proj.iter().map(|v| v.to_f32()).collect(),
-                input_norm: lw.input_norm.to_vec(),
-                post_attn_norm: lw.post_attn_norm.to_vec(),
-                router: lw.router.map(|r| r.iter().map(|v| v.to_f32()).collect()),
-                shared_gate: lw.shared_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                shared_up: lw.shared_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                shared_down: lw.shared_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                dense_gate: lw.dense_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                dense_up: lw.dense_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                dense_down: lw.dense_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-            });
+        // Decide: pre-convert all layers (small models) or lazy per-layer (large models).
+        // Threshold: if num_heads > 64, the f32 pre-conversion would use too much RAM.
+        let lazy_mode = config.num_q_heads() > 64;
+        let mut layers_f32 = Vec::new();
+        if !lazy_mode {
+            let t = std::time::Instant::now();
+            for layer in 0..num_layers {
+                let is_moe = config.is_moe_layer(layer);
+                let lw = weights.mla_layer_weights(layer, is_moe)?;
+                layers_f32.push(MlaLayerF32 {
+                    q_proj: lw.q_proj.iter().map(|v| v.to_f32()).collect(),
+                    kv_a_proj: lw.kv_a_proj.iter().map(|v| v.to_f32()).collect(),
+                    kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
+                    w_uk: lw.w_uk.iter().map(|v| v.to_f32()).collect(),
+                    w_uv: lw.w_uv.iter().map(|v| v.to_f32()).collect(),
+                    o_proj: lw.o_proj.iter().map(|v| v.to_f32()).collect(),
+                    input_norm: lw.input_norm.to_vec(),
+                    post_attn_norm: lw.post_attn_norm.to_vec(),
+                    q_a_proj: lw.q_a_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    q_a_layernorm: lw.q_a_layernorm.map(|w| w.to_vec()),
+                    q_b_proj: lw.q_b_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    router: lw.router.map(|r| r.iter().map(|v| v.to_f32()).collect()),
+                    e_score_correction_bias: lw.e_score_correction_bias.map(|b| b.to_vec()),
+                    shared_gate: lw.shared_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    shared_up: lw.shared_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    shared_down: lw.shared_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    dense_gate: lw.dense_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    dense_up: lw.dense_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                    dense_down: lw.dense_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+                });
+            }
+            eprintln!("Pre-converted weights to f32: {:.1}s", t.elapsed().as_secs_f64());
+        } else {
+            eprintln!("Lazy weight mode: f16→f32 per layer on the fly (~2 GB vs ~54 GB)");
         }
         let lm_head_f32: Vec<f32> = weights.lm_head()?.iter().map(|v| v.to_f32()).collect();
-        eprintln!("Pre-converted weights to f32: {:.1}s", t.elapsed().as_secs_f64());
 
         // Metal setup
         let mut metal = MetalDequantGemv::new();
@@ -164,6 +178,33 @@ impl ModelV2 {
     }
 }
 
+/// Convert one layer's weights from f16 mmap to f32 on the fly.
+fn convert_layer_f32(model: &ModelV2, layer: usize) -> Result<MlaLayerF32> {
+    let is_moe = model.config.is_moe_layer(layer);
+    let lw = model.weights.mla_layer_weights(layer, is_moe)?;
+    Ok(MlaLayerF32 {
+        q_proj: lw.q_proj.iter().map(|v| v.to_f32()).collect(),
+        kv_a_proj: lw.kv_a_proj.iter().map(|v| v.to_f32()).collect(),
+        kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
+        w_uk: lw.w_uk.iter().map(|v| v.to_f32()).collect(),
+        w_uv: lw.w_uv.iter().map(|v| v.to_f32()).collect(),
+        o_proj: lw.o_proj.iter().map(|v| v.to_f32()).collect(),
+        input_norm: lw.input_norm.to_vec(),
+        post_attn_norm: lw.post_attn_norm.to_vec(),
+        q_a_proj: lw.q_a_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        q_a_layernorm: lw.q_a_layernorm.map(|w| w.to_vec()),
+        q_b_proj: lw.q_b_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        router: lw.router.map(|r| r.iter().map(|v| v.to_f32()).collect()),
+        e_score_correction_bias: lw.e_score_correction_bias.map(|b| b.to_vec()),
+        shared_gate: lw.shared_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        shared_up: lw.shared_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        shared_down: lw.shared_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        dense_gate: lw.dense_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        dense_up: lw.dense_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        dense_down: lw.dense_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+    })
+}
+
 /// Run one layer of the V2 model (MLA attention + FFN).
 fn run_layer_v2(
     model: &ModelV2,
@@ -175,23 +216,31 @@ fn run_layer_v2(
 ) -> Result<Vec<f32>> {
     let hidden = model.config.hidden_size();
     let eps = model.config.rms_norm_eps();
-    let lf = &model.layers_f32[layer];
+
+    // Lazy conversion: use pre-converted if available, else convert on the fly
+    let lazy_lf;
+    let lf = if layer < model.layers_f32.len() {
+        &model.layers_f32[layer]
+    } else {
+        lazy_lf = convert_layer_f32(model, layer)?;
+        &lazy_lf
+    };
 
     // 1. RMSNorm → MLA Attention → Residual
     let normed = rmsnorm(x, &lf.input_norm, eps);
 
     let attn_weights = MlaAttnWeights {
-        q_proj: lf.q_proj.clone(),
-        q_a_proj: None,  // V2-Lite: direct q_proj, no LoRA
-        q_a_layernorm: None,
-        q_b_proj: None,
-        kv_a_proj: lf.kv_a_proj.clone(),
-        kv_a_layernorm: lf.kv_a_layernorm.clone(),
-        w_uk: lf.w_uk.clone(),
-        w_uv: lf.w_uv.clone(),
-        o_proj: lf.o_proj.clone(),
-        input_norm: lf.input_norm.clone(),
-        post_attn_norm: lf.post_attn_norm.clone(),
+        q_proj: &lf.q_proj,
+        q_a_proj: lf.q_a_proj.as_deref(),
+        q_a_layernorm: lf.q_a_layernorm.as_deref(),
+        q_b_proj: lf.q_b_proj.as_deref(),
+        kv_a_proj: &lf.kv_a_proj,
+        kv_a_layernorm: &lf.kv_a_layernorm,
+        w_uk: &lf.w_uk,
+        w_uv: &lf.w_uv,
+        o_proj: &lf.o_proj,
+        input_norm: &lf.input_norm,
+        post_attn_norm: &lf.post_attn_norm,
     };
 
     let attn_out = mla_forward_decode(
@@ -208,7 +257,7 @@ fn run_layer_v2(
     let normed2 = rmsnorm(&residual, &lf.post_attn_norm, eps);
 
     let ffn_out = if model.config.is_moe_layer(layer) {
-        moe_ffn_v2(model, router, layer, &normed2)?
+        moe_ffn_v2(model, router, layer, &normed2, lf)?
     } else {
         dense_ffn(&normed2, lf)
     };
@@ -276,9 +325,9 @@ fn moe_ffn_v2(
     router: &mut MoeRouter,
     layer: usize,
     x: &[f32],
+    lf: &MlaLayerF32,
 ) -> Result<Vec<f32>> {
     let hidden = model.config.hidden_size();
-    let lf = &model.layers_f32[layer];
 
     // 1. Router
     let router_w = lf.router.as_ref().expect("MoE layer needs router");
@@ -287,17 +336,31 @@ fn moe_ffn_v2(
     crate::blas::sgemv_f32(router_w, x, &mut gate_logits, num_experts, hidden);
 
     let route = if model.config.ffn.scoring_func == "sigmoid" {
-        router.route(&gate_logits)
+        if let Some(ref bias) = lf.e_score_correction_bias {
+            // V3: grouped sigmoid routing with frozen bias
+            moe_router::route_sigmoid_v3(
+                &gate_logits,
+                bias,
+                model.config.ffn.n_group,
+                model.config.ffn.topk_group,
+                model.config.num_experts_per_tok(),
+                1.0,  // scaling applied separately in weight accumulation
+            )
+        } else {
+            router.route(&gate_logits)
+        }
     } else {
         router.route_softmax(&gate_logits)
     };
 
-    // 2. Shared experts
+    // 2. Shared experts (unscaled — routed_scaling_factor applies only to routed experts)
     let mut combined = if lf.shared_gate.is_some() {
         shared_expert_ffn(x, lf)
     } else {
         vec![0.0f32; hidden]
     };
+
+    let routed_scale = model.config.ffn.routed_scaling_factor;
 
     // 3. Routed experts (4-bit quantized, Metal GPU or CPU)
     let expert_mmap = model.weights.expert_mmap(layer);
@@ -350,23 +413,14 @@ fn moe_ffn_v2(
             if !routing_weights.is_empty() {
                 let down_results = m.fused_and_down_single_cmdbuf(mmap_buf, &fused_ops, &down_ops, x);
                 for (i, weight) in routing_weights.iter().enumerate() {
+                    let scaled_weight = weight * routed_scale;
                     for d in 0..hidden {
-                        combined[d] += weight * down_results[i][d];
+                        combined[d] += scaled_weight * down_results[i][d];
                     }
                 }
             }
         }
         // CPU fallback omitted for now — Metal is the primary path
-    }
-
-    // Apply routed_scaling_factor if > 1.0
-    let scale = model.config.ffn.routed_scaling_factor;
-    if (scale - 1.0).abs() > 0.01 {
-        // Scale only the routed part (combined already includes shared)
-        // For V2-Lite, scale=1.0 so this is a no-op
-        for d in 0..hidden {
-            combined[d] *= scale;
-        }
     }
 
     Ok(combined)

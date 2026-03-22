@@ -138,17 +138,17 @@ fn run_v2_layer(
 
     // 2. MLA attention
     let attn_weights = MlaAttnWeights {
-        q_proj: lf.q_proj.clone(),
+        q_proj: &lf.q_proj,
         q_a_proj: None,
         q_a_layernorm: None,
         q_b_proj: None,
-        kv_a_proj: lf.kv_a_proj.clone(),
-        kv_a_layernorm: lf.kv_a_layernorm.clone(),
-        w_uk: lf.w_uk.clone(),
-        w_uv: lf.w_uv.clone(),
-        o_proj: lf.o_proj.clone(),
-        input_norm: lf.input_norm.clone(),
-        post_attn_norm: lf.post_attn_norm.clone(),
+        kv_a_proj: &lf.kv_a_proj,
+        kv_a_layernorm: &lf.kv_a_layernorm,
+        w_uk: &lf.w_uk,
+        w_uv: &lf.w_uv,
+        o_proj: &lf.o_proj,
+        input_norm: &lf.input_norm,
+        post_attn_norm: &lf.post_attn_norm,
     };
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,

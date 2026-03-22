@@ -53,18 +53,28 @@ fn q_lora_two_stage_matches_composed() {
     // Compute composed q_proj = W_qb @ (norm_weights * W_qa) — this is approximate
     // We can't exactly compose due to RMSNorm nonlinearity, but we CAN verify the LoRA path runs
 
+    // Allocate weight buffers, then borrow into MlaLayerWeights
+    let q_proj_buf = vec![0.0f32; q_total * hidden]; // unused in LoRA path
+    let kv_a_proj_buf: Vec<f32> = (0..kv_out_dim * hidden).map(|i| seed(i + 4000)).collect();
+    let kv_a_layernorm_buf: Vec<f32> = (0..kv_rank).map(|i| 1.0 + seed(i + 5000) * 0.1).collect();
+    let w_uk_buf: Vec<f32> = (0..num_heads * nope * kv_rank).map(|i| seed(i + 6000)).collect();
+    let w_uv_buf: Vec<f32> = (0..num_heads * v_dim * kv_rank).map(|i| seed(i + 7000)).collect();
+    let o_proj_buf: Vec<f32> = (0..hidden * num_heads * v_dim).map(|i| seed(i + 8000)).collect();
+    let input_norm_buf = vec![1.0f32; hidden];
+    let post_attn_norm_buf = vec![1.0f32; hidden];
+
     let weights = MlaLayerWeights {
-        q_proj: vec![0.0; q_total * hidden], // unused in LoRA path
-        q_a_proj: Some(q_a_proj),
-        q_a_layernorm: Some(q_a_layernorm),
-        q_b_proj: Some(q_b_proj),
-        kv_a_proj: (0..kv_out_dim * hidden).map(|i| seed(i + 4000)).collect(),
-        kv_a_layernorm: (0..kv_rank).map(|i| 1.0 + seed(i + 5000) * 0.1).collect(),
-        w_uk: (0..num_heads * nope * kv_rank).map(|i| seed(i + 6000)).collect(),
-        w_uv: (0..num_heads * v_dim * kv_rank).map(|i| seed(i + 7000)).collect(),
-        o_proj: (0..hidden * num_heads * v_dim).map(|i| seed(i + 8000)).collect(),
-        input_norm: vec![1.0; hidden],
-        post_attn_norm: vec![1.0; hidden],
+        q_proj: &q_proj_buf,
+        q_a_proj: Some(&q_a_proj),
+        q_a_layernorm: Some(&q_a_layernorm),
+        q_b_proj: Some(&q_b_proj),
+        kv_a_proj: &kv_a_proj_buf,
+        kv_a_layernorm: &kv_a_layernorm_buf,
+        w_uk: &w_uk_buf,
+        w_uv: &w_uv_buf,
+        o_proj: &o_proj_buf,
+        input_norm: &input_norm_buf,
+        post_attn_norm: &post_attn_norm_buf,
     };
 
     let mut cache = MlaKvCache::new(1, kv_rank, rope_dim, 100);

@@ -42,30 +42,30 @@ impl MlaDecodeConfig {
     }
 }
 
-/// Pre-split MLA weights for one layer (all f32, pre-converted at load time).
-pub struct MlaLayerWeights {
+/// Pre-split MLA weights for one layer (borrowed f32 slices — zero-copy from MlaLayerF32).
+pub struct MlaLayerWeights<'a> {
     /// Q projection: [num_heads * (nope + rope), hidden] row-major
     /// V2-Lite: used directly. V3: not used (Q LoRA path instead).
-    pub q_proj: Vec<f32>,
+    pub q_proj: &'a [f32],
     /// V3 Q LoRA: W_qa [q_lora_rank, hidden], W_qb [num_heads*(nope+rope), q_lora_rank]
     /// Both None for V2-Lite.
-    pub q_a_proj: Option<Vec<f32>>,
-    pub q_a_layernorm: Option<Vec<f32>>,
-    pub q_b_proj: Option<Vec<f32>>,
+    pub q_a_proj: Option<&'a [f32]>,
+    pub q_a_layernorm: Option<&'a [f32]>,
+    pub q_b_proj: Option<&'a [f32]>,
     /// KV down-projection: [kv_lora_rank + rope_dim, hidden] row-major
-    pub kv_a_proj: Vec<f32>,
+    pub kv_a_proj: &'a [f32],
     /// KV layernorm weights: [kv_lora_rank]
-    pub kv_a_layernorm: Vec<f32>,
+    pub kv_a_layernorm: &'a [f32],
     /// W_UK: [num_heads, nope_dim, kv_lora_rank] — split from kv_b_proj at load time
-    pub w_uk: Vec<f32>,
+    pub w_uk: &'a [f32],
     /// W_UV: [num_heads, v_head_dim, kv_lora_rank] — split from kv_b_proj at load time
-    pub w_uv: Vec<f32>,
+    pub w_uv: &'a [f32],
     /// O projection: [hidden, num_heads * v_head_dim] row-major
-    pub o_proj: Vec<f32>,
+    pub o_proj: &'a [f32],
     /// Input layernorm: [hidden]
-    pub input_norm: Vec<f32>,
+    pub input_norm: &'a [f32],
     /// Post-attention layernorm: [hidden]
-    pub post_attn_norm: Vec<f32>,
+    pub post_attn_norm: &'a [f32],
 }
 
 /// MLA KV cache: stores compressed latent + rope key per position per layer.
@@ -152,7 +152,7 @@ impl MlaKvCache {
 /// 9. output = concat(v) @ o_proj^T
 pub fn mla_forward_decode(
     x: &[f32],
-    weights: &MlaLayerWeights,
+    weights: &MlaLayerWeights<'_>,
     cache: &mut MlaKvCache,
     layer: usize,
     pos: usize,
