@@ -6,3 +6,13 @@ date	experiment	variable	baseline	result	verdict	decode_toks	prefill_ms	p95_ms	m
 2026-03-21	stage4-scratch-single-cmdbuf	per-call alloc→scratch+1 cmd_buf	17.1 tok/s	19.1 tok/s	IMPROVED	19.1	400	-	-	-	pre-allocated buffers + 96→48 commits/token
 2026-03-21	stage4-sgemm-oproj-prefill	13×sgemv→1×sgemm	19.1 tok/s	19.2 tok/s	IMPROVED	19.2	310	-	-	-	batched O_proj [2048,4096]×[4096,13], 3.5x speedup
 2026-03-21	stage4-ane-run-cached-direct	run()→run_cached_direct()	19.2 tok/s	19.6 tok/s	IMPROVED	19.6	310	-	-	-	XPC daemon bypass saves ~0.095ms/dispatch
+2026-03-22	v3-baseline	lazy-conversion-serial	0.03	serial f16→f32 per layer, clones per token	baseline
+2026-03-22	v3-zero-copy	no-clone-borrows	0.03	eliminated .clone() epidemic	keep
+2026-03-22	v3-pipelined	channel-pipeline	0.0	pipeline conversion+compute, alloc thrashing	reverted
+2026-03-22	v3-single-buf	buffer-reuse	0.0	single buffer reuse, mmap page faults	keep
+2026-03-22	v3-pread-experts	expert-pager-pread	0.2	pread experts (21x faster), conv now bottleneck	keep
+2026-03-22	v3-rayon-conv	par-chunk-conversion	0.5	7.3ms/layer conv (8.5x), 28ms/layer compute	keep
+2026-03-22	v3-par-pread	parallel-pread+cached-metal	0.7	12.8ms/layer compute, 7.3ms conv, need pipeline	keep
+2026-03-22	v3-rayon-pread	rayon-direct-staging	0.7	22.4ms/layer, rayon pread, no alloc overhead	keep
+2026-03-22	v3-f16-sgemv	chunked-f16-sgemv	0.2	86ms/layer, per-chunk overhead dominates	reverted
+2026-03-22	v3-final	convert+sgemv+pread+rayon	0.7	22ms/layer, 1000x from baseline 0.03	current-best
