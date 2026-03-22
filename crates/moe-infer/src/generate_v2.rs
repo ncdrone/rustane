@@ -561,25 +561,52 @@ fn moe_ffn_v2(
 
     if let Some(m) = model.metal.as_ref() {
         if use_pread {
-            // === PREAD PATH: load only needed experts via pread, pack into staging buffer ===
+            // === PREAD PATH: parallel load needed experts, pack into staging buffer ===
             let loader = &model.expert_loaders[&layer];
             let staging = &model.expert_staging;
 
+            // SAFETY: single-threaded access (pread writes to non-overlapping regions)
+            let staging_ptr = staging.as_ptr() as *mut u8;
+            let staging_len = staging.len();
+
+            // Parallel pread: each expert writes to its own non-overlapping slice
+            let expert_ids: Vec<(usize, usize, f32)> = route.expert_ids.iter()
+                .zip(route.weights.iter())
+                .enumerate()
+                .map(|(i, (&eid, &w))| (i, eid, w))
+                .collect();
+
+            // SAFETY: each thread writes to a non-overlapping region of staging.
+            // staging_ptr is derived from model.expert_staging which lives for 'model.
+            struct SendPtr(*mut u8);
+            unsafe impl Send for SendPtr {}
+            unsafe impl Sync for SendPtr {}
+            let sp = SendPtr(staging_ptr);
+
+            std::thread::scope(|s| {
+                let handles: Vec<_> = expert_ids.iter().map(|&(i, eid, _)| {
+                    let sp_ref = &sp;
+                    s.spawn(move || {
+                        let pack_offset = i * expert_stride;
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(sp_ref.0.add(pack_offset), expert_stride)
+                        };
+                        loader.load_expert(eid as u32, buf)
+                    })
+                }).collect();
+                for h in handles {
+                    h.join().unwrap()
+                        .map_err(|e| anyhow::anyhow!("pread expert layer {layer}: {e}")).unwrap();
+                }
+            });
+
+            // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();
             let mut down_ops = Vec::new();
             let mut routing_weights = Vec::new();
-            // SAFETY: we need &mut staging while also holding &model. Use unsafe to get a
-            // mutable ref to staging bytes (we're single-threaded here).
-            let staging_ptr = staging.as_ptr() as *mut u8;
-            let staging_slice = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
 
-            for (i, (&eid, &weight)) in route.expert_ids.iter().zip(route.weights.iter()).enumerate() {
+            for &(i, _eid, weight) in &expert_ids {
                 let pack_offset = i * expert_stride;
-                let expert_buf = &mut staging_slice[pack_offset..pack_offset + expert_stride];
-
-                // pread this expert from SSD/page cache
-                loader.load_expert(eid as u32, expert_buf)
-                    .map_err(|e| anyhow::anyhow!("pread expert {eid} layer {layer}: {e}"))?;
 
                 fused_ops.push(FusedGateUpSiluOp {
                     gate_packed_offset: pack_offset,
@@ -602,8 +629,8 @@ fn moe_ffn_v2(
             }
 
             if !routing_weights.is_empty() {
-                // Wrap staging buffer with Metal and dispatch
-                let metal_buf = m.wrap_mmap(staging);
+                let staging_slice = unsafe { std::slice::from_raw_parts(staging_ptr, staging_len) };
+                let metal_buf = m.wrap_mmap(staging_slice);
                 let down_results = m.fused_and_down_single_cmdbuf(&metal_buf, &fused_ops, &down_ops, x);
                 for (i, weight) in routing_weights.iter().enumerate() {
                     let scaled_weight = weight * routed_scale;
