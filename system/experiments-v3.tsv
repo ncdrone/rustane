@@ -1,0 +1,11 @@
+date	experiment	variable	baseline	result	verdict	decode_toks	notes
+2026-03-22	v3-baseline	lazy-conversion-serial	0.03	serial f16→f32 per layer, clones per token	baseline	0.03	initial state
+2026-03-22	v3-zero-copy	no-clone-borrows	0.03	eliminated .clone() epidemic	keep	0.03	100GB memcpy saved
+2026-03-22	v3-pipelined	channel-pipeline	-	pipeline conversion+compute, alloc thrashing	reverted	-	DEAD END: alloc thrashing worse than serial
+2026-03-22	v3-single-buf	buffer-reuse	0.03	single buffer reuse, mmap page faults	keep	0.03	zero allocs after warmup
+2026-03-22	v3-pread-experts	expert-pager-pread	0.03	pread experts (21x faster), conv now bottleneck	keep	0.2	replaced 348GB mmap thrashing
+2026-03-22	v3-rayon-conv	par-chunk-conversion	0.2	7.3ms/layer conv (8.5x), 28ms/layer compute	keep	0.5	saturate memory bandwidth across cores
+2026-03-22	v3-par-pread	parallel-pread+cached-metal	0.5	12.8ms/layer compute, 7.3ms conv, need pipeline	keep	0.7	NVMe QD>1 for throughput
+2026-03-22	v3-rayon-pread	rayon-direct-staging	0.7	22.4ms/layer, rayon pread, no alloc overhead	keep	0.7	current architecture baseline
+2026-03-22	v3-f16-sgemv	chunked-f16-sgemv	0.7	86ms/layer, per-chunk overhead dominates	reverted	0.2	DEAD END: 4x slower than convert+sgemv_f32
+2026-03-22	v3-final	convert+sgemv+pread+rayon	0.03	22ms/layer avg, 1000x from baseline	current-best	0.7	Phase 1 final state
