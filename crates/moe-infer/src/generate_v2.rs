@@ -16,6 +16,7 @@ use crate::yarn_rope::{YarnRopeTables, compute_mscale, mla_attention_scale};
 
 use moe_router::{MoeRouter, RouterConfig};
 use moe_kernels::{MetalDequantGemv, ExpertGemvOp, FusedGateUpSiluOp};
+use expert_pager::{ExpertPool, ExpertLoader};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -85,6 +86,13 @@ pub struct ModelV2 {
     pub expert_metal_bufs: std::collections::HashMap<usize, Retained<ProtocolObject<dyn MTLBuffer>>>,
     pub layers_f32: Vec<MlaLayerF32>,
     pub lm_head_f32: Vec<f32>,
+    /// Per-layer expert file loaders for pread-based dispatch (V3 optimization).
+    pub expert_loaders: std::collections::HashMap<usize, ExpertLoader>,
+    /// Expert stride in bytes (computed once at load time).
+    pub expert_stride: usize,
+    /// Staging buffer for packing selected experts before Metal dispatch.
+    /// Size: top_k * expert_stride bytes. Reused across layers and tokens.
+    pub expert_staging: Vec<u8>,
 }
 
 /// Sampling configuration.
@@ -168,18 +176,64 @@ impl ModelV2 {
                 config.moe_inter_size(),
                 config.num_experts_per_tok(),
             );
+            if !lazy_mode {
+                // Small models: wrap all expert mmaps (fits in memory)
+                for layer in 0..num_layers {
+                    if let Some(mmap) = weights.expert_mmap(layer) {
+                        let buf = m.wrap_mmap(mmap);
+                        expert_metal_bufs.insert(layer, buf);
+                    }
+                }
+                eprintln!("Metal GPU: {} layers wrapped (mmap)", expert_metal_bufs.len());
+            } else {
+                // Large models: skip mmap wrapping, use pread-based loading below
+                eprintln!("Metal GPU: expert pager mode (pread on demand)");
+            }
+        }
+
+        // Expert pager: pread-based loading for large models (avoids 348 GB mmap thrashing)
+        let mut expert_loaders = std::collections::HashMap::new();
+        let hidden = config.hidden_size();
+        let moe_inter = config.moe_inter_size();
+        let group_size = config.quantization.group_size;
+
+        // Compute expert stride (same calculation as moe_ffn_v2)
+        let gu_packed = moe_inter * hidden / 2;
+        let gu_groups = moe_inter * (hidden / group_size);
+        let gu_scales = gu_groups * 2;
+        let gu_total = gu_packed + gu_scales * 2;
+        let dn_packed = hidden * moe_inter / 2;
+        let dn_groups = hidden * (moe_inter / group_size);
+        let dn_scales = dn_groups * 2;
+        let dn_total = dn_packed + dn_scales * 2;
+        let expert_stride = gu_total * 2 + dn_total;
+
+        // Pre-allocate staging buffer for top-k experts
+        let top_k = config.num_experts_per_tok();
+        let expert_staging = vec![0u8; top_k * expert_stride];
+
+        if lazy_mode {
+            // Open file handles for each expert layer (pread-based, no mmap wrapping)
+            let layout = expert_pager::ExpertFileLayout {
+                expert_size: expert_stride,
+                num_experts: config.num_experts(),
+            };
             for layer in 0..num_layers {
-                if let Some(mmap) = weights.expert_mmap(layer) {
-                    let buf = m.wrap_mmap(mmap);
-                    expert_metal_bufs.insert(layer, buf);
+                let expert_path = weights_dir.join(format!("layer_{layer:02}_experts.bin"));
+                if expert_path.exists() {
+                    let loader = ExpertLoader::open(expert_path.to_str().unwrap(), layout.clone())
+                        .map_err(|e| anyhow::anyhow!("open expert file layer {layer}: {e}"))?;
+                    expert_loaders.insert(layer, loader);
                 }
             }
-            eprintln!("Metal GPU: {} layers wrapped", expert_metal_bufs.len());
+            eprintln!("Expert pager: {} layers with pread loaders, staging={:.1} MB",
+                expert_loaders.len(), expert_staging.len() as f64 / 1e6);
         }
 
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
+            expert_loaders, expert_stride, expert_staging,
         })
     }
 }
@@ -477,47 +531,58 @@ fn moe_ffn_v2(
     let routed_scale = model.config.ffn.routed_scaling_factor;
 
     // 3. Routed experts (4-bit quantized, Metal GPU or CPU)
-    let expert_mmap = model.weights.expert_mmap(layer);
-    let mmap_metal_buf = model.expert_metal_bufs.get(&layer).map(|b| b.as_ref());
-
     let moe_inter = model.config.moe_inter_size();
     let group_size = model.config.quantization.group_size;
 
-    if let Some(expert_data) = expert_mmap {
-        let gu_packed = moe_inter * hidden / 2;
-        let gu_groups = moe_inter * (hidden / group_size);
-        let gu_scales = gu_groups * 2;
-        let gu_total = gu_packed + gu_scales * 2;
-        let dn_packed = hidden * moe_inter / 2;
-        let dn_groups = hidden * (moe_inter / group_size);
-        let dn_scales = dn_groups * 2;
-        let dn_total = dn_packed + dn_scales * 2;
-        let expert_stride = gu_total * 2 + dn_total;
+    let gu_packed = moe_inter * hidden / 2;
+    let gu_groups = moe_inter * (hidden / group_size);
+    let gu_scales = gu_groups * 2;
+    let gu_total = gu_packed + gu_scales * 2;
+    let dn_packed = hidden * moe_inter / 2;
+    let dn_groups = hidden * (moe_inter / group_size);
+    let dn_scales = dn_groups * 2;
+    let dn_total = dn_packed + dn_scales * 2;
+    let expert_stride = gu_total * 2 + dn_total;
 
-        if let (Some(m), Some(mmap_buf)) = (model.metal.as_ref(), mmap_metal_buf) {
-            // Metal path
+    // Use pread-based loading if available (large models), else fall back to mmap
+    let use_pread = model.expert_loaders.contains_key(&layer);
+
+    if let Some(m) = model.metal.as_ref() {
+        if use_pread {
+            // === PREAD PATH: load only needed experts via pread, pack into staging buffer ===
+            let loader = &model.expert_loaders[&layer];
+            let staging = &model.expert_staging;
+
             let mut fused_ops = Vec::new();
             let mut down_ops = Vec::new();
             let mut routing_weights = Vec::new();
+            // SAFETY: we need &mut staging while also holding &model. Use unsafe to get a
+            // mutable ref to staging bytes (we're single-threaded here).
+            let staging_ptr = staging.as_ptr() as *mut u8;
+            let staging_slice = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
 
-            for (&eid, &weight) in route.expert_ids.iter().zip(route.weights.iter()) {
-                let base = eid * expert_stride;
-                if base + expert_stride > expert_data.len() { continue; }
+            for (i, (&eid, &weight)) in route.expert_ids.iter().zip(route.weights.iter()).enumerate() {
+                let pack_offset = i * expert_stride;
+                let expert_buf = &mut staging_slice[pack_offset..pack_offset + expert_stride];
+
+                // pread this expert from SSD/page cache
+                loader.load_expert(eid as u32, expert_buf)
+                    .map_err(|e| anyhow::anyhow!("pread expert {eid} layer {layer}: {e}"))?;
 
                 fused_ops.push(FusedGateUpSiluOp {
-                    gate_packed_offset: base,
-                    gate_scales_offset: base + gu_packed,
-                    gate_zeros_offset: base + gu_packed + gu_scales,
-                    up_packed_offset: base + gu_total,
-                    up_scales_offset: base + gu_total + gu_packed,
-                    up_zeros_offset: base + gu_total + gu_packed + gu_scales,
+                    gate_packed_offset: pack_offset,
+                    gate_scales_offset: pack_offset + gu_packed,
+                    gate_zeros_offset: pack_offset + gu_packed + gu_scales,
+                    up_packed_offset: pack_offset + gu_total,
+                    up_scales_offset: pack_offset + gu_total + gu_packed,
+                    up_zeros_offset: pack_offset + gu_total + gu_packed + gu_scales,
                     out_features: moe_inter, in_features: hidden, group_size,
                 });
 
                 down_ops.push(ExpertGemvOp {
-                    packed_offset: base + 2 * gu_total,
-                    scales_offset: base + 2 * gu_total + dn_packed,
-                    zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
+                    packed_offset: pack_offset + 2 * gu_total,
+                    scales_offset: pack_offset + 2 * gu_total + dn_packed,
+                    zeros_offset: pack_offset + 2 * gu_total + dn_packed + dn_scales,
                     out_features: hidden, in_features: moe_inter, group_size,
                 });
 
@@ -525,7 +590,9 @@ fn moe_ffn_v2(
             }
 
             if !routing_weights.is_empty() {
-                let down_results = m.fused_and_down_single_cmdbuf(mmap_buf, &fused_ops, &down_ops, x);
+                // Wrap staging buffer with Metal and dispatch
+                let metal_buf = m.wrap_mmap(staging);
+                let down_results = m.fused_and_down_single_cmdbuf(&metal_buf, &fused_ops, &down_ops, x);
                 for (i, weight) in routing_weights.iter().enumerate() {
                     let scaled_weight = weight * routed_scale;
                     for d in 0..hidden {
@@ -533,8 +600,51 @@ fn moe_ffn_v2(
                     }
                 }
             }
+        } else {
+            // === MMAP PATH: original zero-copy Metal dispatch (small models) ===
+            let expert_mmap = model.weights.expert_mmap(layer);
+            let mmap_metal_buf = model.expert_metal_bufs.get(&layer).map(|b| b.as_ref());
+
+            if let (Some(expert_data), Some(mmap_buf)) = (expert_mmap, mmap_metal_buf) {
+                let mut fused_ops = Vec::new();
+                let mut down_ops = Vec::new();
+                let mut routing_weights = Vec::new();
+
+                for (&eid, &weight) in route.expert_ids.iter().zip(route.weights.iter()) {
+                    let base = eid * expert_stride;
+                    if base + expert_stride > expert_data.len() { continue; }
+
+                    fused_ops.push(FusedGateUpSiluOp {
+                        gate_packed_offset: base,
+                        gate_scales_offset: base + gu_packed,
+                        gate_zeros_offset: base + gu_packed + gu_scales,
+                        up_packed_offset: base + gu_total,
+                        up_scales_offset: base + gu_total + gu_packed,
+                        up_zeros_offset: base + gu_total + gu_packed + gu_scales,
+                        out_features: moe_inter, in_features: hidden, group_size,
+                    });
+
+                    down_ops.push(ExpertGemvOp {
+                        packed_offset: base + 2 * gu_total,
+                        scales_offset: base + 2 * gu_total + dn_packed,
+                        zeros_offset: base + 2 * gu_total + dn_packed + dn_scales,
+                        out_features: hidden, in_features: moe_inter, group_size,
+                    });
+
+                    routing_weights.push(weight);
+                }
+
+                if !routing_weights.is_empty() {
+                    let down_results = m.fused_and_down_single_cmdbuf(mmap_buf, &fused_ops, &down_ops, x);
+                    for (i, weight) in routing_weights.iter().enumerate() {
+                        let scaled_weight = weight * routed_scale;
+                        for d in 0..hidden {
+                            combined[d] += scaled_weight * down_results[i][d];
+                        }
+                    }
+                }
+            }
         }
-        // CPU fallback omitted for now — Metal is the primary path
     }
 
     Ok(combined)
