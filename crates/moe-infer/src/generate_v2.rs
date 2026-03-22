@@ -585,18 +585,19 @@ fn moe_ffn_v2(
                 .map(|(i, (&eid, &w))| (i, eid, w))
                 .collect();
 
-            // Parallel pread via load_experts_parallel (QD>1 for NVMe throughput)
-            let expert_id_list: Vec<u32> = expert_ids.iter().map(|&(_, eid, _)| eid as u32).collect();
-            let mut expert_bufs: Vec<Vec<u8>> = (0..expert_id_list.len()).map(|_| Vec::new()).collect();
-            loader.load_experts_parallel(&expert_id_list, &mut expert_bufs, 4)
-                .map_err(|e| anyhow::anyhow!("pread experts layer {layer}: {e}"))?;
-
-            // Copy into staging at packed offsets
+            // Parallel pread directly into staging via rayon (no thread creation, no alloc)
+            use rayon::prelude::*;
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
-            for (i, buf) in expert_bufs.iter().enumerate() {
-                let off = i * expert_stride;
-                staging_mut[off..off + expert_stride].copy_from_slice(&buf[..expert_stride]);
-            }
+
+            // Split staging into per-expert chunks and load in parallel
+            staging_mut[..expert_ids.len() * expert_stride]
+                .chunks_mut(expert_stride)
+                .zip(expert_ids.iter())
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .for_each(|(chunk, &(_, eid, _))| {
+                    loader.load_expert(eid as u32, chunk).unwrap();
+                });
 
             // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();

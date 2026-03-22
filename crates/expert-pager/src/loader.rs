@@ -29,6 +29,10 @@ pub struct ExpertLoader {
     pub layout: ExpertFileLayout,
 }
 
+// SAFETY: ExpertLoader uses pread which is thread-safe (no file position mutation).
+// The fd is only used via as_raw_fd() + pread — safe for concurrent access.
+unsafe impl Sync for ExpertLoader {}
+
 impl ExpertLoader {
     /// Open an expert weight file.
     pub fn open(path: &str, layout: ExpertFileLayout) -> io::Result<Self> {
