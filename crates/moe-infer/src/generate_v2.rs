@@ -608,137 +608,70 @@ pub fn generate_v2(
 
     let lazy_mode = model.layers_f32.is_empty();
 
-    // For lazy mode: double-buffer pipeline with REUSABLE buffers (ping-pong).
-    // Two MlaLayerF32 buffers alternate: converter fills one, compute reads the other.
+    // For lazy mode: single reusable buffer, sequential convert+compute.
+    // ONE MlaLayerF32 buffer is reused across all layers and tokens.
     // After warmup (~3 layers), Vec capacities are established → ZERO allocations.
-    //
-    // Flow per token:
-    //   main:  convert(buf_a, L0) → compute(buf_a, L0) → compute(buf_b, L1) → compute(buf_a, L2) → ...
-    //   conv:                        convert(buf_b, L1) → convert(buf_a, L2) → convert(buf_b, L3) → ...
-    //   Buffers ping-pong via ownership transfer through channels.
+    // Simple and eliminates the ~1.8 GB alloc/dealloc per layer that was the bottleneck.
 
     let (prefill_secs, decode_secs) = if lazy_mode {
-        // Channels for ping-pong buffer exchange:
-        // Main → Converter: (layer_to_convert, buffer_to_fill)
-        // Converter → Main: (filled_buffer, result)
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, MlaLayerF32)>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<(MlaLayerF32, Result<()>)>();
+        // One reusable conversion buffer — persists across all tokens
+        let mut layer_buf = MlaLayerF32::empty();
 
-        std::thread::scope(|s| -> Result<(f64, f64)> {
-            let weights = &model.weights;
-            let config = &model.config;
-
-            // Converter thread: receives (layer, buffer), fills buffer in-place, sends back.
-            s.spawn(move || {
-                while let Ok((layer, mut buf)) = req_rx.recv() {
-                    let result = convert_layer_into(&mut buf, weights, config, layer);
-                    let _ = res_tx.send((buf, result));
-                }
-            });
-
-            /// Process all layers for one token using ping-pong double-buffer.
-            fn run_all_layers_pipelined(
-                model: &ModelV2,
-                cache: &mut MlaKvCache,
-                router: &mut MoeRouter,
-                num_layers: usize,
-                x: &mut Vec<f32>,
-                pos: usize,
-                spare: &mut MlaLayerF32,
-                req_tx: &std::sync::mpsc::Sender<(usize, MlaLayerF32)>,
-                res_rx: &std::sync::mpsc::Receiver<(MlaLayerF32, Result<()>)>,
-            ) -> Result<MlaLayerF32> {
-                // Convert layer 0 on main thread (blocking, but reuses spare capacity)
-                convert_layer_into(spare, &model.weights, &model.config, 0)?;
-                // spare now holds layer 0's weights
-                // We need a second buffer for the converter. Take a dummy for now.
-                let mut current_lf = std::mem::replace(spare, MlaLayerF32::empty());
-
-                for layer in 0..num_layers {
-                    // Send spare buffer to converter for next layer
-                    if layer + 1 < num_layers {
-                        let send_buf = std::mem::replace(spare, MlaLayerF32::empty());
-                        req_tx.send((layer + 1, send_buf)).unwrap();
-                    }
-
-                    // Compute current layer on main thread
-                    *x = run_layer_compute(model, cache, router, layer, x, pos, &current_lf)?;
-
-                    // Receive filled buffer from converter, give back current as spare
-                    if layer + 1 < num_layers {
-                        let (new_buf, result) = res_rx.recv().unwrap();
-                        result?;
-                        *spare = current_lf;  // old current becomes spare (keeps capacity!)
-                        current_lf = new_buf; // new buffer has next layer's weights
-                    }
-                }
-                // Return current_lf so its capacity persists across tokens
-                Ok(current_lf)
+        // --- Prefill ---
+        let t_prefill = std::time::Instant::now();
+        for (i, &token_id) in input_ids.iter().enumerate() {
+            let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+            let mut x = emb;
+            for layer in 0..num_layers {
+                convert_layer_into(&mut layer_buf, &model.weights, &model.config, layer)?;
+                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &layer_buf)?;
             }
+            cache.advance();
 
-            // Two persistent buffers that ping-pong across tokens + layers
-            let mut spare_buf = MlaLayerF32::empty();
-            let mut carry_buf; // will be set by first call
-
-            // --- Prefill ---
-            let t_prefill = std::time::Instant::now();
-            for (i, &token_id) in input_ids.iter().enumerate() {
-                let mut x = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-                carry_buf = run_all_layers_pipelined(
-                    model, &mut cache, &mut router, num_layers,
-                    &mut x, i, &mut spare_buf, &req_tx, &res_rx,
-                )?;
-                // Swap: carry_buf becomes spare for next token
-                spare_buf = carry_buf;
-                cache.advance();
-
-                if i == input_ids.len() - 1 {
-                    let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-                    let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
-                    let next_token = sample(&logits, sampling, i as u64);
-                    all_ids.push(next_token);
-                }
-            }
-            let prefill_secs = t_prefill.elapsed().as_secs_f64();
-
-            // --- Decode ---
-            let t_decode = std::time::Instant::now();
-            let mut pos = input_ids.len();
-            let mut first_token_logged = false;
-            for step in 0..max_new_tokens.saturating_sub(1) {
-                if pos >= max_seq { break; }
-                let token_id = *all_ids.last().unwrap();
-                if token_id == model.config.model.eos_token_id { break; }
-
-                let t_tok = std::time::Instant::now();
-                let mut x = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-
-                carry_buf = run_all_layers_pipelined(
-                    model, &mut cache, &mut router, num_layers,
-                    &mut x, pos, &mut spare_buf, &req_tx, &res_rx,
-                )?;
-                spare_buf = carry_buf;
-                cache.advance();
-
+            if i == input_ids.len() - 1 {
                 let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
                 let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
-                let next_token = sample(&logits, sampling, (pos + step) as u64);
+                let next_token = sample(&logits, sampling, i as u64);
                 all_ids.push(next_token);
-
-                let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
-                if !first_token_logged {
-                    first_token_logged = true;
-                    eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total, pipelined+reuse) ---");
-                    eprintln!("  {num_layers} layers at {:.1}ms/layer", tok_ms / num_layers as f64);
-                }
-
-                pos += 1;
             }
-            let decode_secs = t_decode.elapsed().as_secs_f64();
+        }
+        let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-            drop(req_tx);
-            Ok((prefill_secs, decode_secs))
-        })?
+        // --- Decode ---
+        let t_decode = std::time::Instant::now();
+        let mut pos = input_ids.len();
+        let mut first_token_logged = false;
+        for step in 0..max_new_tokens.saturating_sub(1) {
+            if pos >= max_seq { break; }
+            let token_id = *all_ids.last().unwrap();
+            if token_id == model.config.model.eos_token_id { break; }
+
+            let t_tok = std::time::Instant::now();
+            let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+            let mut x = emb;
+
+            for layer in 0..num_layers {
+                convert_layer_into(&mut layer_buf, &model.weights, &model.config, layer)?;
+                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &layer_buf)?;
+            }
+            cache.advance();
+
+            let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+            let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+            let next_token = sample(&logits, sampling, (pos + step) as u64);
+            all_ids.push(next_token);
+
+            let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+            if !first_token_logged {
+                first_token_logged = true;
+                eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total, single-buf reuse) ---");
+                eprintln!("  {num_layers} layers at {:.1}ms/layer", tok_ms / num_layers as f64);
+            }
+
+            pos += 1;
+        }
+        let decode_secs = t_decode.elapsed().as_secs_f64();
+        (prefill_secs, decode_secs)
     } else {
         // --- Pre-converted path (small models like V2-Lite) ---
         let t_prefill = std::time::Instant::now();
