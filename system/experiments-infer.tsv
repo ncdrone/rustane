@@ -16,3 +16,5 @@ date	experiment	variable	baseline	result	verdict	decode_toks	prefill_ms	p95_ms	m
 2026-03-22	v3-rayon-pread	rayon-direct-staging	0.7	22.4ms/layer, rayon pread, no alloc overhead	keep
 2026-03-22	v3-f16-sgemv	chunked-f16-sgemv	0.2	86ms/layer, per-chunk overhead dominates	reverted
 2026-03-22	v3-final	convert+sgemv+pread+rayon	0.7	22ms/layer, 1000x from baseline 0.03	current-best
+2026-03-22	v3-pipeline-decode	thread::scope double-buffer	0.7	0.74 warm, bandwidth contention nullifies overlap	no-effect	0.74	-	-	-	-	conversion+BLAS compete for memory bus; avg pipelined 21.3ms vs 22ms baseline
+2026-03-22	v3-bulk-fcvtl	convert_to_f32_slice vs per-elem to_f32	0.7	conv 5.6ms/layer (was 7ms), 6-7x single-thread speedup	keep	0.75	-	-	-	-	half::HalfFloatSliceExt uses NEON FCVTL 4-wide; rayon hides most gain (mem-BW limited)

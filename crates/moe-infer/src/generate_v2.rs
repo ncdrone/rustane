@@ -247,12 +247,14 @@ impl ModelV2 {
     }
 }
 
-/// Fill dst Vec from f16 src using parallel chunk conversion.
+/// Fill dst Vec from f16 src using parallel bulk NEON conversion.
 /// Reuses existing Vec capacity (zero allocs after first call).
-/// For large tensors, splits across multiple threads via rayon.
+/// Uses half's convert_to_f32_slice (FCVTL: 4 f16→4 f32 per instruction)
+/// instead of per-element to_f32 (scalar fcvt + runtime detection overhead).
 #[inline]
 fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
     use rayon::prelude::*;
+    use half::slice::HalfFloatSliceExt;
     let n = src.len();
     dst.clear();
     if dst.capacity() < n {
@@ -262,18 +264,13 @@ fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
 
     const PAR_THRESHOLD: usize = 500_000; // ~1 MB f16 = worth parallelizing
     if n >= PAR_THRESHOLD {
-        // Parallel conversion: split into chunks, each core converts a chunk
+        // Parallel conversion: each rayon thread uses vectorized FCVTL on its chunk
         dst.par_chunks_mut(256 * 1024).enumerate().for_each(|(chunk_idx, chunk)| {
             let base = chunk_idx * 256 * 1024;
-            for i in 0..chunk.len() {
-                chunk[i] = src[base + i].to_f32();
-            }
+            src[base..base + chunk.len()].convert_to_f32_slice(chunk);
         });
     } else {
-        let dst_s = dst.as_mut_slice();
-        for i in 0..n {
-            dst_s[i] = src[i].to_f32();
-        }
+        src.convert_to_f32_slice(dst.as_mut_slice());
     }
 }
 
