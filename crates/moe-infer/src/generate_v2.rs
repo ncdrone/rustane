@@ -964,13 +964,14 @@ pub fn generate_v2(
         eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers)",
             t_warmup.elapsed().as_secs_f64(), num_layers);
 
-        // --- Prefill (f16 direct — no conversion pass) ---
+        // --- Prefill ---
         let t_prefill = std::time::Instant::now();
         for (i, &token_id) in input_ids.iter().enumerate() {
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
             for layer in 0..num_layers {
-                x = run_layer_f16(model, &mut cache, &mut router, layer, &x, i)?;
+                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &buf_a)?;
             }
             cache.advance();
             if i == input_ids.len() - 1 {
@@ -982,7 +983,7 @@ pub fn generate_v2(
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // --- Decode (f16 direct — no conversion pass, half memory traffic) ---
+        // --- Decode (sequential convert+compute, single reusable buffer) ---
         let t_decode = std::time::Instant::now();
         let mut pos = input_ids.len();
         let mut first_token_logged = false;
@@ -996,7 +997,8 @@ pub fn generate_v2(
             let mut x = emb;
 
             for layer in 0..num_layers {
-                x = run_layer_f16(model, &mut cache, &mut router, layer, &x, pos)?;
+                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &buf_a)?;
             }
             cache.advance();
 
