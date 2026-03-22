@@ -578,36 +578,22 @@ fn moe_ffn_v2(
             let staging_ptr = staging.as_ptr() as *mut u8;
             let staging_len = staging.len();
 
-            // Parallel pread: each expert writes to its own non-overlapping slice
+            // Parallel pread using rayon (pre-warmed thread pool — no thread creation overhead)
             let expert_ids: Vec<(usize, usize, f32)> = route.expert_ids.iter()
                 .zip(route.weights.iter())
                 .enumerate()
                 .map(|(i, (&eid, &w))| (i, eid, w))
                 .collect();
 
-            // SAFETY: each thread writes to a non-overlapping region of staging.
-            // staging_ptr is derived from model.expert_staging which lives for 'model.
-            struct SendPtr(*mut u8);
-            unsafe impl Send for SendPtr {}
-            unsafe impl Sync for SendPtr {}
-            let sp = SendPtr(staging_ptr);
-
-            std::thread::scope(|s| {
-                let handles: Vec<_> = expert_ids.iter().map(|&(i, eid, _)| {
-                    let sp_ref = &sp;
-                    s.spawn(move || {
-                        let pack_offset = i * expert_stride;
-                        let buf = unsafe {
-                            std::slice::from_raw_parts_mut(sp_ref.0.add(pack_offset), expert_stride)
-                        };
-                        loader.load_expert(eid as u32, buf)
-                    })
-                }).collect();
-                for h in handles {
-                    h.join().unwrap()
-                        .map_err(|e| anyhow::anyhow!("pread expert layer {layer}: {e}")).unwrap();
-                }
-            });
+            // SAFETY: each task writes to a non-overlapping region of staging.
+            // Use indexed iteration to avoid Send issues with raw pointers.
+            let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
+            for &(i, eid, _) in &expert_ids {
+                let pack_offset = i * expert_stride;
+                let expert_buf = &mut staging_mut[pack_offset..pack_offset + expert_stride];
+                loader.load_expert(eid as u32, expert_buf)
+                    .map_err(|e| anyhow::anyhow!("pread expert {eid} layer {layer}: {e}"))?;
+            }
 
             // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();
