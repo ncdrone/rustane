@@ -93,6 +93,8 @@ pub struct ModelV2 {
     /// Staging buffer for packing selected experts before Metal dispatch.
     /// Size: top_k * expert_stride bytes. Reused across layers and tokens.
     pub expert_staging: Vec<u8>,
+    /// Pre-wrapped Metal buffer for expert_staging (created once, reused).
+    pub expert_staging_metal: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 /// Sampling configuration.
@@ -230,10 +232,17 @@ impl ModelV2 {
                 expert_loaders.len(), expert_staging.len() as f64 / 1e6);
         }
 
+        // Pre-wrap staging buffer with Metal (created once, content updated per dispatch)
+        let expert_staging_metal = if !expert_staging.is_empty() {
+            metal.as_ref().map(|m| m.wrap_mmap(&expert_staging))
+        } else {
+            None
+        };
+
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
-            expert_loaders, expert_stride, expert_staging,
+            expert_loaders, expert_stride, expert_staging, expert_staging_metal,
         })
     }
 }
@@ -629,9 +638,9 @@ fn moe_ffn_v2(
             }
 
             if !routing_weights.is_empty() {
-                let staging_slice = unsafe { std::slice::from_raw_parts(staging_ptr, staging_len) };
-                let metal_buf = m.wrap_mmap(staging_slice);
-                let down_results = m.fused_and_down_single_cmdbuf(&metal_buf, &fused_ops, &down_ops, x);
+                // Use pre-wrapped Metal buffer (staging content updated in-place via pread)
+                let metal_buf = model.expert_staging_metal.as_ref().unwrap();
+                let down_results = m.fused_and_down_single_cmdbuf(metal_buf, &fused_ops, &down_ops, x);
                 for (i, weight) in routing_weights.iter().enumerate() {
                     let scaled_weight = weight * routed_scale;
                     for d in 0..hidden {
