@@ -843,14 +843,16 @@ pub fn generate_v2(
                 let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
                 let mut x = emb;
 
-                // Convert layer 0 into buf_a (blocking, reuses capacity)
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, 0)?;
-                // buf_b is the spare buffer — send to converter for layer 1
-                // Ping-pong: even layers use buf_a, odd layers use buf_b
+                // Send buf_a to converter for layer 0 (reuses capacity from previous token)
+                let send_a = std::mem::replace(&mut buf_a, MlaLayerF32::empty());
+                req_tx.send((0, send_a)).unwrap();
+                let (filled0, result0) = res_rx.recv().unwrap();
+                result0?;
+                buf_a = filled0; // buf_a now has layer 0 weights
 
                 for layer in 0..num_layers {
                     if layer + 1 < num_layers {
-                        // Send spare buffer to converter for next layer
+                        // Send buf_b (spare with capacity) to converter for next layer
                         let spare = std::mem::replace(&mut buf_b, MlaLayerF32::empty());
                         req_tx.send((layer + 1, spare)).unwrap();
                     }
