@@ -68,8 +68,14 @@ pub struct MlaLayerWeights<'a> {
     pub w_uk: &'a [f16],            // pre-split from kv_b_proj
     pub w_uv: &'a [f16],            // pre-split from kv_b_proj
     pub o_proj: &'a [f16],
+    // V3 Q LoRA (None for V2-Lite)
+    pub q_a_proj: Option<&'a [f16]>,
+    pub q_a_layernorm: Option<&'a [f32]>,
+    pub q_b_proj: Option<&'a [f16]>,
     // FFN: either dense or MoE
     pub router: Option<&'a [f16]>,   // None for dense layers
+    // e_score_correction_bias (V3 sigmoid routing, None for V2-Lite)
+    pub e_score_correction_bias: Option<&'a [f32]>,
     // Shared expert weights (for MoE layers)
     pub shared_gate_proj: Option<&'a [f16]>,
     pub shared_up_proj: Option<&'a [f16]>,
@@ -100,6 +106,13 @@ impl BackboneWeights {
             .with_context(|| format!("opening {}", bin_path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmap {}", bin_path.display()))?;
+
+        // Pre-fault backbone pages into page cache (async kernel readahead).
+        // Without this, every f16→f32 conversion hits SSD page faults.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_WILLNEED);
+        }
 
         // Try to load expert files
         let mut expert_mmaps = HashMap::new();
@@ -221,8 +234,13 @@ impl BackboneWeights {
         let input_norm = self.tensor_f32(&format!("{prefix}.input_layernorm.weight"))?;
         let post_attn_norm = self.tensor_f32(&format!("{prefix}.post_attention_layernorm.weight"))?;
 
-        // MLA attention
-        let q_proj = self.tensor_f16(&format!("{prefix}.self_attn.q_proj.weight"))?;
+        // MLA attention — try Q LoRA first (V3), fall back to direct q_proj (V2-Lite)
+        let q_a_proj = self.tensor_f16(&format!("{prefix}.self_attn.q_a_proj.weight")).ok();
+        let q_a_layernorm = self.tensor_f32(&format!("{prefix}.self_attn.q_a_layernorm.weight")).ok();
+        let q_b_proj = self.tensor_f16(&format!("{prefix}.self_attn.q_b_proj.weight")).ok();
+        let q_proj = self.tensor_f16(&format!("{prefix}.self_attn.q_proj.weight"))
+            .unwrap_or_else(|_| &[]); // empty if V3 Q LoRA path
+
         let kv_a_proj = self.tensor_f16(&format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"))?;
         let kv_a_layernorm = self.tensor_f32(&format!("{prefix}.self_attn.kv_a_layernorm.weight"))?;
         let w_uk = self.tensor_f16(&format!("{prefix}.self_attn.w_uk"))?;
@@ -231,6 +249,7 @@ impl BackboneWeights {
 
         if is_moe {
             let router = self.tensor_f16(&format!("{prefix}.mlp.gate.weight"))?;
+            let e_bias = self.tensor_f32(&format!("{prefix}.mlp.gate.e_score_correction_bias")).ok();
             let shared_gate = self.tensor_f16(&format!("{prefix}.mlp.shared_experts.gate_proj.weight")).ok();
             let shared_up = self.tensor_f16(&format!("{prefix}.mlp.shared_experts.up_proj.weight")).ok();
             let shared_down = self.tensor_f16(&format!("{prefix}.mlp.shared_experts.down_proj.weight")).ok();
@@ -238,7 +257,9 @@ impl BackboneWeights {
             Ok(MlaLayerWeights {
                 input_norm, post_attn_norm,
                 q_proj, kv_a_proj, kv_a_layernorm, w_uk, w_uv, o_proj,
+                q_a_proj, q_a_layernorm, q_b_proj,
                 router: Some(router),
+                e_score_correction_bias: e_bias,
                 shared_gate_proj: shared_gate,
                 shared_up_proj: shared_up,
                 shared_down_proj: shared_down,
@@ -255,7 +276,9 @@ impl BackboneWeights {
             Ok(MlaLayerWeights {
                 input_norm, post_attn_norm,
                 q_proj, kv_a_proj, kv_a_layernorm, w_uk, w_uv, o_proj,
+                q_a_proj, q_a_layernorm, q_b_proj,
                 router: None,
+                e_score_correction_bias: None,
                 shared_gate_proj: None,
                 shared_up_proj: None,
                 shared_down_proj: None,

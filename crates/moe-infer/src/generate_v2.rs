@@ -617,6 +617,15 @@ pub fn generate_v2(
         // One reusable conversion buffer — persists across all tokens
         let mut layer_buf = MlaLayerF32::empty();
 
+        // Warmup: pre-fault all backbone pages into page cache.
+        // First pass is I/O bound (~34 GB from SSD). After this, all pages are warm.
+        let t_warmup = std::time::Instant::now();
+        for layer in 0..num_layers {
+            convert_layer_into(&mut layer_buf, &model.weights, &model.config, layer)?;
+        }
+        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers)",
+            t_warmup.elapsed().as_secs_f64(), num_layers);
+
         // --- Prefill ---
         let t_prefill = std::time::Instant::now();
         for (i, &token_id) in input_ids.iter().enumerate() {
