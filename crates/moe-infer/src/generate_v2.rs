@@ -122,29 +122,7 @@ impl ModelV2 {
         if !lazy_mode {
             let t = std::time::Instant::now();
             for layer in 0..num_layers {
-                let is_moe = config.is_moe_layer(layer);
-                let lw = weights.mla_layer_weights(layer, is_moe)?;
-                layers_f32.push(MlaLayerF32 {
-                    q_proj: lw.q_proj.iter().map(|v| v.to_f32()).collect(),
-                    kv_a_proj: lw.kv_a_proj.iter().map(|v| v.to_f32()).collect(),
-                    kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
-                    w_uk: lw.w_uk.iter().map(|v| v.to_f32()).collect(),
-                    w_uv: lw.w_uv.iter().map(|v| v.to_f32()).collect(),
-                    o_proj: lw.o_proj.iter().map(|v| v.to_f32()).collect(),
-                    input_norm: lw.input_norm.to_vec(),
-                    post_attn_norm: lw.post_attn_norm.to_vec(),
-                    q_a_proj: lw.q_a_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    q_a_layernorm: lw.q_a_layernorm.map(|w| w.to_vec()),
-                    q_b_proj: lw.q_b_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    router: lw.router.map(|r| r.iter().map(|v| v.to_f32()).collect()),
-                    e_score_correction_bias: lw.e_score_correction_bias.map(|b| b.to_vec()),
-                    shared_gate: lw.shared_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    shared_up: lw.shared_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    shared_down: lw.shared_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    dense_gate: lw.dense_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    dense_up: lw.dense_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                    dense_down: lw.dense_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-                });
+                layers_f32.push(convert_layer_f32(&weights, &config, layer)?);
             }
             eprintln!("Pre-converted weights to f32: {:.1}s", t.elapsed().as_secs_f64());
         } else {
@@ -178,53 +156,61 @@ impl ModelV2 {
     }
 }
 
-/// Convert one layer's weights from f16 mmap to f32 on the fly.
-fn convert_layer_f32(model: &ModelV2, layer: usize) -> Result<MlaLayerF32> {
-    let is_moe = model.config.is_moe_layer(layer);
-    let lw = model.weights.mla_layer_weights(layer, is_moe)?;
+/// Convert f16 slice to f32 Vec (auto-vectorizes to FCVTL on aarch64).
+#[inline]
+fn f16_to_f32_vec(src: &[f16]) -> Vec<f32> {
+    src.iter().map(|v| v.to_f32()).collect()
+}
+
+/// Convert one layer's weights from f16 mmap to f32.
+/// Takes `&BackboneWeights` + `&InferConfig` directly so it can be called from a background thread.
+fn convert_layer_f32(weights: &BackboneWeights, config: &InferConfig, layer: usize) -> Result<MlaLayerF32> {
+    let is_moe = config.is_moe_layer(layer);
+    let lw = weights.mla_layer_weights(layer, is_moe)?;
     Ok(MlaLayerF32 {
-        q_proj: lw.q_proj.iter().map(|v| v.to_f32()).collect(),
-        kv_a_proj: lw.kv_a_proj.iter().map(|v| v.to_f32()).collect(),
+        q_proj: f16_to_f32_vec(lw.q_proj),
+        kv_a_proj: f16_to_f32_vec(lw.kv_a_proj),
         kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
-        w_uk: lw.w_uk.iter().map(|v| v.to_f32()).collect(),
-        w_uv: lw.w_uv.iter().map(|v| v.to_f32()).collect(),
-        o_proj: lw.o_proj.iter().map(|v| v.to_f32()).collect(),
+        w_uk: f16_to_f32_vec(lw.w_uk),
+        w_uv: f16_to_f32_vec(lw.w_uv),
+        o_proj: f16_to_f32_vec(lw.o_proj),
         input_norm: lw.input_norm.to_vec(),
         post_attn_norm: lw.post_attn_norm.to_vec(),
-        q_a_proj: lw.q_a_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        q_a_proj: lw.q_a_proj.map(f16_to_f32_vec),
         q_a_layernorm: lw.q_a_layernorm.map(|w| w.to_vec()),
-        q_b_proj: lw.q_b_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-        router: lw.router.map(|r| r.iter().map(|v| v.to_f32()).collect()),
+        q_b_proj: lw.q_b_proj.map(f16_to_f32_vec),
+        router: lw.router.map(f16_to_f32_vec),
         e_score_correction_bias: lw.e_score_correction_bias.map(|b| b.to_vec()),
-        shared_gate: lw.shared_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-        shared_up: lw.shared_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-        shared_down: lw.shared_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-        dense_gate: lw.dense_gate_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-        dense_up: lw.dense_up_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
-        dense_down: lw.dense_down_proj.map(|w| w.iter().map(|v| v.to_f32()).collect()),
+        shared_gate: lw.shared_gate_proj.map(f16_to_f32_vec),
+        shared_up: lw.shared_up_proj.map(f16_to_f32_vec),
+        shared_down: lw.shared_down_proj.map(f16_to_f32_vec),
+        dense_gate: lw.dense_gate_proj.map(f16_to_f32_vec),
+        dense_up: lw.dense_up_proj.map(f16_to_f32_vec),
+        dense_down: lw.dense_down_proj.map(f16_to_f32_vec),
     })
 }
 
-/// Run one layer of the V2 model (MLA attention + FFN).
-fn run_layer_v2(
+/// Per-layer timing breakdown (ms).
+#[derive(Default)]
+struct LayerTiming {
+    convert_ms: f64,
+    attn_ms: f64,
+    ffn_ms: f64,
+}
+
+/// Run one layer's compute given pre-converted f32 weights.
+/// This is the core compute path — no conversion, no allocation of weight buffers.
+fn run_layer_compute(
     model: &ModelV2,
     cache: &mut MlaKvCache,
     router: &mut MoeRouter,
     layer: usize,
     x: &[f32],
     pos: usize,
+    lf: &MlaLayerF32,
 ) -> Result<Vec<f32>> {
     let hidden = model.config.hidden_size();
     let eps = model.config.rms_norm_eps();
-
-    // Lazy conversion: use pre-converted if available, else convert on the fly
-    let lazy_lf;
-    let lf = if layer < model.layers_f32.len() {
-        &model.layers_f32[layer]
-    } else {
-        lazy_lf = convert_layer_f32(model, layer)?;
-        &lazy_lf
-    };
 
     // 1. RMSNorm → MLA Attention → Residual
     let normed = rmsnorm(x, &lf.input_norm, eps);
@@ -267,6 +253,44 @@ fn run_layer_v2(
     }
 
     Ok(residual)
+}
+
+/// Run one layer of the V2 model (MLA attention + FFN).
+/// If `timing` is Some, accumulates per-phase timing.
+fn run_layer_v2(
+    model: &ModelV2,
+    cache: &mut MlaKvCache,
+    router: &mut MoeRouter,
+    layer: usize,
+    x: &[f32],
+    pos: usize,
+    mut timing: Option<&mut LayerTiming>,
+) -> Result<Vec<f32>> {
+    // Lazy conversion: use pre-converted if available, else convert on the fly
+    let t_conv = std::time::Instant::now();
+    let lazy_lf;
+    let lf = if layer < model.layers_f32.len() {
+        &model.layers_f32[layer]
+    } else {
+        lazy_lf = convert_layer_f32(&model.weights, &model.config, layer)?;
+        &lazy_lf
+    };
+    if let Some(ref mut t) = timing {
+        t.convert_ms = t_conv.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    let t_attn = std::time::Instant::now();
+    let result = run_layer_compute(model, cache, router, layer, x, pos, lf)?;
+
+    // Split timing: approximate attn vs ffn (run_layer_compute handles both)
+    if let Some(ref mut t) = timing {
+        // Total compute time (attn + ffn combined)
+        let compute_ms = t_attn.elapsed().as_secs_f64() * 1000.0;
+        t.attn_ms = compute_ms; // report as attn for now (combined)
+        t.ffn_ms = 0.0;
+    }
+
+    Ok(result)
 }
 
 /// Dense FFN: SiLU(x @ gate^T) * (x @ up^T) → @ down^T
@@ -499,51 +523,176 @@ pub fn generate_v2(
     let mut all_ids = input_ids.clone();
     let prompt_tokens = input_ids.len();
 
-    // Prefill: sequential CPU
-    let t_prefill = std::time::Instant::now();
-    for (i, &token_id) in input_ids.iter().enumerate() {
-        let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-        let mut x = emb;
-        for layer in 0..num_layers {
-            x = run_layer_v2(model, &mut cache, &mut router, layer, &x, i)?;
-        }
-        cache.advance();
+    let lazy_mode = model.layers_f32.is_empty();
 
-        if i == input_ids.len() - 1 {
+    // For lazy mode: set up pipelined conversion via channels + dedicated thread.
+    // The converter thread only borrows &BackboneWeights + &InferConfig (both Send+Sync).
+    // The main thread keeps full access to model (including Metal).
+    use std::sync::mpsc;
+
+    // Prefill + Decode wrapped in thread::scope for converter thread lifetime
+    let (prefill_secs, decode_secs) = if lazy_mode {
+        let (req_tx, req_rx) = mpsc::channel::<usize>();
+        let (res_tx, res_rx) = mpsc::channel::<Result<MlaLayerF32>>();
+
+        std::thread::scope(|s| -> Result<(f64, f64)> {
+            let weights = &model.weights;
+            let config = &model.config;
+
+            // Spawn dedicated converter thread
+            s.spawn(move || {
+                while let Ok(layer) = req_rx.recv() {
+                    let _ = res_tx.send(convert_layer_f32(weights, config, layer));
+                }
+            });
+
+            // --- Prefill ---
+            let t_prefill = std::time::Instant::now();
+            for (i, &token_id) in input_ids.iter().enumerate() {
+                let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+                let mut x = emb;
+
+                // Convert first layer blocking
+                let mut current_lf = convert_layer_f32(&model.weights, &model.config, 0)?;
+
+                for layer in 0..num_layers {
+                    // Request next layer conversion (background)
+                    if layer + 1 < num_layers {
+                        req_tx.send(layer + 1).unwrap();
+                    }
+
+                    // Compute current layer (main thread, uses Metal)
+                    x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &current_lf)?;
+
+                    // Receive next layer's weights
+                    if layer + 1 < num_layers {
+                        current_lf = res_rx.recv().unwrap()?;
+                    }
+                }
+                cache.advance();
+
+                if i == input_ids.len() - 1 {
+                    let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+                    let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+                    let next_token = sample(&logits, sampling, i as u64);
+                    all_ids.push(next_token);
+                }
+            }
+            let prefill_secs = t_prefill.elapsed().as_secs_f64();
+
+            // --- Decode ---
+            let t_decode = std::time::Instant::now();
+            let mut pos = input_ids.len();
+            let mut first_token_logged = false;
+            for step in 0..max_new_tokens.saturating_sub(1) {
+                if pos >= max_seq { break; }
+                let token_id = *all_ids.last().unwrap();
+                if token_id == model.config.model.eos_token_id { break; }
+
+                let t_tok = std::time::Instant::now();
+
+                let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+                let mut x = emb;
+
+                // Convert first layer blocking, then pipeline the rest
+                let t_conv0 = std::time::Instant::now();
+                let mut current_lf = convert_layer_f32(&model.weights, &model.config, 0)?;
+                let conv0_ms = t_conv0.elapsed().as_secs_f64() * 1000.0;
+
+                for layer in 0..num_layers {
+                    if layer + 1 < num_layers {
+                        req_tx.send(layer + 1).unwrap();
+                    }
+                    x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &current_lf)?;
+                    if layer + 1 < num_layers {
+                        current_lf = res_rx.recv().unwrap()?;
+                    }
+                }
+                cache.advance();
+
+                let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+                let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+                let next_token = sample(&logits, sampling, (pos + step) as u64);
+                all_ids.push(next_token);
+
+                let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+                if !first_token_logged {
+                    first_token_logged = true;
+                    eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total, pipelined) ---");
+                    eprintln!("  layer0 convert: {conv0_ms:.1}ms, {num_layers} layers at {:.1}ms/layer",
+                        tok_ms / num_layers as f64);
+                }
+
+                pos += 1;
+            }
+            let decode_secs = t_decode.elapsed().as_secs_f64();
+
+            // Drop sender to signal converter thread to exit
+            drop(req_tx);
+            Ok((prefill_secs, decode_secs))
+        })?
+    } else {
+        // --- Pre-converted path (small models like V2-Lite) ---
+        let t_prefill = std::time::Instant::now();
+        for (i, &token_id) in input_ids.iter().enumerate() {
+            let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+            let mut x = emb;
+            for layer in 0..num_layers {
+                x = run_layer_v2(model, &mut cache, &mut router, layer, &x, i, None)?;
+            }
+            cache.advance();
+            if i == input_ids.len() - 1 {
+                let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+                let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+                let next_token = sample(&logits, sampling, i as u64);
+                all_ids.push(next_token);
+            }
+        }
+        let prefill_secs = t_prefill.elapsed().as_secs_f64();
+
+        let t_decode = std::time::Instant::now();
+        let mut pos = input_ids.len();
+        let mut first_token_logged = false;
+        for step in 0..max_new_tokens.saturating_sub(1) {
+            if pos >= max_seq { break; }
+            let token_id = *all_ids.last().unwrap();
+            if token_id == model.config.model.eos_token_id { break; }
+
+            let t_tok = std::time::Instant::now();
+            let profile_this = !first_token_logged;
+            let mut layer_timings: Vec<LayerTiming> = if profile_this {
+                (0..num_layers).map(|_| LayerTiming::default()).collect()
+            } else {
+                Vec::new()
+            };
+
+            let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+            let mut x = emb;
+            for layer in 0..num_layers {
+                let timing = if profile_this { Some(&mut layer_timings[layer]) } else { None };
+                x = run_layer_v2(model, &mut cache, &mut router, layer, &x, pos, timing)?;
+            }
+            cache.advance();
+
             let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
             let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
-            let next_token = sample(&logits, sampling, i as u64);
+            let next_token = sample(&logits, sampling, (pos + step) as u64);
             all_ids.push(next_token);
-        }
-    }
-    let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-    // Decode: generate new tokens one at a time
-    let t_decode = std::time::Instant::now();
-    let mut pos = input_ids.len();
-    for step in 0..max_new_tokens.saturating_sub(1) {
-        if pos >= max_seq {
-            break;
-        }
-        let token_id = *all_ids.last().unwrap();
-        if token_id == model.config.model.eos_token_id {
-            break;
-        }
+            if profile_this {
+                first_token_logged = true;
+                let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+                let total_conv: f64 = layer_timings.iter().map(|t| t.convert_ms).sum();
+                let total_compute: f64 = layer_timings.iter().map(|t| t.attn_ms).sum();
+                eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total) ---");
+                eprintln!("  convert: {total_conv:.0}ms  compute: {total_compute:.0}ms");
+            }
 
-        let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-        let mut x = emb;
-        for layer in 0..num_layers {
-            x = run_layer_v2(model, &mut cache, &mut router, layer, &x, pos)?;
+            pos += 1;
         }
-        cache.advance();
-
-        let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-        let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
-        let next_token = sample(&logits, sampling, (pos + step) as u64);
-        all_ids.push(next_token);
-        pos += 1;
-    }
-    let decode_secs = t_decode.elapsed().as_secs_f64();
+        let decode_secs = t_decode.elapsed().as_secs_f64();
+        (prefill_secs, decode_secs)
+    };
 
     let generated_ids = all_ids[input_ids.len()..].to_vec();
     let text = tokenizer.decode(&generated_ids, true)
