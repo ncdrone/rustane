@@ -260,7 +260,7 @@ fn run_inference_test(
             continue;
         }
 
-        let (slot, is_hit) = pool.request(eid as u32);
+        let (slot, is_hit) = pool.request(0, eid as u32);
         let _ = slot;
 
         // pread expert data from SSD

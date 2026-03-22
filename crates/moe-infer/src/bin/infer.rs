@@ -5,8 +5,24 @@
 //!   cargo run -p moe-infer --release --bin infer -- --config configs/qwen3-moe-30b.toml --prompt "Hello"
 
 use moe_infer::config::InferConfig;
-use moe_infer::generate::{Model, SamplingConfig};
+use moe_infer::generate::SamplingConfig;
 use std::path::Path;
+
+fn print_stats(_text: &str, tokens_generated: usize, prompt_tokens: usize,
+               prefill_secs: f64, decode_secs: f64, total_secs: f64) {
+    println!("\n---");
+    let decode_tok_per_sec = if decode_secs > 0.0 {
+        (tokens_generated.saturating_sub(1)) as f64 / decode_secs
+    } else { 0.0 };
+    let total_tok_per_sec = tokens_generated as f64 / total_secs;
+    println!("{} tokens in {:.1}s = {:.1} tok/s (decode: {:.1} tok/s)",
+        tokens_generated, total_secs, total_tok_per_sec, decode_tok_per_sec);
+    println!("  Prefill: {} tokens in {:.1}s ({:.0} tok/s)",
+        prompt_tokens, prefill_secs, prompt_tokens as f64 / prefill_secs.max(0.001));
+    println!("  Decode: {} tokens in {:.1}s ({:.1} tok/s)",
+        tokens_generated.saturating_sub(1), decode_secs, decode_tok_per_sec);
+    println!("  Backend: Metal GPU + Accelerate BLAS");
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -108,17 +124,6 @@ fn main() {
         }
         "generate" => {
             let prompt_text = prompt.unwrap();
-            println!("Loading model from {weights_dir}...");
-
-            let model = Model::load(
-                Path::new(&weights_dir),
-                Path::new(&config_path),
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Error loading model: {e}");
-                std::process::exit(1);
-            });
-
             println!("Loading tokenizer from {tokenizer_path}...");
             let tok = tokenizers::Tokenizer::from_file(&tokenizer_path)
                 .unwrap_or_else(|e| {
@@ -126,45 +131,60 @@ fn main() {
                     std::process::exit(1);
                 });
 
-            println!("Generating (max {max_tokens} tokens)...\n");
-
-            let t0 = std::time::Instant::now();
             let sampling = SamplingConfig::greedy();
-            let output = moe_infer::generate::generate(
-                &model, &tok, &prompt_text, max_tokens, &sampling,
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Generation error: {e}");
-                std::process::exit(1);
-            });
-            let elapsed = t0.elapsed();
+            let t0 = std::time::Instant::now();
 
-            println!("{}{}", prompt_text, output.text);
-            println!("\n---");
-            let decode_tok_per_sec = if output.decode_secs > 0.0 {
-                (output.tokens_generated.saturating_sub(1)) as f64 / output.decode_secs
-            } else { 0.0 };
-            let total_tok_per_sec = output.tokens_generated as f64 / elapsed.as_secs_f64();
-            println!(
-                "{} tokens in {:.1}s = {:.1} tok/s (decode: {:.1} tok/s)",
-                output.tokens_generated,
-                elapsed.as_secs_f64(),
-                total_tok_per_sec,
-                decode_tok_per_sec,
-            );
-            println!(
-                "  Prefill: {} tokens in {:.1}s ({:.0} tok/s)",
-                output.prompt_tokens,
-                output.prefill_secs,
-                output.prompt_tokens as f64 / output.prefill_secs.max(0.001),
-            );
-            println!(
-                "  Decode: {} tokens in {:.1}s ({:.1} tok/s)",
-                output.tokens_generated.saturating_sub(1),
-                output.decode_secs,
-                decode_tok_per_sec,
-            );
-            println!("  Backend: Metal GPU + Accelerate BLAS");
+            if config.is_mla() {
+                // MLA path (DeepSeek-V2/V3)
+                println!("Loading MLA model from {weights_dir}...");
+                let model = moe_infer::generate_v2::ModelV2::load(
+                    Path::new(&weights_dir),
+                    Path::new(&config_path),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Error loading model: {e}");
+                    std::process::exit(1);
+                });
+
+                println!("Generating (max {max_tokens} tokens)...\n");
+                let output = moe_infer::generate_v2::generate_v2(
+                    &model, &tok, &prompt_text, max_tokens, &sampling,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Generation error: {e}");
+                    std::process::exit(1);
+                });
+                let elapsed = t0.elapsed();
+
+                println!("{}{}", prompt_text, output.text);
+                print_stats(&output.text, output.tokens_generated, output.prompt_tokens,
+                    output.prefill_secs, output.decode_secs, elapsed.as_secs_f64());
+            } else {
+                // GQA path (Qwen3)
+                println!("Loading GQA model from {weights_dir}...");
+                let model = moe_infer::generate::Model::load(
+                    Path::new(&weights_dir),
+                    Path::new(&config_path),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Error loading model: {e}");
+                    std::process::exit(1);
+                });
+
+                println!("Generating (max {max_tokens} tokens)...\n");
+                let output = moe_infer::generate::generate(
+                    &model, &tok, &prompt_text, max_tokens, &sampling,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Generation error: {e}");
+                    std::process::exit(1);
+                });
+                let elapsed = t0.elapsed();
+
+                println!("{}{}", prompt_text, output.text);
+                print_stats(&output.text, output.tokens_generated, output.prompt_tokens,
+                    output.prefill_secs, output.decode_secs, elapsed.as_secs_f64());
+            }
         }
         _ => unreachable!(),
     }

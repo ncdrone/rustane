@@ -9,6 +9,7 @@
 pub mod attention;
 pub mod blas;
 pub mod config;
+pub mod fp8;
 pub mod generate;
 pub mod generate_v2;
 pub mod kv_cache;

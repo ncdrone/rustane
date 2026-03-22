@@ -106,6 +106,12 @@ pub struct FfnSection {
     /// Scaling factor for routed expert outputs (1.0 for V2-Lite, 2.5 for V3).
     #[serde(default = "default_scaling")]
     pub routed_scaling_factor: f32,
+    /// Number of expert groups for grouped routing (8 for V3, default 1).
+    #[serde(default = "default_one")]
+    pub n_group: usize,
+    /// Number of top groups to select from (4 for V3, default 1).
+    #[serde(default = "default_one")]
+    pub topk_group: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -123,6 +129,7 @@ fn default_beta_slow() -> f32 { 1.0 }
 fn default_mscale() -> f32 { 1.0 }
 fn default_scoring() -> String { "softmax".to_string() }
 fn default_scaling() -> f32 { 1.0 }
+fn default_one() -> usize { 1 }
 
 impl InferConfig {
     /// Load from a TOML file with nested [model], [attention], [ffn], [quantization] sections.
@@ -230,5 +237,45 @@ mod tests {
         assert!(!config.ffn.norm_topk_prob);
         assert_eq!(config.ffn.scoring_func, "softmax");
         assert_eq!(config.ffn.routed_scaling_factor, 1.0);
+    }
+
+    #[test]
+    fn parse_deepseek_v3_toml() {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let ws_root = Path::new(&manifest).parent().unwrap().parent().unwrap();
+        let config = InferConfig::from_toml(&ws_root.join("configs/deepseek-v3.toml"))
+            .expect("parse V3 config");
+        assert_eq!(config.model.hidden_size, 7168);
+        assert_eq!(config.model.num_layers, 61);
+        assert_eq!(config.model.vocab_size, 129280);
+        assert_eq!(config.model.bos_token_id, 0);
+        assert_eq!(config.model.eos_token_id, 1);
+        assert!(config.is_mla());
+        assert_eq!(config.attention.num_q_heads, 128);
+        assert_eq!(config.attention.kv_lora_rank, Some(512));
+        assert_eq!(config.attention.q_lora_rank, Some(1536));
+        assert_eq!(config.attention.qk_nope_head_dim, Some(128));
+        assert_eq!(config.attention.qk_rope_head_dim, Some(64));
+        assert_eq!(config.attention.v_head_dim, Some(128));
+        // YaRN
+        let rs = config.attention.rope_scaling.as_ref().expect("rope_scaling");
+        assert_eq!(rs.factor, 40.0);
+        assert!((rs.mscale - 1.0).abs() < 0.001);
+        // FFN: 3 dense layers
+        assert!(!config.is_moe_layer(0));  // dense
+        assert!(!config.is_moe_layer(1));  // dense
+        assert!(!config.is_moe_layer(2));  // dense
+        assert!(config.is_moe_layer(3));   // MoE starts here
+        assert!(config.is_moe_layer(60));  // last layer is MoE
+        assert_eq!(config.ffn.first_k_dense_replace, 3);
+        assert_eq!(config.ffn.dense_inter_size, Some(18432));
+        assert_eq!(config.ffn.num_experts, 256);
+        assert_eq!(config.ffn.num_experts_per_tok, 8);
+        assert_eq!(config.ffn.shared_expert_count, 1);
+        assert!(config.ffn.norm_topk_prob);
+        assert_eq!(config.ffn.scoring_func, "sigmoid");
+        assert_eq!(config.ffn.routed_scaling_factor, 2.5);
+        assert_eq!(config.ffn.n_group, 8);
+        assert_eq!(config.ffn.topk_group, 4);
     }
 }

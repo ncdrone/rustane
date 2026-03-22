@@ -1,7 +1,8 @@
-//! ExpertPool: LRU cache for expert weight buffers.
+//! ExpertPool: Least-Stale cache for expert weight buffers.
 //!
-//! Tracks which experts are resident in memory, evicts least-recently-used
-//! when capacity is exceeded, and provides hit/miss statistics.
+//! Evicts by minimum `last_used_layer` — experts used at low layers are evicted
+//! first because they are furthest from reuse in the next decode step.
+//! This is the Least-Stale policy (SpecMD, Apple 2026).
 
 use std::collections::HashMap;
 
@@ -20,26 +21,24 @@ impl PoolStats {
     }
 }
 
-/// LRU entry tracking.
+/// Least-Stale entry tracking.
 struct Entry {
-    /// Slot index in the ring buffer.
+    /// Slot index in the buffer pool.
     slot: usize,
-    /// LRU timestamp (higher = more recent).
-    last_used: u64,
+    /// Layer index where this expert was last used.
+    last_used_layer: u32,
 }
 
-/// LRU-based expert weight cache.
+/// Least-Stale expert weight cache.
 ///
 /// Manages a fixed number of buffer slots. When an expert is requested:
-/// - If resident (hit): returns the slot index, updates LRU.
-/// - If not resident (miss): evicts LRU entry, returns the freed slot for loading.
+/// - If resident (hit): returns the slot index, updates last_used_layer.
+/// - If not resident (miss): evicts the expert with lowest last_used_layer.
 pub struct ExpertPool {
     /// Max number of experts that can be resident simultaneously.
     capacity: usize,
-    /// Map from expert_id to cache entry.
-    entries: HashMap<u32, Entry>,
-    /// LRU clock (monotonically increasing).
-    clock: u64,
+    /// Map from (layer_idx, expert_idx) to cache entry.
+    entries: HashMap<(u32, u32), Entry>,
     /// Free slot stack.
     free_slots: Vec<usize>,
     /// Performance counters.
@@ -52,7 +51,6 @@ impl ExpertPool {
         Self {
             capacity,
             entries: HashMap::with_capacity(capacity),
-            clock: 0,
             free_slots: (0..capacity).rev().collect(),
             stats: PoolStats::default(),
         }
@@ -60,12 +58,12 @@ impl ExpertPool {
 
     /// Request an expert. Returns (slot_index, is_hit).
     /// If miss, the returned slot is free and ready for loading.
-    pub fn request(&mut self, expert_id: u32) -> (usize, bool) {
-        self.clock += 1;
+    pub fn request(&mut self, layer: u32, expert_id: u32) -> (usize, bool) {
+        let key = (layer, expert_id);
 
         // Cache hit
-        if let Some(entry) = self.entries.get_mut(&expert_id) {
-            entry.last_used = self.clock;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used_layer = layer;
             self.stats.hits += 1;
             return (entry.slot, true);
         }
@@ -74,31 +72,35 @@ impl ExpertPool {
         self.stats.misses += 1;
 
         let slot = if let Some(slot) = self.free_slots.pop() {
-            // Free slot available
             slot
         } else {
-            // Evict LRU
-            let (&lru_id, _) = self
+            // Evict Least-Stale: minimum last_used_layer
+            let (&victim_key, _) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, e)| e.last_used)
+                .min_by_key(|(_, e)| e.last_used_layer)
                 .expect("pool not empty but no entries");
-            let evicted = self.entries.remove(&lru_id).unwrap();
+            let evicted = self.entries.remove(&victim_key).unwrap();
             self.stats.evictions += 1;
             evicted.slot
         };
 
-        self.entries.insert(expert_id, Entry {
+        self.entries.insert(key, Entry {
             slot,
-            last_used: self.clock,
+            last_used_layer: layer,
         });
 
         (slot, false)
     }
 
-    /// Check if an expert is resident without updating LRU.
-    pub fn is_resident(&self, expert_id: u32) -> bool {
-        self.entries.contains_key(&expert_id)
+    /// Check if an expert is resident without updating state.
+    pub fn is_resident(&self, layer: u32, expert_id: u32) -> bool {
+        self.entries.contains_key(&(layer, expert_id))
+    }
+
+    /// Maximum capacity of the pool.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Number of currently resident experts.
@@ -109,5 +111,65 @@ impl ExpertPool {
     /// Reset statistics.
     pub fn reset_stats(&mut self) {
         self.stats = PoolStats::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn least_stale_evicts_lowest_layer() {
+        let mut pool = ExpertPool::new(2);
+        pool.request(3, 10);   // layer 3, expert 10
+        pool.request(59, 20);  // layer 59, expert 20
+        pool.request(30, 5);   // layer 30, expert 5 — triggers eviction
+        // Layer 3 should be evicted (lowest layer = furthest from reuse)
+        assert!(!pool.is_resident(3, 10));
+        assert!(pool.is_resident(59, 20));  // kept (highest layer)
+        assert!(pool.is_resident(30, 5));   // just added
+    }
+
+    #[test]
+    fn cache_hit_returns_same_slot() {
+        let mut pool = ExpertPool::new(4);
+        let (slot1, hit1) = pool.request(5, 42);
+        assert!(!hit1);
+        let (slot2, hit2) = pool.request(5, 42);
+        assert!(hit2);
+        assert_eq!(slot1, slot2);
+    }
+
+    #[test]
+    fn stats_tracking() {
+        let mut pool = ExpertPool::new(2);
+        pool.request(0, 1);  // miss
+        pool.request(0, 2);  // miss
+        pool.request(0, 1);  // hit
+        pool.request(1, 3);  // miss, evicts
+        assert_eq!(pool.stats.hits, 1);
+        assert_eq!(pool.stats.misses, 3);
+        assert_eq!(pool.stats.evictions, 1);
+        assert!((pool.stats.hit_rate() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fill_without_eviction() {
+        let mut pool = ExpertPool::new(3);
+        pool.request(0, 0);
+        pool.request(0, 1);
+        pool.request(0, 2);
+        assert_eq!(pool.resident_count(), 3);
+        assert_eq!(pool.stats.evictions, 0);
+    }
+
+    #[test]
+    fn different_layers_same_expert_distinct() {
+        let mut pool = ExpertPool::new(3);
+        pool.request(0, 5);
+        pool.request(1, 5);
+        assert_eq!(pool.resident_count(), 2);
+        assert!(pool.is_resident(0, 5));
+        assert!(pool.is_resident(1, 5));
     }
 }
