@@ -666,9 +666,28 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
 
+            let profile_this = !first_token_logged;
+            let mut total_conv_ms = 0.0f64;
+            let mut total_compute_ms = 0.0f64;
+
             for layer in 0..num_layers {
+                let t0 = std::time::Instant::now();
                 convert_layer_into(&mut layer_buf, &model.weights, &model.config, layer)?;
+                let conv_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                let t1 = std::time::Instant::now();
                 x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &layer_buf)?;
+                let compute_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+                if profile_this {
+                    total_conv_ms += conv_ms;
+                    total_compute_ms += compute_ms;
+                    // Log a few representative layers
+                    if layer < 4 || layer == num_layers - 1 {
+                        let moe = if model.config.is_moe_layer(layer) { "MoE" } else { "dense" };
+                        eprintln!("  L{layer:2} ({moe}): conv={conv_ms:.1}ms compute={compute_ms:.1}ms");
+                    }
+                }
             }
             cache.advance();
 
@@ -678,10 +697,12 @@ pub fn generate_v2(
             all_ids.push(next_token);
 
             let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
-            if !first_token_logged {
+            if profile_this {
                 first_token_logged = true;
-                eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total, single-buf reuse) ---");
-                eprintln!("  {num_layers} layers at {:.1}ms/layer", tok_ms / num_layers as f64);
+                eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total) ---");
+                eprintln!("  convert: {total_conv_ms:.0}ms  compute: {total_compute_ms:.0}ms");
+                eprintln!("  avg/layer: conv={:.1}ms compute={:.1}ms",
+                    total_conv_ms / num_layers as f64, total_compute_ms / num_layers as f64);
             }
 
             pos += 1;
