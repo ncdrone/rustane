@@ -184,28 +184,35 @@ impl ModelV2 {
     }
 }
 
-/// Fill dst Vec from f16 src, reusing existing capacity (zero allocs after first call).
+/// Fill dst Vec from f16 src using SIMD-friendly bulk conversion.
+/// Reuses existing Vec capacity (zero allocs after first call).
 #[inline]
 fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
+    let n = src.len();
     dst.clear();
-    dst.reserve(src.len().saturating_sub(dst.capacity()));
-    dst.extend(src.iter().map(|v| v.to_f32()));
+    if dst.capacity() < n {
+        dst.reserve(n - dst.capacity());
+    }
+    // Extend len without zero-init (we'll write all elements)
+    unsafe { dst.set_len(n); }
+    // Tight indexed loop — LLVM auto-vectorizes to Neon FCVTL (4×f16→f32)
+    let dst_s = dst.as_mut_slice();
+    for i in 0..n {
+        dst_s[i] = src[i].to_f32();
+    }
 }
 
-/// Fill optional Vec from optional f16 src, reusing capacity.
-/// When src is None, sets dst to None (drops Vec — capacity lost but correct semantics).
-/// Compute code checks Option, not Vec length, so we must use None for absent fields.
+/// Fill optional Vec from optional f16 src using SIMD-friendly conversion.
+/// When src is None, sets dst to None.
 #[inline]
 fn fill_f32_opt(dst: &mut Option<Vec<f32>>, src: Option<&[f16]>) {
     match src {
         Some(data) => {
             let vec = dst.get_or_insert_with(Vec::new);
-            vec.clear();
-            vec.reserve(data.len().saturating_sub(vec.capacity()));
-            vec.extend(data.iter().map(|v| v.to_f32()));
+            fill_f32(vec, data);
         }
         None => {
-            *dst = None; // must be None so as_deref() returns None
+            *dst = None;
         }
     }
 }
