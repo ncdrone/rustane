@@ -238,21 +238,33 @@ impl ModelV2 {
     }
 }
 
-/// Fill dst Vec from f16 src using SIMD-friendly bulk conversion.
+/// Fill dst Vec from f16 src using parallel chunk conversion.
 /// Reuses existing Vec capacity (zero allocs after first call).
+/// For large tensors, splits across multiple threads via rayon.
 #[inline]
 fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
+    use rayon::prelude::*;
     let n = src.len();
     dst.clear();
     if dst.capacity() < n {
         dst.reserve(n - dst.capacity());
     }
-    // Extend len without zero-init (we'll write all elements)
     unsafe { dst.set_len(n); }
-    // Tight indexed loop — LLVM auto-vectorizes to Neon FCVTL (4×f16→f32)
-    let dst_s = dst.as_mut_slice();
-    for i in 0..n {
-        dst_s[i] = src[i].to_f32();
+
+    const PAR_THRESHOLD: usize = 500_000; // ~1 MB f16 = worth parallelizing
+    if n >= PAR_THRESHOLD {
+        // Parallel conversion: split into chunks, each core converts a chunk
+        dst.par_chunks_mut(256 * 1024).enumerate().for_each(|(chunk_idx, chunk)| {
+            let base = chunk_idx * 256 * 1024;
+            for i in 0..chunk.len() {
+                chunk[i] = src[base + i].to_f32();
+            }
+        });
+    } else {
+        let dst_s = dst.as_mut_slice();
+        for i in 0..n {
+            dst_s[i] = src[i].to_f32();
+        }
     }
 }
 
