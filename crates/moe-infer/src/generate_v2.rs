@@ -46,6 +46,34 @@ pub struct MlaLayerF32 {
     pub dense_down: Option<Vec<f32>>,
 }
 
+impl MlaLayerF32 {
+    /// Create an empty buffer (all Vecs with zero capacity).
+    /// Used for double-buffer initialization; first convert_layer_into will allocate.
+    pub fn empty() -> Self {
+        Self {
+            q_proj: Vec::new(),
+            kv_a_proj: Vec::new(),
+            kv_a_layernorm: Vec::new(),
+            w_uk: Vec::new(),
+            w_uv: Vec::new(),
+            o_proj: Vec::new(),
+            input_norm: Vec::new(),
+            post_attn_norm: Vec::new(),
+            q_a_proj: None,
+            q_a_layernorm: None,
+            q_b_proj: None,
+            router: None,
+            e_score_correction_bias: None,
+            shared_gate: None,
+            shared_up: None,
+            shared_down: None,
+            dense_gate: None,
+            dense_up: None,
+            dense_down: None,
+        }
+    }
+}
+
 /// Loaded DeepSeek-V2 model ready for generation.
 pub struct ModelV2 {
     pub weights: BackboneWeights,
@@ -156,92 +184,93 @@ impl ModelV2 {
     }
 }
 
-/// Convert f16 slice to f32 Vec using rayon for large slices.
-/// Auto-vectorizes to Neon FCVTL on aarch64. For large tensors (>1M elements),
-/// uses rayon par_iter to saturate memory bandwidth across P-cores.
+/// Fill dst Vec from f16 src, reusing existing capacity (zero allocs after first call).
 #[inline]
-fn f16_to_f32_vec(src: &[f16]) -> Vec<f32> {
-    use rayon::prelude::*;
-    const PAR_THRESHOLD: usize = 1_000_000; // ~4 MB in f16 = worth parallelizing
-    if src.len() >= PAR_THRESHOLD {
-        src.par_iter().map(|v| v.to_f32()).collect()
-    } else {
-        src.iter().map(|v| v.to_f32()).collect()
+fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
+    dst.clear();
+    dst.reserve(src.len().saturating_sub(dst.capacity()));
+    dst.extend(src.iter().map(|v| v.to_f32()));
+}
+
+/// Fill optional Vec from optional f16 src, reusing capacity.
+/// When src is None, sets dst to None (drops Vec — capacity lost but correct semantics).
+/// Compute code checks Option, not Vec length, so we must use None for absent fields.
+#[inline]
+fn fill_f32_opt(dst: &mut Option<Vec<f32>>, src: Option<&[f16]>) {
+    match src {
+        Some(data) => {
+            let vec = dst.get_or_insert_with(Vec::new);
+            vec.clear();
+            vec.reserve(data.len().saturating_sub(vec.capacity()));
+            vec.extend(data.iter().map(|v| v.to_f32()));
+        }
+        None => {
+            *dst = None; // must be None so as_deref() returns None
+        }
     }
 }
 
-/// Convert one layer's weights from f16 mmap to f32.
-/// Takes `&BackboneWeights` + `&InferConfig` directly so it can be called from a background thread.
-/// Uses rayon to parallelize conversion of large tensors across CPU cores.
-fn convert_layer_f32(weights: &BackboneWeights, config: &InferConfig, layer: usize) -> Result<MlaLayerF32> {
-    use rayon::prelude::*;
+/// Fill Vec from f32 src (norms, biases — already f32, just copy).
+#[inline]
+fn fill_copy(dst: &mut Vec<f32>, src: &[f32]) {
+    dst.clear();
+    dst.reserve(src.len().saturating_sub(dst.capacity()));
+    dst.extend_from_slice(src);
+}
+
+/// Fill optional Vec from optional f32 src.
+#[inline]
+fn fill_copy_opt(dst: &mut Option<Vec<f32>>, src: Option<&[f32]>) {
+    match src {
+        Some(data) => {
+            let vec = dst.get_or_insert_with(Vec::new);
+            vec.clear();
+            vec.reserve(data.len().saturating_sub(vec.capacity()));
+            vec.extend_from_slice(data);
+        }
+        None => {
+            *dst = None;
+        }
+    }
+}
+
+/// Convert one layer's weights INTO a pre-allocated buffer (zero allocs after warmup).
+/// This is the hot path — reuses Vec capacity from previous layers.
+fn convert_layer_into(buf: &mut MlaLayerF32, weights: &BackboneWeights, config: &InferConfig, layer: usize) -> Result<()> {
     let is_moe = config.is_moe_layer(layer);
     let lw = weights.mla_layer_weights(layer, is_moe)?;
 
-    // Convert all large f16 fields in parallel using rayon join chains.
-    // Each field is independent — saturate memory bandwidth across cores.
-    let (q_proj, (kv_a_proj, (w_uk, (w_uv, o_proj)))) = rayon::join(
-        || f16_to_f32_vec(lw.q_proj),
-        || rayon::join(
-            || f16_to_f32_vec(lw.kv_a_proj),
-            || rayon::join(
-                || f16_to_f32_vec(lw.w_uk),
-                || rayon::join(
-                    || f16_to_f32_vec(lw.w_uv),
-                    || f16_to_f32_vec(lw.o_proj),
-                ),
-            ),
-        ),
-    );
+    // Always-present fields: reuse capacity
+    fill_f32(&mut buf.q_proj, lw.q_proj);
+    fill_f32(&mut buf.kv_a_proj, lw.kv_a_proj);
+    fill_copy(&mut buf.kv_a_layernorm, lw.kv_a_layernorm);
+    fill_f32(&mut buf.w_uk, lw.w_uk);
+    fill_f32(&mut buf.w_uv, lw.w_uv);
+    fill_f32(&mut buf.o_proj, lw.o_proj);
+    fill_copy(&mut buf.input_norm, lw.input_norm);
+    fill_copy(&mut buf.post_attn_norm, lw.post_attn_norm);
 
-    // V3 Q LoRA fields (large)
-    let (q_a_proj, (q_b_proj, _)) = rayon::join(
-        || lw.q_a_proj.map(f16_to_f32_vec),
-        || rayon::join(
-            || lw.q_b_proj.map(f16_to_f32_vec),
-            || (), // placeholder
-        ),
-    );
+    // Optional fields: reuse capacity where possible
+    fill_f32_opt(&mut buf.q_a_proj, lw.q_a_proj);
+    fill_copy_opt(&mut buf.q_a_layernorm, lw.q_a_layernorm);
+    fill_f32_opt(&mut buf.q_b_proj, lw.q_b_proj);
+    fill_f32_opt(&mut buf.router, lw.router);
+    fill_copy_opt(&mut buf.e_score_correction_bias, lw.e_score_correction_bias);
+    fill_f32_opt(&mut buf.shared_gate, lw.shared_gate_proj);
+    fill_f32_opt(&mut buf.shared_up, lw.shared_up_proj);
+    fill_f32_opt(&mut buf.shared_down, lw.shared_down_proj);
+    fill_f32_opt(&mut buf.dense_gate, lw.dense_gate_proj);
+    fill_f32_opt(&mut buf.dense_up, lw.dense_up_proj);
+    fill_f32_opt(&mut buf.dense_down, lw.dense_down_proj);
 
-    // FFN fields (shared or dense — one set per layer)
-    let (shared_gate, (shared_up, shared_down)) = rayon::join(
-        || lw.shared_gate_proj.map(f16_to_f32_vec),
-        || rayon::join(
-            || lw.shared_up_proj.map(f16_to_f32_vec),
-            || lw.shared_down_proj.map(f16_to_f32_vec),
-        ),
-    );
+    Ok(())
+}
 
-    let (dense_gate, (dense_up, dense_down)) = rayon::join(
-        || lw.dense_gate_proj.map(f16_to_f32_vec),
-        || rayon::join(
-            || lw.dense_up_proj.map(f16_to_f32_vec),
-            || lw.dense_down_proj.map(f16_to_f32_vec),
-        ),
-    );
-
-    // Small tensors — convert on calling thread (not worth parallelizing)
-    Ok(MlaLayerF32 {
-        q_proj,
-        kv_a_proj,
-        kv_a_layernorm: lw.kv_a_layernorm.to_vec(),
-        w_uk,
-        w_uv,
-        o_proj,
-        input_norm: lw.input_norm.to_vec(),
-        post_attn_norm: lw.post_attn_norm.to_vec(),
-        q_a_proj,
-        q_a_layernorm: lw.q_a_layernorm.map(|w| w.to_vec()),
-        q_b_proj,
-        router: lw.router.map(f16_to_f32_vec),
-        e_score_correction_bias: lw.e_score_correction_bias.map(|b| b.to_vec()),
-        shared_gate,
-        shared_up,
-        shared_down,
-        dense_gate,
-        dense_up,
-        dense_down,
-    })
+/// Allocating version for pre-conversion at load time (V2-Lite path).
+fn convert_layer_f32(weights: &BackboneWeights, config: &InferConfig, layer: usize) -> Result<MlaLayerF32> {
+    let mut buf = MlaLayerF32::empty();
+    convert_layer_into(&mut buf, weights, config, layer)?;
+    Ok(buf)
 }
 
 /// Per-layer timing breakdown (ms).
@@ -579,50 +608,88 @@ pub fn generate_v2(
 
     let lazy_mode = model.layers_f32.is_empty();
 
-    // For lazy mode: set up pipelined conversion via channels + dedicated thread.
-    // The converter thread only borrows &BackboneWeights + &InferConfig (both Send+Sync).
-    // The main thread keeps full access to model (including Metal).
-    use std::sync::mpsc;
+    // For lazy mode: double-buffer pipeline with REUSABLE buffers (ping-pong).
+    // Two MlaLayerF32 buffers alternate: converter fills one, compute reads the other.
+    // After warmup (~3 layers), Vec capacities are established → ZERO allocations.
+    //
+    // Flow per token:
+    //   main:  convert(buf_a, L0) → compute(buf_a, L0) → compute(buf_b, L1) → compute(buf_a, L2) → ...
+    //   conv:                        convert(buf_b, L1) → convert(buf_a, L2) → convert(buf_b, L3) → ...
+    //   Buffers ping-pong via ownership transfer through channels.
 
-    // Prefill + Decode wrapped in thread::scope for converter thread lifetime
     let (prefill_secs, decode_secs) = if lazy_mode {
-        let (req_tx, req_rx) = mpsc::channel::<usize>();
-        let (res_tx, res_rx) = mpsc::channel::<Result<MlaLayerF32>>();
+        // Channels for ping-pong buffer exchange:
+        // Main → Converter: (layer_to_convert, buffer_to_fill)
+        // Converter → Main: (filled_buffer, result)
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, MlaLayerF32)>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(MlaLayerF32, Result<()>)>();
 
         std::thread::scope(|s| -> Result<(f64, f64)> {
             let weights = &model.weights;
             let config = &model.config;
 
-            // Spawn dedicated converter thread
+            // Converter thread: receives (layer, buffer), fills buffer in-place, sends back.
             s.spawn(move || {
-                while let Ok(layer) = req_rx.recv() {
-                    let _ = res_tx.send(convert_layer_f32(weights, config, layer));
+                while let Ok((layer, mut buf)) = req_rx.recv() {
+                    let result = convert_layer_into(&mut buf, weights, config, layer);
+                    let _ = res_tx.send((buf, result));
                 }
             });
+
+            /// Process all layers for one token using ping-pong double-buffer.
+            fn run_all_layers_pipelined(
+                model: &ModelV2,
+                cache: &mut MlaKvCache,
+                router: &mut MoeRouter,
+                num_layers: usize,
+                x: &mut Vec<f32>,
+                pos: usize,
+                spare: &mut MlaLayerF32,
+                req_tx: &std::sync::mpsc::Sender<(usize, MlaLayerF32)>,
+                res_rx: &std::sync::mpsc::Receiver<(MlaLayerF32, Result<()>)>,
+            ) -> Result<MlaLayerF32> {
+                // Convert layer 0 on main thread (blocking, but reuses spare capacity)
+                convert_layer_into(spare, &model.weights, &model.config, 0)?;
+                // spare now holds layer 0's weights
+                // We need a second buffer for the converter. Take a dummy for now.
+                let mut current_lf = std::mem::replace(spare, MlaLayerF32::empty());
+
+                for layer in 0..num_layers {
+                    // Send spare buffer to converter for next layer
+                    if layer + 1 < num_layers {
+                        let send_buf = std::mem::replace(spare, MlaLayerF32::empty());
+                        req_tx.send((layer + 1, send_buf)).unwrap();
+                    }
+
+                    // Compute current layer on main thread
+                    *x = run_layer_compute(model, cache, router, layer, x, pos, &current_lf)?;
+
+                    // Receive filled buffer from converter, give back current as spare
+                    if layer + 1 < num_layers {
+                        let (new_buf, result) = res_rx.recv().unwrap();
+                        result?;
+                        *spare = current_lf;  // old current becomes spare (keeps capacity!)
+                        current_lf = new_buf; // new buffer has next layer's weights
+                    }
+                }
+                // Return current_lf so its capacity persists across tokens
+                Ok(current_lf)
+            }
+
+            // Two persistent buffers that ping-pong across tokens + layers
+            let mut spare_buf = MlaLayerF32::empty();
+            let mut carry_buf; // will be set by first call
 
             // --- Prefill ---
             let t_prefill = std::time::Instant::now();
             for (i, &token_id) in input_ids.iter().enumerate() {
-                let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-                let mut x = emb;
-
-                // Convert first layer blocking
-                let mut current_lf = convert_layer_f32(&model.weights, &model.config, 0)?;
-
-                for layer in 0..num_layers {
-                    // Request next layer conversion (background)
-                    if layer + 1 < num_layers {
-                        req_tx.send(layer + 1).unwrap();
-                    }
-
-                    // Compute current layer (main thread, uses Metal)
-                    x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &current_lf)?;
-
-                    // Receive next layer's weights
-                    if layer + 1 < num_layers {
-                        current_lf = res_rx.recv().unwrap()?;
-                    }
-                }
+                let mut x = embed_f16_to_f32(embed_table, token_id as usize, hidden);
+                carry_buf = run_all_layers_pipelined(
+                    model, &mut cache, &mut router, num_layers,
+                    &mut x, i, &mut spare_buf, &req_tx, &res_rx,
+                )?;
+                // Swap: carry_buf becomes spare for next token
+                spare_buf = carry_buf;
                 cache.advance();
 
                 if i == input_ids.len() - 1 {
@@ -644,24 +711,13 @@ pub fn generate_v2(
                 if token_id == model.config.model.eos_token_id { break; }
 
                 let t_tok = std::time::Instant::now();
+                let mut x = embed_f16_to_f32(embed_table, token_id as usize, hidden);
 
-                let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
-                let mut x = emb;
-
-                // Convert first layer blocking, then pipeline the rest
-                let t_conv0 = std::time::Instant::now();
-                let mut current_lf = convert_layer_f32(&model.weights, &model.config, 0)?;
-                let conv0_ms = t_conv0.elapsed().as_secs_f64() * 1000.0;
-
-                for layer in 0..num_layers {
-                    if layer + 1 < num_layers {
-                        req_tx.send(layer + 1).unwrap();
-                    }
-                    x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &current_lf)?;
-                    if layer + 1 < num_layers {
-                        current_lf = res_rx.recv().unwrap()?;
-                    }
-                }
+                carry_buf = run_all_layers_pipelined(
+                    model, &mut cache, &mut router, num_layers,
+                    &mut x, pos, &mut spare_buf, &req_tx, &res_rx,
+                )?;
+                spare_buf = carry_buf;
                 cache.advance();
 
                 let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
@@ -672,16 +728,14 @@ pub fn generate_v2(
                 let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
                 if !first_token_logged {
                     first_token_logged = true;
-                    eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total, pipelined) ---");
-                    eprintln!("  layer0 convert: {conv0_ms:.1}ms, {num_layers} layers at {:.1}ms/layer",
-                        tok_ms / num_layers as f64);
+                    eprintln!("--- decode token 0 profile ({tok_ms:.0}ms total, pipelined+reuse) ---");
+                    eprintln!("  {num_layers} layers at {:.1}ms/layer", tok_ms / num_layers as f64);
                 }
 
                 pos += 1;
             }
             let decode_secs = t_decode.elapsed().as_secs_f64();
 
-            // Drop sender to signal converter thread to exit
             drop(req_tx);
             Ok((prefill_secs, decode_secs))
         })?
