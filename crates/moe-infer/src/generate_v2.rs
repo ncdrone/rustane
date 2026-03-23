@@ -722,11 +722,13 @@ fn moe_ffn_v2(
         router.route_softmax(&gate_logits)
     };
 
-    // 2. Shared experts (unscaled — routed_scaling_factor applies only to routed experts)
-    let mut combined = if lf.shared_gate.is_some() {
-        shared_expert_ffn(x, lf)
+    // 2. Shared experts (computed eagerly on non-pread path, overlapped with pread on pread path)
+    let use_pread = model.expert_loaders.contains_key(&layer);
+    let mut combined = if !use_pread {
+        // Non-pread path: compute shared FFN eagerly (no overlap opportunity)
+        if lf.shared_gate.is_some() { shared_expert_ffn(x, lf) } else { vec![0.0f32; hidden] }
     } else {
-        vec![0.0f32; hidden]
+        vec![0.0f32; hidden]  // placeholder — filled by thread::scope in pread path below
     };
 
     let routed_scale = model.config.ffn.routed_scaling_factor;
@@ -745,39 +747,50 @@ fn moe_ffn_v2(
     let dn_total = dn_packed + dn_scales * 2;
     let expert_stride = gu_total * 2 + dn_total;
 
-    // Use pread-based loading if available (large models), else fall back to mmap
-    let use_pread = model.expert_loaders.contains_key(&layer);
-
     if let Some(m) = model.metal.as_ref() {
         if use_pread {
-            // === PREAD PATH: parallel load needed experts, pack into staging buffer ===
+            // === PREAD PATH: overlap expert pread with shared FFN ===
             let loader = &model.expert_loaders[&layer];
             let staging = &model.expert_staging;
 
             // SAFETY: single-threaded access (pread writes to non-overlapping regions)
             let staging_ptr = staging.as_ptr() as *mut u8;
-            let staging_len = staging.len();
 
-            // Parallel pread using rayon (pre-warmed thread pool — no thread creation overhead)
             let expert_ids: Vec<(usize, usize, f32)> = route.expert_ids.iter()
                 .zip(route.weights.iter())
                 .enumerate()
                 .map(|(i, (&eid, &w))| (i, eid, w))
                 .collect();
 
-            // Parallel pread directly into staging via rayon (no thread creation, no alloc)
+            // Overlap: pread experts from SSD while CPU computes shared FFN.
+            // Saves ~min(pread_ms, shared_ffn_ms) per MoE layer.
             use rayon::prelude::*;
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
+            let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
-            // Split staging into per-expert chunks and load in parallel
-            staging_mut[..expert_ids.len() * expert_stride]
-                .chunks_mut(expert_stride)
-                .zip(expert_ids.iter())
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .for_each(|(chunk, &(_, eid, _))| {
-                    loader.load_expert(eid as u32, chunk).unwrap();
+            let mut combined = std::thread::scope(|s| {
+                // Spawn pread on background thread (uses rayon internally for QD>1)
+                let pread_handle = s.spawn(|| {
+                    pread_region
+                        .chunks_mut(expert_stride)
+                        .zip(expert_ids.iter())
+                        .collect::<Vec<_>>()
+                        .into_par_iter()
+                        .for_each(|(chunk, &(_, eid, _))| {
+                            loader.load_expert(eid as u32, chunk).unwrap();
+                        });
                 });
+
+                // Shared FFN on current thread (overlaps with pread I/O)
+                let result = if lf.shared_gate.is_some() {
+                    shared_expert_ffn(x, lf)
+                } else {
+                    vec![0.0f32; hidden]
+                };
+
+                pread_handle.join().unwrap();
+                result
+            });
 
             // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();
