@@ -246,6 +246,21 @@ impl BackboneWeights {
         let w_uv = self.tensor_f16(&format!("{prefix}.self_attn.w_uv"))?;
         let o_proj = self.tensor_f16(&format!("{prefix}.self_attn.o_proj.weight"))?;
 
+        // Validate critical tensor shapes (catches V3/K2 head count mismatches)
+        if let Some(info) = self.tensor_info(&format!("{prefix}.self_attn.w_uk")) {
+            if info.shape.len() == 3 && info.shape[0] != 0 {
+                let expected_heads = w_uk.len() / (info.shape[1] * info.shape[2]);
+                if layer == 0 {
+                    eprintln!("  w_uk shape: {:?} ({} heads)", info.shape, info.shape[0]);
+                }
+            }
+        }
+        if let Some(info) = self.tensor_info(&format!("{prefix}.self_attn.o_proj.weight")) {
+            if layer == 0 {
+                eprintln!("  o_proj shape: {:?}", info.shape);
+            }
+        }
+
         if is_moe {
             let router = self.tensor_f16(&format!("{prefix}.mlp.gate.weight"))?;
             let e_bias = self.tensor_f32(&format!("{prefix}.mlp.gate.e_score_correction_bias")).ok();
