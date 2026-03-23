@@ -160,6 +160,26 @@ pub fn mla_forward_decode(
     cfg: &MlaDecodeConfig,
     attn_scale: f32,
 ) -> Vec<f32> {
+    let (v_concat, out_dim, v_total) = mla_decode_v_concat(
+        x, weights, cache, layer, pos, rope, cfg, attn_scale,
+    );
+    let mut output = vec![0.0f32; out_dim];
+    crate::blas::sgemv_f32(&weights.o_proj, &v_concat, &mut output, out_dim, v_total);
+    output
+}
+
+/// MLA decode steps 1-8: Q/KV projection, attention, value combination.
+/// Returns (v_concat, out_dim, v_total) — caller applies O projection (f32 or f16).
+pub fn mla_decode_v_concat(
+    x: &[f32],
+    weights: &MlaLayerWeights<'_>,
+    cache: &mut MlaKvCache,
+    layer: usize,
+    pos: usize,
+    rope: &YarnRopeTables,
+    cfg: &MlaDecodeConfig,
+    attn_scale: f32,
+) -> (Vec<f32>, usize, usize) {
     let h = cfg.num_heads;
     let nope = cfg.qk_nope_head_dim;
     let rope_dim = cfg.qk_rope_head_dim;
@@ -173,18 +193,15 @@ pub fn mla_forward_decode(
     if let (Some(q_a), Some(q_a_norm), Some(q_b)) =
         (&weights.q_a_proj, &weights.q_a_layernorm, &weights.q_b_proj)
     {
-        // V3 Q LoRA: x → W_qa → RMSNorm → W_qb → q
         let q_lora_rank = q_a.len() / hidden;
         let mut q_latent = vec![0.0f32; q_lora_rank];
         crate::blas::sgemv_f32(q_a, x, &mut q_latent, q_lora_rank, hidden);
         let q_latent_normed = rmsnorm(&q_latent, q_a_norm, cfg.rms_eps);
         crate::blas::sgemv_f32(q_b, &q_latent_normed, &mut q, q_total, q_lora_rank);
     } else {
-        // V2-Lite direct: x → W_q → q
         crate::blas::sgemv_f32(&weights.q_proj, x, &mut q, q_total, hidden);
     }
 
-    // Split into q_nope [H * nope] and q_pe [H * rope_dim]
     let mut q_nope = vec![0.0f32; h * nope];
     let mut q_pe = vec![0.0f32; h * rope_dim];
     for head in 0..h {
@@ -195,33 +212,20 @@ pub fn mla_forward_decode(
             .copy_from_slice(&q[src + nope..src + nope + rope_dim]);
     }
 
-    // 2. Apply RoPE to q_pe (all heads get same rotation)
     rope.apply_all_heads(&mut q_pe, h, pos);
 
-    // 3. KV compression: kv_out = x @ kv_a_proj^T
     let kv_out_dim = kv_rank + rope_dim;
     let mut kv_out = vec![0.0f32; kv_out_dim];
     crate::blas::sgemv_f32(&weights.kv_a_proj, x, &mut kv_out, kv_out_dim, hidden);
 
     let kv_latent_raw = &kv_out[..kv_rank];
     let k_pe_raw = &kv_out[kv_rank..];
-
-    // 4. kv_a_layernorm BEFORE cache (CRITICAL)
     let kv_latent = rmsnorm(kv_latent_raw, &weights.kv_a_layernorm, cfg.rms_eps);
-
-    // 5. Apply RoPE to k_pe (stored post-RoPE in cache)
     let mut k_pe = k_pe_raw.to_vec();
     rope.apply(&mut k_pe, pos);
-
-    // 6. Cache write
     cache.write(layer, pos, &kv_latent, &k_pe);
     let seq_len = pos + 1;
 
-    // 7. Absorbed attention — TWO SEPARATE DOT PRODUCTS SUMMED
-
-    // 7a. q_absorbed = per-head q_nope @ W_UK: [H, nope] × [H, nope, kv_rank] → [H, kv_rank]
-    // W_UK[head] is stored as [nope, kv_rank] row-major
-    // We want q_absorbed = W_UK^T @ q_nope = [kv_rank, nope] @ [nope] → [kv_rank]
     let mut q_absorbed = vec![0.0f32; h * kv_rank];
     for head in 0..h {
         let q_head = &q_nope[head * nope..(head + 1) * nope];
@@ -230,7 +234,6 @@ pub fn mla_forward_decode(
         crate::blas::sgemv_f32_trans(w_uk_head, q_head, out, kv_rank, nope);
     }
 
-    // 7b. Compute attention scores
     let latent_cache = cache.get_latents(layer, seq_len);
     let rope_cache = cache.get_rope_keys(layer, seq_len);
 
@@ -238,71 +241,42 @@ pub fn mla_forward_decode(
     for head in 0..h {
         let q_abs = &q_absorbed[head * kv_rank..(head + 1) * kv_rank];
         let q_rope = &q_pe[head * rope_dim..(head + 1) * rope_dim];
-
         for t in 0..seq_len {
             let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
             let rope_t = &rope_cache[t * rope_dim..(t + 1) * rope_dim];
-
-            // scores_nope = q_absorbed · kv_latent[t]
             let mut dot_nope = 0.0f64;
-            for d in 0..kv_rank {
-                dot_nope += q_abs[d] as f64 * lat_t[d] as f64;
-            }
-
-            // scores_rope = q_pe · k_pe[t] (k_pe is MQA — shared across all heads)
+            for d in 0..kv_rank { dot_nope += q_abs[d] as f64 * lat_t[d] as f64; }
             let mut dot_rope = 0.0f64;
-            for d in 0..rope_dim {
-                dot_rope += q_rope[d] as f64 * rope_t[d] as f64;
-            }
-
+            for d in 0..rope_dim { dot_rope += q_rope[d] as f64 * rope_t[d] as f64; }
             scores[head * seq_len + t] = (dot_nope + dot_rope) as f32 * attn_scale;
         }
     }
 
-    // 7c. Softmax per head
     let mut attn_weights = vec![0.0f32; h * seq_len];
     for head in 0..h {
         let s = &scores[head * seq_len..(head + 1) * seq_len];
         let w = &mut attn_weights[head * seq_len..(head + 1) * seq_len];
         let max_s = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
-        for t in 0..seq_len {
-            w[t] = (s[t] - max_s).exp();
-            sum += w[t];
-        }
-        for t in 0..seq_len {
-            w[t] /= sum;
-        }
+        for t in 0..seq_len { w[t] = (s[t] - max_s).exp(); sum += w[t]; }
+        for t in 0..seq_len { w[t] /= sum; }
     }
 
-    // 8. Value combination: v_latent = weights @ kv_latent_cache, then v = v_latent @ W_UV
     let mut v_concat = vec![0.0f32; h * v_dim];
     for head in 0..h {
         let w = &attn_weights[head * seq_len..(head + 1) * seq_len];
-
-        // v_latent = sum_t(w[t] * kv_latent[t]) — [kv_rank]
         let mut v_latent = vec![0.0f32; kv_rank];
         for t in 0..seq_len {
             let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
             let wt = w[t];
-            for d in 0..kv_rank {
-                v_latent[d] += wt * lat_t[d];
-            }
+            for d in 0..kv_rank { v_latent[d] += wt * lat_t[d]; }
         }
-
-        // v = v_latent @ W_UV[head]: [kv_rank] × [v_dim, kv_rank]^T → [v_dim]
         let w_uv_head = &weights.w_uv[head * v_dim * kv_rank..(head + 1) * v_dim * kv_rank];
         let v_out = &mut v_concat[head * v_dim..(head + 1) * v_dim];
         crate::blas::sgemv_f32(w_uv_head, &v_latent, v_out, v_dim, kv_rank);
     }
 
-    // 9. Output projection: output = v_concat @ o_proj^T
-    let out_dim = hidden;
-    let v_total = h * v_dim;
-    let mut output = vec![0.0f32; out_dim];
-    crate::blas::sgemv_f32(&weights.o_proj, &v_concat, &mut output, out_dim, v_total);
-
-    output
+    (v_concat, hidden, h * v_dim)
 }
 
 /// MLA forward decode using f16 weights directly (no f32 conversion pass).

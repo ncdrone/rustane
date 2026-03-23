@@ -437,6 +437,7 @@ fn run_mla_only(
 
     let normed = rmsnorm(x, &lf.input_norm, eps);
     let attn_weights = make_attn_weights(lf);
+
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
         &model.rope, &model.mla_config, model.attn_scale,

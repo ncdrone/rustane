@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 12
+tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 13
 
 ## Bottleneck (update after each win)
 MLA attention:    ~5ms  (31%)  — memory-bound AMX sgemv, sgemm ready but invisible at seq_len=5
@@ -29,6 +29,8 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 - GENERAL: ALL forms of explicit sgemv parallelization are dead ends — both parallelizing SEPARATE calls (iter 10) and row-partitioning SINGLE calls (iter 11). Accelerate handles multi-threading internally for large matrices and has near-optimal single-core performance for small matrices.
 - [iter 12] cached layer 0 f32 weights (buf_layer0, skip serial convert(0)): NO EFFECT 1.15 tok/s. Hypothesis: save ~5ms serial convert(0) per token. Reality: 5ms / 940ms per token = 0.5%, below noise. This confirms: single-layer conversion savings (~5ms) are invisible at the current per-token cost (~940ms). Eliminating individual convert() calls is a dead end.
 - GENERAL: ALL CPU-side "skip work" optimizations on single-layer granularity are dead ends. The per-token cost is ~940ms across 61 layers. Saving <10ms from any single layer = <1% = invisible. The exhaustion of CPU-side optimizations is now CONFIRMED across 12 iterations.
+- [iter 13] f16 O projection from mmap via sgemv_f16_par: 24% REGRESSION (1.13→0.86 tok/s). Skipped o_proj f32 conversion, read 235 MB f16 directly from mmap instead of 470 MB pre-converted f32. Reality: pre-converted f32 buffer is warm in RAM from background pipeline thread; mmap f16 pages are cold (last accessed during previous token). The chunked rayon convert+sgemv on cold mmap pages incurs page faults and serialization that vastly outweigh the halved DRAM traffic. Additionally, sgemv_f16_par defeats Accelerate's internal multi-threading for large matrices (same issue as iter 11).
+- GENERAL: reading f16 weights from mmap on the critical path is ALWAYS slower than using pre-warmed f32 from the pipeline overlap buffer. The pipeline background thread (running during FFN) pre-faults and converts pages into hot RAM. Bypassing this to read cold mmap pages is a net loss even at half the data volume. This closes the "f16 mmap direct read" family of optimizations.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -38,12 +40,29 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 ## Bugs Found (for manual sessions — do not fix, just document)
 - test_v3_validation L2 failure: layers_f32 empty in lazy mode (pre-existing, not caused by optimizations)
 
-## Suggested Next (ideas agents couldn't try — pick from here if relevant)
-- Wire ExpertPool (pool.rs) to cache hot experts in RAM instead of pread every token — but note: pread is already hidden by shared FFN overlap, so this only helps if shared FFN is also optimized
-- Profile actual per-component timing within MLA (instrument inside mla_forward_decode, measure W_qa/W_qb/W_kva/W_UK/W_UV/O individually) — this is RESEARCH, not optimization, but would validate AMX bandwidth estimates
-- ARCHITECTURAL (>100 lines): Metal attention kernel to move MLA sgemv to GPU (~5ms/layer CPU → <1ms/layer GPU)
-- ARCHITECTURAL (>100 lines): f16 compute path via Metal GPU (halves bandwidth requirement, path to 10+ tok/s)
-- EXHAUSTION NOTE: 11 iterations have systematically tried all CPU-side overlap, parallelization, and allocation optimizations, PLUS explicit BLAS parallelization. All remaining small optimizations are <3% individually (below noise), and attempting to out-parallelize Accelerate causes regression. The next measurable gain requires changing HOW compute is done (GPU kernels, f16 precision) or reducing DATA volume (ExpertPool caching), not parallelization or scheduling.
+## Category Status (NEVER pick from EXHAUSTED categories)
+- CPU overlap/scheduling: EXHAUSTED (6 experiments, 3 wins then ceiling)
+- CPU parallelization: EXHAUSTED (4 experiments, Apple BLAS already multi-threads internally)
+- Allocation elimination: EXHAUSTED (<50µs invisible at 940ms/token)
+- f16 CPU compute: DEAD END (4 experiments, needs Metal not CPU — includes f16 mmap direct read)
+- BLAS batching: OPEN (sgemm-attention tried but invisible at seq_len=5; Q LoRA batching untried)
+- Metal GPU compute: OPEN (untried — biggest untapped potential, needs arch session)
+- Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt)
+- Memory layout: OPEN (INT8 KV, f16 buffers, 2MB alignment untried)
+- LM head optimization: OPEN (4.35 GB, ~11ms/token)
+- Profiling/instrumentation: OPEN (no per-component MLA breakdown exists)
+
+## Suggested Next (pick from OPEN categories only, ranked by expected impact)
+1. [Profiling] Per-component MLA timing — instrument mla_forward_decode: W_qa, W_qb, W_kva, W_UK, W_UV, attn scores, value recon, O_proj individually. ~20 lines. Reveals real targets.
+2. [I/O] 2MB-aligned expert buffers — posix_memalign(buf, 2MB, size) for pread. Apple SSD DMA coalesces 2MB reads. ~10 lines. Could be 3.6x pread throughput.
+3. [Overlap] Overlap lm_head with next token — thread::scope lm_head ([151936,7168]=4.35GB, ~11ms) while background does embedding+norm for next token. Different data, no BW conflict. ~40 lines.
+4. [Memory] Pre-convert small tensors at load — convert norms, router, bias to f32 once at startup (~0.5 GB). Skip per-layer conversion for these. ~20 lines.
+5. [BLAS] Batch Q LoRA W_qa+W_qb — concatenate at load, one sgemm instead of two sequential sgemv. Save ~30µs/layer dispatch. ~30 lines.
+6. [Profiling] ExpertPool stats logging — wire pool.stats() into decode loop, log hit_rate/miss_count every 10 tokens. Don't cache yet, just measure. ~15 lines.
+7. [Compute] RMSNorm via NEON intrinsics — replace vDSP calls with inline float32x4_t. Avoid 0.5µs/call FFI overhead × 183 calls/token. ~40 lines.
+8. [Memory] Reuse attention scratch across layers — pre-allocate q[24576], kv_out[576], scores[128×seq] once, reuse. ~30 lines.
+
+EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and allocation categories. The ideas above are from DIFFERENT categories mined from the full 43-file research corpus.
 
 ## Iteration Log
 [iter 1] TIMEOUT at 60min — spent entire budget on diagnostic V3 benchmark. Never coded.
@@ -70,3 +89,5 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 [iter 11] INSIGHT: Apple Accelerate cblas_sgemv internally multi-threads for large matrices (>100 MB). This means the single sgemv call on O projection (470 MB) is ALREADY using multiple cores and approaching peak DRAM bandwidth (~400-546 GB/s). Manually splitting into smaller chunks forces each chunk into single-threaded mode, reducing total throughput. This definitively closes ALL forms of explicit sgemv parallelization — BLAS handles it optimally. The ONLY remaining path to improve MLA performance is reducing the DATA volume (f16 compute, W_UK absorption caching, or GPU offload), not changing HOW it's parallelized.
 [iter 12] RESULT: v3-cached-layer0 — NO EFFECT 1.15 tok/s. Cached layer 0's f32 weights in a third buffer (buf_layer0), peeled layer 0 out of the decode loop to skip the serial convert_layer_into(0) call. Median 1.15 across 3 runs (14.8, 15.2, 15.4 ms/layer). The 5ms saved per token is 0.5% of 940ms, invisible.
 [iter 12] INSIGHT: Single-layer conversion costs ~5ms. At 940ms/token total, this is 0.5% — confirmed below noise. This is the LAST possible "skip redundant work" optimization on single-layer granularity. 12 iterations have now exhaustively tried: overlap (iters 2,5,6,7,9), parallelization (iters 8,10,11), allocation elimination (iter 5), and work elimination (iter 12). ALL produce <3% improvement. CPU-side optimization is definitively exhausted. The next measurable gain requires GPU compute (Metal attention, f16 GEMV) or data volume reduction (ExpertPool caching).
+[iter 13] RESULT: v3-f16-oproj-mmap — REVERTED 0.86 tok/s (24% regression). Skipped o_proj f32 conversion in pipeline, read 235 MB f16 from mmap directly via sgemv_f16_par (rayon chunked convert+sgemv). Used mla_decode_v_concat refactor to split O projection from MLA core. Pre-warmed f32 from pipeline overlap buffer beats cold mmap f16 pages even at half data volume.
+[iter 13] INSIGHT: The pipeline overlap buffer is a WARM CACHE — the background thread pre-faults and converts mmap pages into hot f32 during the FFN phase. Reading from this buffer is fast because pages are already in the TLB and L3. Reading f16 from mmap on the critical path bypasses this warm cache, hitting cold pages that need page faults + TLB misses. The 50% bandwidth reduction from f16 is completely negated by the page fault latency. This is the same fundamental issue as iter 4 (f16 bypass) but at a different level — not single-core conversion speed, but page cache warmth.
