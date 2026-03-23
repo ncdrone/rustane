@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | experiments: 43
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | experiments: 44
 NOTE: there is ALWAYS something to try. 400+ experiment systems find wins at 19% rate with long dry spells between. Never declare exhaustion.
 
 ## Bottleneck (update after each win)
@@ -75,7 +75,7 @@ FFN total:        ~8.4ms (64%)
 - Allocation elimination: 2 tried, 0 wins. <50µs at current scale.
 - f16 CPU compute: 8 tried, 0 wins. Root cause: f16→f32 conversion creates 2.4x more memory traffic (10B vs 4B/element). Only viable f16 path is Metal GPU native.
 - I/O alignment: 1 tried, 0 wins. pread hidden by overlap.
-- BLAS batching: 4 tried, 1 win (sgemm-attention +6.1%). Q LoRA has norm between stages. Gate+up concat regressed. saxpy routing accumulation: NO EFFECT (call overhead > savings for small vectors).
+- BLAS batching: 5 tried, 1 win (sgemm-attention +6.1%). Q LoRA has norm between stages. Gate+up concat regressed. saxpy routing accumulation: NO EFFECT. sgemm(N=1) vs sgemv for O proj: NO EFFECT (same internal codepath).
 - Metal GPU: 4 tried, 0 wins. Per-dispatch overhead, waitUntilCompleted blocking, overlap destruction, and encode/commit separation overhead. Batched MLA untried.
 - Metal shader optimization: 2 tried, 0 wins. TG shared memory vs L2 device reads equivalent for small vectors. TG size 128 (4 SIMD groups) worse than 256 (8 SIMD groups) — 18% regression from dispatch overhead of 2× more TGs.
 - Metal alloc overhead: 1 tried, 0 wins. Pre-cached constant Metal buffers = NO EFFECT (290 ObjC allocs/token = ~0.4ms, 0.05% of 760ms decode).
@@ -171,3 +171,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 70] INSIGHT: This is a REVISIT of s9-batch-gate-up (iter 25, REVERTED at 1.22 due to hot-path memcpy). s9 concatenated during convert_layer_into (adding 116 MB memcpy per layer to the pipeline overlap thread). s18 avoids this by pre-concatenating at warmup, storing the cached matrices permanently. Result: still NO EFFECT. The failure is NOT memcpy overhead — it's that Accelerate's auto-threading threshold for sgemv is either not at 100 MB, or the [4096,7168] matrix shape doesn't trigger it (the 100 MB threshold may apply to sgemm, not sgemv). A single sgemv on [4096,7168] produces the same AMX instruction stream as two sequential sgemv on [2048,7168] — same total work, same hardware utilization. The only potential win was Accelerate internal multi-threading, which did not activate. CLOSES "batch shared expert gate+up" path definitively (both hot-path and warmup variants tried).
 [iter 71] RESULT: s19-fuse-attn-score-scale — NO EFFECT 1.31 tok/s (median of 1.29, 1.31, 1.33 warm; baseline ~1.19 on this machine). Fused two sgemm_nt + add+scale loop into two sgemm_nt_ab calls with alpha=attn_scale, beta=0/1. Added sgemm_nt_ab to blas.rs. Eliminates scores_rope_buf allocation and 2560-element scalar add+scale loop per layer. Correctness: 4 unit tests, max_diff 1.9e-6 vs original path.
 [iter 71] INSIGHT: Attention score computation at seq_len≈20 is already negligible (0.01ms/layer after iter 20's sgemm batching). Eliminating one allocation (10 KB) and one 2560-element loop saves ~0.05µs/layer = 3µs/token = 0.0004%. BLAS alpha/beta parameter fusion is mathematically correct but provides zero measurable benefit when the operation is already <1% of layer time. The sgemm_nt_ab function IS useful infrastructure for future work at longer seq_lens (>1000) where attention dominates. CLOSES "fuse attention score scale" path at short seq_len. The code is clean but NOT worth committing for pure performance — would only commit as code quality improvement.
+[iter 72] RESULT: s20-sgemm-oproj — NO EFFECT 1.33 tok/s (median of 1.30, 1.33, 1.35 warm). Used cblas_sgemm(M=7168,N=1,K=16384) instead of cblas_sgemv for O projection (470MB f32, largest single MLA component at 2.1ms/layer). 4 correctness tests passed (exact match <1e-5). No per-phase timing change.
+[iter 72] INSIGHT: Accelerate's sgemm with degenerate N=1 produces identical timing to sgemv — confirming that Accelerate detects the K=1 case and dispatches to the same internal sgemv codepath. There is no "hidden" BLAS-3 optimization path for matrix-vector operations accessed through sgemm instead of sgemv. CLOSES "BLAS routine selection" as an optimization vector. For the O projection (and all other sgemv calls), the ONLY path to faster execution is reducing data volume (INT8 quantization, f16 via Metal GPU natively) — not changing which BLAS entry point we call.
