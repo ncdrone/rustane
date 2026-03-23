@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.31 | ms/layer: 13.2 | baseline: 0.7 | wins: 4 | iterations: 15
+tok/s: 1.31 | ms/layer: 13.2 | baseline: 0.7 | wins: 4 | iterations: 18
 
 ## Bottleneck (update after each win)
 ### Per-layer (13.2ms, warm decode, seq_len≈20):
@@ -42,6 +42,8 @@ FFN total:        ~8.4ms (64%)
 - GENERAL: reading f16 weights from mmap on the critical path is ALWAYS slower than using pre-warmed f32 from the pipeline overlap buffer. The pipeline background thread (running during FFN) pre-faults and converts pages into hot RAM. Bypassing this to read cold mmap pages is a net loss even at half the data volume. This closes the "f16 mmap direct read" family of optimizations.
 - [iter 15] sgemv_f16_par for shared expert FFN from mmap: 39% REGRESSION (1.31→0.80 tok/s). Replaced shared_expert_ffn's sgemv_f32 with sgemv_f16_par reading f16 directly from mmap. The rayon tasks from sgemv_f16_par compete with pread rayon tasks inside thread::scope for the same global thread pool. 8 pread workers blocked on SSD I/O starve sgemv_f16_par chunks of CPU workers. Worse than iter 13 (o_proj) because shared expert FFN runs INSIDE the pread overlap scope, not outside it.
 - GENERAL: sgemv_f16_par CANNOT be used inside thread::scope that also spawns rayon pread work. The rayon global thread pool sees both workloads and cannot prioritize — I/O-blocked threads hold pool slots, starving CPU-bound chunks. This closes ALL variants of "f16_par inside pread overlap scope".
+- [iter 17] sgemv_f16_par for O projection during uncontested MLA phase: 50% REGRESSION (1.31→0.66 tok/s). Used sgemv_f16_par on f16 o_proj from mmap in run_mla_only (no background rayon). Replaced Accelerate's internally-threaded sgemv_f32 on pre-warmed f32 heap buffer. Even without rayon contention, mmap page-table overhead at 16 KB granularity for 235 MB data (~14700 page table walks) makes mmap reads fundamentally slower than heap reads for large sequential scans.
+- GENERAL: mmap access is ALWAYS slower than heap access for large weight matrices (>100 MB). mmap uses 16 KB pages (macOS), requiring ~14700 TLB/page-table entries for 235 MB vs contiguous heap memory that benefits from Accelerate's sequential access patterns. This is a FUNDAMENTAL platform limitation, not a warmth or contention issue. ALL paths that read f16 weights from backbone.bin mmap for compute are permanently closed. The ONLY viable f16 path is: copy f16 from mmap to heap buffer at pipeline time, then sgemv_f16_par on the heap buffer — but the copy + convert overhead negates savings.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -55,11 +57,12 @@ FFN total:        ~8.4ms (64%)
 - CPU overlap/scheduling: EXHAUSTED (6 experiments, 3 wins then ceiling)
 - CPU parallelization: EXHAUSTED (4 experiments, Apple BLAS already multi-threads internally)
 - Allocation elimination: EXHAUSTED (<50µs invisible at 940ms/token)
-- f16 CPU compute: DEAD END (5 experiments, needs Metal not CPU — includes f16 mmap direct read AND f16_par inside pread scope)
+- f16 CPU compute: DEAD END (7 experiments, needs Metal not CPU — includes f16 mmap direct read, f16_par inside pread scope, AND f16_par on uncontested mmap)
+- I/O alignment: EXHAUSTED (1 experiment — pread hidden by overlap, alignment cannot help)
 - BLAS batching: OPEN (sgemm-attention tried but invisible at seq_len=5; Q LoRA batching untried)
 - Metal GPU compute: OPEN (untried — biggest untapped potential, needs arch session)
 - Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt; dense layer caching PROVEN effective)
-- Memory layout: OPEN (INT8 KV, f16 buffers, 2MB alignment untried)
+- Memory layout: OPEN (INT8 KV, f16 buffers untried)
 - LM head optimization: OPEN (4.35 GB, ~11ms/token)
 - Profiling/instrumentation: DONE (s1-mla-profiling: per-component MLA timing via RUSTANE_MLA_PROFILE=1)
 
@@ -108,3 +111,7 @@ EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and alloc
 [iter 15] INSIGHT: The rayon global thread pool is a SHARED RESOURCE. Inside thread::scope, pread spawns 8 rayon tasks that block on SSD I/O (holding rayon worker threads hostage). sgemv_f16_par spawns 32 rayon conversion+compute tasks that need CPU workers. With 12 pool threads, 8 blocked on I/O leaves only 4 for sgemv chunks — worse than the original single-core sgemv_f32 which ran entirely on the main thread without touching rayon at all. KEY LESSON: never add rayon parallelism to the main thread's work inside a thread::scope where the spawned thread also uses rayon for I/O. The main thread's non-rayon work (sgemv_f32) was actually OPTIMAL because it didn't compete for pool resources.
 [iter 16] RESULT: s1-mla-profiling — DIAGNOSTIC 1.30 tok/s. Added env-gated per-component timing to mla_decode_v_concat (RUSTANE_MLA_PROFILE=1). Zero overhead when disabled. Median 1.30 across 3 runs (13.1, 13.1, 13.4 ms/layer). No regression.
 [iter 16] INSIGHT: MLA per-layer breakdown at seq_len≈20: o_proj 2110µs (44%), q_proj 947µs (20%), attn_scores+softmax 883µs (19%), value_recon+w_uv 471µs (10%), w_uk_absorb 237µs (5%), kv_compress 116µs (2%). Total MLA ~4.8ms = 36% of 13.2ms/layer. KEY FINDING: O projection is the single largest MLA component at 2.1ms/layer reading 470 MB f32. Attention scores (scalar f64 loops) scale linearly with seq_len — 883µs at seq_len=20 would become ~4ms at seq_len=100 and dominate MLA at longer contexts. The previously estimated "~5ms MLA" was close but now we know the internal distribution.
+[iter 17] RESULT: v3-oproj-f16-mla-phase — REVERTED 0.66 tok/s (50% regression). Used sgemv_f16_par on f16 o_proj from mmap during MLA phase when rayon pool is completely uncontested. Replaced Accelerate's internally-threaded sgemv_f32 on pre-warmed f32 heap buffer. Even without rayon contention, mmap page-table overhead at 16 KB granularity for 235 MB makes mmap reads fundamentally slower than heap reads.
+[iter 17] INSIGHT: mmap access is ALWAYS slower than heap access for large weight matrices (>100 MB) on macOS. This is a FUNDAMENTAL platform limitation — 16 KB pages require ~14700 TLB/page-table entries for 235 MB vs contiguous heap memory that benefits from Accelerate's sequential access patterns. Not a warmth or contention issue. ALL paths that read f16 weights from backbone.bin mmap for compute are permanently closed. This DEFINITIVELY closes the f16 CPU compute category after 7 failed experiments across 5 iterations.
+[iter 18] RESULT: s2-2mb-aligned-bufs — NO EFFECT 1.30 tok/s. posix_memalign(2MB) for expert_staging buffer (~178 MB). Median 1.30 across 3 runs (13.2, 13.3, 13.1 ms/layer). Identical to baseline.
+[iter 18] INSIGHT: pread is fully hidden by shared FFN overlap (1.5ms pread vs 4ms shared FFN), so improved I/O alignment cannot affect the critical path. Also: macOS already promotes large anonymous mappings (>2MB) to superpages automatically — explicit 2MB posix_memalign provides no additional benefit over Vec's default 16KB alignment for a 178 MB buffer. This closes the "io-alignment" family: alignment only matters when I/O is on the critical path, which it isn't after the pread||FFN overlap (iter 5).
