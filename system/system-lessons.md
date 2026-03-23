@@ -92,6 +92,18 @@ Read this before modifying any system/ scripts. Updated after every incident.
 
 ---
 
+## L7: Commit synced-back files before relaunching
+
+**Date:** 2026-03-22
+**Severity:** LOW
+**Incident:** The script syncs `experiments-v3.tsv` and `v3-gossip.md` back to the main repo after each iteration, but these are unstaged changes. If you relaunch without committing them to `v3-optimize`, the worktree merge won't include them (they're not in any commit).
+
+**Fix:** Before relaunching, always `git add system/experiments-v3.tsv system/v3-gossip.md && git commit`. Or add this to the script as a pre-launch step.
+
+**Rule:** Check `git status` on v3-optimize before relaunching. Commit any synced-back files.
+
+---
+
 ## General Principles
 
 1. **Stateless agents need filesystem memory.** Gossip files, experiment logs, and state files bridge the gap between invocations.
