@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 28
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 29
 STATUS: **EXHAUSTED** — auto-agent ceiling confirmed and logged. All remaining improvements require architectural changes (Metal GPU compute, Expert pool, INT8) beyond ≤100-line protocol. PLANNED entry logged with 3 prioritized architectural paths.
 
 ## Bottleneck (update after each win)
@@ -91,8 +91,8 @@ FFN total:        ~8.4ms (64%)
 - s4-preconvert-small: TESTED NO EFFECT (iter 22, 1.37 tok/s). Router conversion hidden by pipeline overlap headroom.
 - s5-batch-qlora: NOT VIABLE — norm between W_qa and W_qb prevents batching
 - s6-pool-stats: DONE (90.6% hit rate warm, 0 evictions at cap=2000)
-- s7-rmsnorm-neon: 0.01% savings — below noise (not worth implementing)
-- s8-reuse-attn-scratch: 0.01% savings — below noise (not worth implementing)
+- s7-rmsnorm-neon: CLOSED iter 29. 0.013% savings, pure Rust scalar (no vDSP FFI to save), DRAM-limited. BELOW NOISE.
+- s8-reuse-attn-scratch: TESTED iter 28. NO EFFECT 1.37 tok/s. jemalloc slab caches make allocs near-free.
 
 EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimization categories. Every remaining path to >3% improvement requires either: (a) Metal GPU compute for MLA components, (b) weight quantization with custom kernels, or (c) architectural changes to the pipeline. The autonomous optimization agent has reached diminishing returns for incremental optimizations.
 
@@ -155,3 +155,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 27] INSIGHT: FINAL AUTO-AGENT SUMMARY — The 5 wins came from: (1) pipeline overlap convert||compute +14%, (2) pread||shared_FFN overlap +34%, (3) deferred convert to FFN-only phase +6.6%, (4) cache all 3 dense layers f32 +15.9%, (5) sgemm attention batching +6.1%. Every win exploited a DIFFERENT hardware resource overlap or eliminated redundant data movement. The 21 non-wins proved that: (a) f16 CPU compute is fundamentally slower than f32 due to L2 traffic amplification (10B vs 4B/element), (b) Metal per-dispatch overhead makes single-op GPU offload a net loss, (c) Apple Accelerate internally multi-threads large sgemv so explicit parallelization regresses, (d) pipeline background thread has 5ms headroom so reducing its work cannot help, (e) all remaining individual CPU-side optimizations are <3% = below noise. The path to 5+ tok/s requires: Metal shared expert FFN (INT4, +33%), Metal batched MLA kernel (+17%), or async Metal pipeline (+50%).
 [iter 28] RESULT: s8-reuse-attn-scratch — NO EFFECT 1.37 tok/s (median of 1.37, 1.37, 1.37). Implemented MlaScratch struct with 15 pre-allocated buffers + rmsnorm_into. Eliminates 915 alloc/dealloc per token (~52 MB churn). Bit-identical output verified via 4 unit tests. Allocation overhead confirmed at ~1.8ms/token = 0.25%, invisible at noise floor.
 [iter 28] INSIGHT: jemalloc/macOS allocator uses slab caches for common sizes — after the first token's warmup, repeated allocations of the same size (e.g., vec![0.0; 65536]) hit the thread-local free list and complete in <1µs. The predicted 2µs/alloc was an overestimate; real cost is closer to 0.5-1µs for warm slab allocations. Cache pollution from scratch zeroing (850 KB/layer) is negligible because weight matrices (470+ MB O_proj, 150 MB Q_proj) stream from DRAM regardless of L2/L3 state. This CLOSES the scratch buffer reuse category and is the FINAL ≤100-line CPU-side experiment. ALL 12 optimization categories are now EXHAUSTED or DEAD END after 28 iterations.
+[iter 29] RESULT: s7-rmsnorm-neon — BELOW NOISE (not implemented). Last remaining IDEA row. Predicted 0.013% savings (91µs/720ms), 230× below 3% noise floor. Read the actual rmsnorm.rs: pure Rust scalar code (no vDSP FFI to eliminate). Even NEON intrinsics cannot improve DRAM-limited norm computation at 7168 elements (~1-2µs per call, dominated by weight vector read from DRAM/L3).
+[iter 29] INSIGHT: FINAL EXHAUSTION CONFIRMATION — 29 iterations, all 12 categories exhausted. Read every hot-path source file (generate_v2.rs, mla_attention.rs, blas.rs, rmsnorm.rs). No missed low-hanging fruit. The BLAS wrappers are direct Accelerate FFI with zero overhead. The pipeline overlap is optimal for current resource allocation. Every Vec allocation in the hot path was examined by s8 and confirmed near-free via jemalloc slab caches. The s7 IDEA was based on a wrong premise (rmsnorm uses vDSP) — it's actually pure Rust scalar, making NEON intrinsics even less impactful than predicted. The ONLY remaining paths to 5+ tok/s are architectural: Metal batched MLA kernel (~300 lines), Metal shared expert FFN (~150 lines), or async Metal pipeline (~400 lines). These require a manual design session, not the ≤100-line auto-agent protocol.
