@@ -4,14 +4,14 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.06 | ms/layer: 16.2 | baseline: 0.7 | wins: 2 | iterations: 6
+tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 7
 
 ## Bottleneck (update after each win)
 MLA attention:    ~5ms  (31%)  — memory-bound AMX sgemv, sgemm ready but invisible at seq_len=5
 Metal dispatch:   ~3ms  (19%)  — GPU compute + waitUntilCompleted sync
 Residual compute: ~3ms  (19%)  — RMSNorm, routing, residuals
-Conversion:       ~3ms  (19%)  — hidden by pipeline overlap (was 7ms serial)
-Expert pread:     ~2ms  (12%)  — hidden by shared FFN overlap (was 3ms serial)
+Conversion:       ~2ms  (13%)  — hidden by pipeline overlap, deferred to FFN phase only (was 7ms serial)
+Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 
 ## Dead Ends (append-only — DO NOT RETRY these or variations of them)
 - [iter 2] manual NEON sgemv: 3x slower than AMX BLAS for [128,512]. AMX dispatch overhead only 1.3μs/call.
@@ -19,6 +19,7 @@ Expert pread:     ~2ms  (12%)  — hidden by shared FFN overlap (was 3ms serial)
 - [iter 4] f16 direct path with FCVTL: 1-core conversion (80 GB/s) loses to 12-core rayon (300 GB/s) + pipeline overlap. Even vectorized, halving traffic can't compensate for losing parallelism.
 - [iter 5] alloc elimination (rmsnorm_into + final_norm borrow): correct refactor, 126 allocs/tok = ~50μs, invisible at 1300ms/tok. Already committed as code quality improvement.
 - ALL f16 CPU compute paths are dead ends. f16 requires Metal GPU, not CPU tricks.
+- [iter 7] overlap Metal dispatch with convert instead of shared FFN: no improvement. M4 Max unified memory handles concurrent AMX+rayon without BW contention. CPU-side BW scheduling rearrangements are dead ends.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -29,10 +30,11 @@ Expert pread:     ~2ms  (12%)  — hidden by shared FFN overlap (was 3ms serial)
 - test_v3_validation L2 failure: layers_f32 empty in lazy mode (pre-existing, not caused by optimizations)
 
 ## Suggested Next (ideas agents couldn't try — pick from here if relevant)
-- Overlap Metal expert dispatch with next layer's conversion (Metal GPU || CPU rayon — different resources)
 - Batch multiple sgemv calls in MLA attention into fewer sgemm calls (Q LoRA W_qa + W_qb back-to-back)
 - Pre-compute RMSNorm scales for all layers at token start (tiny tensors, eliminate per-layer overhead)
 - Move RMSNorm to NEON intrinsics (avoid vDSP call overhead for small vectors)
+- Wire ExpertPool (pool.rs) to cache hot experts in RAM instead of pread every token
+- Batch per-head W_UK/W_UV sgemv calls (128 × [128,512]) — dispatch overhead = 128 × 1.3μs = 166μs/layer
 
 ## Iteration Log
 [iter 1] TIMEOUT at 60min — spent entire budget on diagnostic V3 benchmark. Never coded.
@@ -45,3 +47,7 @@ Expert pread:     ~2ms  (12%)  — hidden by shared FFN overlap (was 3ms serial)
 [iter 5] RESULT: v3-elim-norm-allocs — NO EFFECT 0.79 tok/s. rmsnorm_into + final_norm borrow. 126 allocs eliminated but ~50μs total.
 [iter 5] RESULT: v3-overlap-pread-ffn — KEPT, 0.8→1.06 tok/s (34%). Overlap expert pread with shared FFN. SSD I/O and memory BW use different hardware.
 [iter 5] INSIGHT: the remaining bottleneck is memory-bandwidth-bound (MLA attention + Metal dispatch + residual). CPU tricks exhausted — need Metal f16 GEMV or ExpertPool for next jump.
+[iter 6] RESULT: v3-deferred-convert — KEPT, 1.06→1.13 tok/s (6.6%). Deferred conversion thread to overlap with FFN phase only (not MLA). MLA sgemv is memory-bandwidth-bound; concurrent conversion stole ~15% BW. Deferring to FFN phase (Metal GPU + SSD pread, no BW contention) recovers 1.0ms/layer.
+[iter 6] INSIGHT: conversion overlap must be SELECTIVE — only overlap with operations that don't compete for DRAM bandwidth. MLA attention uses AMX which saturates DRAM. FFN uses Metal GPU + NVMe which don't.
+[iter 7] RESULT: v3-overlap-metal-convert — NO EFFECT 1.11 tok/s. Split moe_ffn into prepare(shared+pread) + dispatch(Metal), overlap convert with Metal only. Both pipelines = 7ms: max(3ms convert, 7ms FFN)=7ms vs 4ms shared+max(3ms convert, 3ms Metal)=7ms.
+[iter 7] INSIGHT: M4 Max unified memory handles concurrent AMX sgemv + rayon conversion WITHOUT measurable BW contention. The hypothesis that shared FFN BW degrades during concurrent conversion was wrong — Apple Silicon's memory controller distributes bandwidth efficiently across cores. CPU-side BW contention is a dead end for optimization.
