@@ -33,13 +33,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- Config ---
-MAX_ITERS=10
+MAX_ITERS=100
 COOLDOWN=15
 MODEL="claude-opus-4-6"
 AGENT_ID="alpha"
 DRY_RUN=false
 SHOW_STATUS=false
-ITER_TIMEOUT_MIN=120
+ITER_TIMEOUT_MIN=90
 WORKTREE_BASE="/Users/dan/Dev/rustane-v3-auto"
 BASE_BRANCH="v3-optimize"
 RESEARCH_REPO="/Users/dan/Dev/rustane-research"
@@ -280,6 +280,13 @@ STEP 1 — READ CONTEXT (do this first, do not skip):
   - research-context/stage2/03-architecture-10toks.md (10 tok/s blueprint, physical limits)
   - research-context/stage1/FINAL.md (10 architecture corrections from 9 research agents)
   - research-context/01-internal-architecture.md (MLA math, compute budget, weight tensors)
+
+STEP 1.5 — PICK EXPERIMENT:
+  Check system/experiments-v3.tsv for rows with verdict=IDEA. These are prioritized
+  experiments from the research corpus. Pick the FIRST one (lowest s-number).
+  Also check the "Category Status" in v3-gossip.md — NEVER pick from an EXHAUSTED category.
+  If no IDEA rows remain, pick from the gossip "Suggested Next" list.
+  Only invent your own experiment if all IDEA rows are tried and Suggested Next is empty.
 
 STEP 2 — THINK:
   What's the highest-leverage SMALL change? Consider:
