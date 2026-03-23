@@ -170,17 +170,23 @@ if ! git -C "$REPO_ROOT" show-ref --quiet "refs/heads/${BRANCH}"; then
     git -C "$REPO_ROOT" branch "$BRANCH" "${BASE_BRANCH}"
     log "Created branch ${BRANCH} from ${BASE_BRANCH}"
 else
-    # Fast-forward agent branch to pick up any new commits on base branch
-    log "Fast-forwarding ${BRANCH} to latest ${BASE_BRANCH}..."
-    git -C "$REPO_ROOT" checkout "$BRANCH" --quiet 2>/dev/null
-    git -C "$REPO_ROOT" merge "${BASE_BRANCH}" --ff-only --quiet 2>/dev/null || \
-        log "WARNING: could not fast-forward (diverged commits). Using existing branch as-is."
-    git -C "$REPO_ROOT" checkout - --quiet 2>/dev/null || true
+    log "Reusing existing branch ${BRANCH}"
 fi
 
-# Create worktree
+# Create worktree (agent branch is checked out here)
 git -C "$REPO_ROOT" worktree add "$WORKTREE" "$BRANCH"
 log "Worktree created at ${WORKTREE}"
+
+# Merge latest base branch INTO the worktree (picks up system updates)
+# This works because the agent branch IS checked out in the worktree.
+# NEVER checkout branches in the main repo — breaks worktree workflows.
+if git -C "$WORKTREE" merge-base --is-ancestor "${BASE_BRANCH}" HEAD 2>/dev/null; then
+    log "Agent branch already contains latest ${BASE_BRANCH}"
+else
+    log "Merging latest ${BASE_BRANCH} into agent branch..."
+    git -C "$WORKTREE" merge "${BASE_BRANCH}" --no-edit --quiet 2>/dev/null || \
+        log "WARNING: merge failed (conflicts). Continuing with existing state."
+fi
 
 # Copy context files (gitignored)
 if [ -d "${REPO_ROOT}/dev" ]; then
