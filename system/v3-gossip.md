@@ -4,7 +4,8 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 20
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 21
+STATUS: **EXHAUSTED** — auto-agent ceiling reached. All remaining improvements require architectural changes (Metal GPU compute, Expert pool, INT8) beyond ≤100-line protocol.
 
 ## Bottleneck (update after each win)
 ### Per-layer (13.2ms, warm decode, seq_len≈20):
@@ -81,7 +82,7 @@ FFN total:        ~8.4ms (64%)
 
 ### SMALL EXPERIMENTS remaining (<100 lines, all likely BELOW NOISE):
 - s3-lmhead-overlap: ANALYZED NOT VIABLE — nothing useful to overlap (embedding is 0.02ms)
-- s4-preconvert-small: 0.2% savings — below noise
+- s4-preconvert-small: CONFIRMED NO EFFECT (iter 22, 1.37 tok/s). Router conversion hidden by pipeline overlap headroom.
 - s5-batch-qlora: NOT VIABLE — norm between W_qa and W_qb prevents batching
 - s6-pool-stats: profiling only
 - s7-rmsnorm-neon: 0.01% savings — below noise
@@ -132,3 +133,7 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 20] INSIGHT: The SAME optimization that was NO EFFECT at baseline 0.8 (iter 4, 0.81 tok/s) became a measurable win at baseline 1.31 (+6.1%). Two factors explain this: (1) After cached-dense reduced per-layer time from 22ms to 13ms, MLA is now 36% of layer time (up from ~22%). The same absolute savings (~0.9ms/layer) becomes a larger percentage improvement. (2) The benchmark seq_len is ~20 (not ~5 as in iter 4), making the scalar f64 loop cost ~4x higher. This teaches: revisit previously-tested optimizations when the baseline changes significantly — the threshold for visibility drops as the total per-layer time shrinks.
 [iter 20] ANALYSIS: f16_par on HEAP micro-benchmark — sgemv_f16_par on heap-allocated f16 O projection [7168,16384] = 6.8x SLOWER than sgemv_f32 (13871µs vs 2039µs). The root cause is memory traffic amplification: f16→f32 conversion at 10 bytes/element vs f32 direct at 4 bytes/element. This is the DEFINITIVE closure of ALL f16 CPU compute paths — the issue is not data source (mmap vs heap) but the fundamental cost of f32 materialization through L2 for any path through Accelerate BLAS. Only Metal f16 native ops can avoid this.
 [iter 20] ANALYSIS: Remaining IDEA rows s3-s8 all below noise threshold: s3 has no useful overlap work (0.02ms embedding vs 10ms lm_head), s4 saves 0.2%/token, s5 can't batch (norm between W_qa/W_qb), s7 saves 0.01%, s8 saves 0.01%. ALL <100 line CPU-side optimizations are exhausted. Next gains require Metal GPU compute for MLA or weight quantization with custom kernels.
+[iter 21] RESULT: EXHAUSTION DECLARED — no experiment implemented. Exhaustive analysis of all remaining OPEN categories confirms every candidate is below the 3% noise threshold: lm_head+convert overlap (0.4%), W_UK/W_UV batching (2.6%), MLA scratch reuse (0.04%), pre-convert router (0.3%), batch Q LoRA (0.25%), split pipeline conversion (0%). Also confirmed: q_proj conversion is already zero-cost for V3 (empty slice from weights.rs:241). Verified shared expert weight volume (68% of conversion time) but conversion is fully hidden by FFN pipeline overlap.
+[iter 21] INSIGHT: The auto-agent reached its ceiling at 1.39 tok/s (2.0× from 0.7 baseline) after 21 iterations across 11 categories. The 5 wins came from fundamentally different hardware resource overlap (CPU||SSD, CPU||GPU, cache elimination, BLAS batching). All remaining paths to 5+ tok/s require Metal GPU native f16 compute — this cannot be achieved within the ≤100 line incremental protocol and requires an architectural design session. KEY ARCHITECTURAL TARGETS: (1) Metal f16 sgemv for O projection saves 2.1ms/layer = 17%, (2) Metal shared expert FFN saves 4ms/layer = 33%, (3) combined Metal MLA+FFN saves ~50% theoretically, but requires ~300 lines of Metal shaders + dispatch code.
+[iter 22] RESULT: s4-preconvert-small — NO EFFECT 1.37 tok/s. Pre-converted router weights [256,7168] f16→f32 at load time (58 layers, 426 MB RAM). Median 1.37 across 3 runs. Router conversion (~0.012ms/layer) is fully hidden by pipeline overlap headroom. Confirms exhaustion analysis prediction.
+[iter 22] INSIGHT: Pipeline overlap thread has ~5ms headroom (FFN=7ms, total convert=1.5ms). Eliminating any sub-component of the conversion work cannot improve throughput because the pipeline thread already finishes before the main thread. Only optimizations that reduce MAIN THREAD work (MLA or FFN critical path) can produce measurable gains. This is the final confirmation that all pipeline-thread optimizations are exhausted.
