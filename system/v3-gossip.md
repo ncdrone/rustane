@@ -46,6 +46,8 @@ FFN total:        ~8.4ms (64%)
 - GENERAL: mmap access is ALWAYS slower than heap access for large weight matrices (>100 MB). mmap uses 16 KB pages (macOS), requiring ~14700 TLB/page-table entries for 235 MB vs contiguous heap memory that benefits from Accelerate's sequential access patterns. This is a FUNDAMENTAL platform limitation, not a warmth or contention issue. ALL paths that read f16 weights from backbone.bin mmap for compute are permanently closed. The ONLY viable f16 path is: copy f16 from mmap to heap buffer at pipeline time, then sgemv_f16_par on the heap buffer — but the copy + convert overhead negates savings.
 - [iter 19] overlap Metal expert dispatch (GPU) with shared_expert_ffn (CPU sgemv): 8.4% REGRESSION (1.31→1.20 tok/s median, high variance 0.80-1.26). Moved pread→Metal dispatch to background thread::scope, ran shared_FFN concurrently on main. Hypothesis: GPU and CPU use different hardware resources. Reality: Metal API has non-trivial CPU-side overhead (command buffer encoding, ObjC dispatch, constant buffer HashMap allocation, waitUntilCompleted polling/spin). This CPU footprint interferes with Accelerate's internally-threaded sgemv on the main thread. High variance across runs confirms thread scheduling interference.
 - GENERAL: Metal dispatch is NOT a pure GPU operation. It has significant CPU-side overhead from the Metal API (ObjC messaging, IOKit calls, buffer management, driver polling). Overlapping Metal dispatch with CPU-intensive work (sgemv, rayon) causes contention. Metal dispatch should remain SEQUENTIAL after CPU work completes. This closes the "overlap Metal with CPU" family of optimizations.
+- [iter 20] sgemv_f16_par on HEAP data for O projection: 6.8x SLOWER than sgemv_f32 (micro-benchmark: 13871µs vs 2039µs for [7168,16384]). Even on contiguous heap memory with no mmap overhead and uncontested rayon, the f16→f32 chunked conversion creates 2.4x MORE total memory traffic per element: read 2B f16 from DRAM + write 4B f32 to L2 + read 4B f32 from L2 in sgemv = 10 bytes/element, vs 4 bytes/element for direct f32 sgemv. The sgemv_f16_par per-chunk Vec allocation (4 MB × 112 chunks = 448 MB allocation churn) adds further overhead.
+- GENERAL (DEFINITIVE): ALL CPU-based f16 compute paths are dead ends regardless of data source (mmap OR heap). The root cause is NOT mmap page tables, NOT rayon contention, NOT page warmth — it's the FUNDAMENTAL memory traffic amplification of f16→f32 conversion: any path through Accelerate's f32 BLAS requires materializing f32 data in at least L2, which adds 6+ bytes of traffic per element on top of the 2B f16 read. The ONLY viable f16 path is Metal GPU which processes f16 natively in register without f32 materialization.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -59,27 +61,33 @@ FFN total:        ~8.4ms (64%)
 - CPU overlap/scheduling: EXHAUSTED (6 experiments, 3 wins then ceiling)
 - CPU parallelization: EXHAUSTED (4 experiments, Apple BLAS already multi-threads internally)
 - Allocation elimination: EXHAUSTED (<50µs invisible at 940ms/token)
-- f16 CPU compute: DEAD END (7 experiments, needs Metal not CPU — includes f16 mmap direct read, f16_par inside pread scope, AND f16_par on uncontested mmap)
+- f16 CPU compute: DEAD END (8 experiments — includes f16 mmap, f16_par pread scope, f16_par mmap uncontested, AND f16_par HEAP. Root cause: f16→f32 conversion creates 2.4x MORE memory traffic per element (10B vs 4B) because intermediate f32 must pass through L2, not registers. Only viable f16 path is Metal GPU native f16.)
 - I/O alignment: EXHAUSTED (1 experiment — pread hidden by overlap, alignment cannot help)
-- BLAS batching: PARTIALLY EXHAUSTED (sgemm-attention now a win at 1.31 baseline; Q LoRA batching untried)
+- BLAS batching: EXHAUSTED (sgemm-attention win at 1.39 baseline; Q LoRA has norm between W_qa/W_qb, can't batch)
 - Metal GPU overlap: DEAD END (1 experiment — Metal API CPU overhead contends with concurrent sgemv)
 - Metal GPU compute: OPEN (dedicated Metal kernels for MLA untried — biggest untapped potential, needs arch session)
-- Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt; dense layer caching PROVEN effective)
-- Memory layout: OPEN (INT8 KV, f16 buffers untried)
-- LM head optimization: OPEN (4.35 GB, ~11ms/token)
+- Expert caching/pool: OPEN (ExpertPool built, unwired — borderline: pread hidden by overlap)
+- Memory layout: OPEN (INT8 KV cache in L2/L3 → no DRAM savings; INT8 weight quantization for O proj/Q proj theoretically halves traffic but needs custom sgemv_int8)
+- LM head optimization: OPEN but SMALL (4.35 GB, ~10ms/token = 1.4% of 720ms)
+- Small tensor pre-conversion: BELOW NOISE (s4: norms+router total ~7.3 MB/layer, conversion <0.03ms/layer = 1.4ms/token = 0.2%)
+- Scratch buffer reuse: BELOW NOISE (s8: ~640 KB allocs/layer × 61 = 39 MB, alloc time ~92µs = 0.01%)
 - Profiling/instrumentation: DONE (s1-mla-profiling: per-component MLA timing via RUSTANE_MLA_PROFILE=1)
 
-## Suggested Next (pick from OPEN categories only, ranked by expected impact)
-1. [Profiling] Per-component MLA timing — instrument mla_forward_decode: W_qa, W_qb, W_kva, W_UK, W_UV, attn scores, value recon, O_proj individually. ~20 lines. Reveals real targets.
-2. [I/O] 2MB-aligned expert buffers — posix_memalign(buf, 2MB, size) for pread. Apple SSD DMA coalesces 2MB reads. ~10 lines. Could be 3.6x pread throughput.
-3. [Overlap] Overlap lm_head with next token — thread::scope lm_head ([151936,7168]=4.35GB, ~11ms) while background does embedding+norm for next token. Different data, no BW conflict. ~40 lines.
-4. [Memory] Pre-convert small tensors at load — convert norms, router, bias to f32 once at startup (~0.5 GB). Skip per-layer conversion for these. ~20 lines.
-5. [BLAS] Batch Q LoRA W_qa+W_qb — concatenate at load, one sgemm instead of two sequential sgemv. Save ~30µs/layer dispatch. ~30 lines.
-6. [Profiling] ExpertPool stats logging — wire pool.stats() into decode loop, log hit_rate/miss_count every 10 tokens. Don't cache yet, just measure. ~15 lines.
-7. [Compute] RMSNorm via NEON intrinsics — replace vDSP calls with inline float32x4_t. Avoid 0.5µs/call FFI overhead × 183 calls/token. ~40 lines.
-8. [Memory] Reuse attention scratch across layers — pre-allocate q[24576], kv_out[576], scores[128×seq] once, reuse. ~30 lines.
+## Suggested Next (ranked by expected impact)
+### ARCHITECTURAL CHANGES needed (>100 lines, needs design session):
+1. [Metal MLA kernel] Offload O projection + Q LoRA to Metal GPU with f16 native ops. O proj alone saves 2.1ms/layer (17% of total). GPU reads 235 MB f16 natively — no conversion overhead. HIGHEST IMPACT.
+2. [Metal shared expert] Run shared expert FFN on Metal with INT4 quantization (like MoE experts). Saves 4ms CPU/layer. Need separate INT4 weight packing for shared expert at model load.
+3. [INT8 O projection] Custom INT8 sgemv kernel: read 117.5 MB int8 + dequant on-the-fly. Halves O proj time. Needs calibration for quantization error.
 
-EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and allocation categories. The ideas above are from DIFFERENT categories mined from the full 43-file research corpus.
+### SMALL EXPERIMENTS remaining (<100 lines, all likely BELOW NOISE):
+- s3-lmhead-overlap: ANALYZED NOT VIABLE — nothing useful to overlap (embedding is 0.02ms)
+- s4-preconvert-small: 0.2% savings — below noise
+- s5-batch-qlora: NOT VIABLE — norm between W_qa and W_qb prevents batching
+- s6-pool-stats: profiling only
+- s7-rmsnorm-neon: 0.01% savings — below noise
+- s8-reuse-attn-scratch: 0.01% savings — below noise
+
+EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimization categories. Every remaining path to >3% improvement requires either: (a) Metal GPU compute for MLA components, (b) weight quantization with custom kernels, or (c) architectural changes to the pipeline. The autonomous optimization agent has reached diminishing returns for incremental optimizations.
 
 ## Iteration Log
 [iter 1] TIMEOUT at 60min — spent entire budget on diagnostic V3 benchmark. Never coded.
@@ -122,3 +130,5 @@ EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and alloc
 [iter 19] INSIGHT: Metal dispatch is NOT purely GPU compute. The Metal API has significant CPU-side overhead: command buffer creation, ObjC method dispatch, constant buffer HashMap allocation, scratch buffer memcpy, and waitUntilCompleted polling/spin. When this CPU overhead runs concurrently with Accelerate's internally-threaded sgemv, both compete for CPU cache, memory bandwidth, and thread scheduling priority. The high variance (0.80-1.26 across 3 runs) proves scheduler-dependent contention. This DEFINITIVELY closes the "overlap Metal with CPU" family: Metal dispatch must remain sequential after CPU work completes.
 [iter 20] RESULT: v3-sgemm-attention-v2 — KEPT, 1.31→1.39 tok/s (6.1%). Re-tested sgemm_nt/sgemm for attention scores and value reconstruction. Replaced scalar f64 per-head loops with batched BLAS calls. attn_scores+softmax dropped 883µs→5-22µs/layer (profiled). Also replaces 128 per-head allocs/layer with 2 batch allocs.
 [iter 20] INSIGHT: The SAME optimization that was NO EFFECT at baseline 0.8 (iter 4, 0.81 tok/s) became a measurable win at baseline 1.31 (+6.1%). Two factors explain this: (1) After cached-dense reduced per-layer time from 22ms to 13ms, MLA is now 36% of layer time (up from ~22%). The same absolute savings (~0.9ms/layer) becomes a larger percentage improvement. (2) The benchmark seq_len is ~20 (not ~5 as in iter 4), making the scalar f64 loop cost ~4x higher. This teaches: revisit previously-tested optimizations when the baseline changes significantly — the threshold for visibility drops as the total per-layer time shrinks.
+[iter 20] ANALYSIS: f16_par on HEAP micro-benchmark — sgemv_f16_par on heap-allocated f16 O projection [7168,16384] = 6.8x SLOWER than sgemv_f32 (13871µs vs 2039µs). The root cause is memory traffic amplification: f16→f32 conversion at 10 bytes/element vs f32 direct at 4 bytes/element. This is the DEFINITIVE closure of ALL f16 CPU compute paths — the issue is not data source (mmap vs heap) but the fundamental cost of f32 materialization through L2 for any path through Accelerate BLAS. Only Metal f16 native ops can avoid this.
+[iter 20] ANALYSIS: Remaining IDEA rows s3-s8 all below noise threshold: s3 has no useful overlap work (0.02ms embedding vs 10ms lm_head), s4 saves 0.2%/token, s5 can't batch (norm between W_qa/W_qb), s7 saves 0.01%, s8 saves 0.01%. ALL <100 line CPU-side optimizations are exhausted. Next gains require Metal GPU compute for MLA or weight quantization with custom kernels.
