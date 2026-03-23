@@ -360,6 +360,23 @@ struct LayerTiming {
     ffn_ms: f64,
 }
 
+/// Construct MLA attention weight borrows from pre-converted f32 layer.
+fn make_attn_weights(lf: &MlaLayerF32) -> MlaAttnWeights<'_> {
+    MlaAttnWeights {
+        q_proj: &lf.q_proj,
+        q_a_proj: lf.q_a_proj.as_deref(),
+        q_a_layernorm: lf.q_a_layernorm.as_deref(),
+        q_b_proj: lf.q_b_proj.as_deref(),
+        kv_a_proj: &lf.kv_a_proj,
+        kv_a_layernorm: &lf.kv_a_layernorm,
+        w_uk: &lf.w_uk,
+        w_uv: &lf.w_uv,
+        o_proj: &lf.o_proj,
+        input_norm: &lf.input_norm,
+        post_attn_norm: &lf.post_attn_norm,
+    }
+}
+
 /// Run one layer's compute given pre-converted f32 weights.
 /// This is the core compute path — no conversion, no allocation of weight buffers.
 fn run_layer_compute(
@@ -376,20 +393,7 @@ fn run_layer_compute(
 
     // 1. RMSNorm → MLA Attention → Residual
     let normed = rmsnorm(x, &lf.input_norm, eps);
-
-    let attn_weights = MlaAttnWeights {
-        q_proj: &lf.q_proj,
-        q_a_proj: lf.q_a_proj.as_deref(),
-        q_a_layernorm: lf.q_a_layernorm.as_deref(),
-        q_b_proj: lf.q_b_proj.as_deref(),
-        kv_a_proj: &lf.kv_a_proj,
-        kv_a_layernorm: &lf.kv_a_layernorm,
-        w_uk: &lf.w_uk,
-        w_uv: &lf.w_uv,
-        o_proj: &lf.o_proj,
-        input_norm: &lf.input_norm,
-        post_attn_norm: &lf.post_attn_norm,
-    };
+    let attn_weights = make_attn_weights(lf);
 
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
@@ -415,6 +419,53 @@ fn run_layer_compute(
     }
 
     Ok(residual)
+}
+
+/// MLA attention only — returns (residual_after_attn, normed2_for_ffn).
+/// Separated from FFN so the decode loop can defer convert(N+1) to overlap with
+/// FFN instead of MLA, avoiding memory bandwidth contention during sgemv calls.
+fn run_mla_only(
+    model: &ModelV2,
+    cache: &mut MlaKvCache,
+    layer: usize,
+    x: &[f32],
+    pos: usize,
+    lf: &MlaLayerF32,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let hidden = model.config.hidden_size();
+    let eps = model.config.rms_norm_eps();
+
+    let normed = rmsnorm(x, &lf.input_norm, eps);
+    let attn_weights = make_attn_weights(lf);
+    let attn_out = mla_forward_decode(
+        &normed, &attn_weights, cache, layer, pos,
+        &model.rope, &model.mla_config, model.attn_scale,
+    );
+
+    let mut residual = vec![0.0f32; hidden];
+    for d in 0..hidden { residual[d] = x[d] + attn_out[d]; }
+
+    let normed2 = rmsnorm(&residual, &lf.post_attn_norm, eps);
+    Ok((residual, normed2))
+}
+
+/// FFN only — adds FFN output into residual in place.
+fn run_ffn_only(
+    model: &ModelV2,
+    router: &mut MoeRouter,
+    layer: usize,
+    normed2: &[f32],
+    residual: &mut [f32],
+    lf: &MlaLayerF32,
+) -> Result<()> {
+    let hidden = model.config.hidden_size();
+    let ffn_out = if model.config.is_moe_layer(layer) {
+        moe_ffn_v2(model, router, layer, normed2, lf)?
+    } else {
+        dense_ffn(normed2, lf)
+    };
+    for d in 0..hidden { residual[d] += ffn_out[d]; }
+    Ok(())
 }
 
 /// Run one layer of the V2 model (MLA attention + FFN).
@@ -993,10 +1044,12 @@ pub fn generate_v2(
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // --- Decode (pipelined convert+compute, double-buffered) ---
-        // Overlap f16→f32 conversion of layer N+1 with compute of layer N.
-        // Uses std::thread::scope for safe scoped thread with zero unsafe code.
-        // Expected savings: ~7ms conversion hidden behind ~15ms compute per layer.
+        // --- Decode (deferred-convert pipeline, double-buffered) ---
+        // Key insight: MLA attention is memory-bandwidth-bound (sgemv reads ~750 MB f32).
+        // Running f16→f32 conversion concurrently steals ~50% of bandwidth from sgemv.
+        // Fix: run MLA attention FIRST with no background thread (full bandwidth),
+        // then overlap convert(N+1) with FFN (which uses Metal GPU + SSD pread,
+        // not competing for memory bandwidth).
         let t_decode = std::time::Instant::now();
         let mut pos = input_ids.len();
         let mut first_token_logged = false;
@@ -1009,31 +1062,33 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
 
-            // Pre-convert layer 0, then pipeline convert(N+1) with compute(N)
-            // Extract field refs so spawn closure doesn't capture &ModelV2 (which has !Sync Metal bufs)
+            // Extract field refs so spawn closure doesn't capture &ModelV2
             let weights_ref = &model.weights;
             let config_ref = &model.config;
             convert_layer_into(&mut buf_a, weights_ref, config_ref, 0)?;
             for layer in 0..num_layers {
+                // Phase 1: MLA attention — no background thread, full memory bandwidth
+                let (mut residual, normed2) = run_mla_only(
+                    model, &mut cache, layer, &x, pos, &buf_a,
+                )?;
+
+                // Phase 2: convert(N+1) overlapped with FFN
                 if layer + 1 < num_layers {
                     let next = layer + 1;
-                    x = std::thread::scope(|s| -> Result<Vec<f32>> {
+                    std::thread::scope(|s| -> Result<()> {
                         let h = s.spawn(|| {
                             convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
                         });
-                        let result = run_layer_compute(
-                            model, &mut cache, &mut router, layer, &x, pos, &buf_a,
-                        )?;
+                        run_ffn_only(model, &mut router, layer, &normed2, &mut residual, &buf_a)?;
                         h.join().unwrap()?;
-                        Ok(result)
+                        Ok(())
                     })?;
                     std::mem::swap(&mut buf_a, &mut buf_b);
                 } else {
-                    // Last layer: no next to pipeline
-                    x = run_layer_compute(
-                        model, &mut cache, &mut router, layer, &x, pos, &buf_a,
-                    )?;
+                    run_ffn_only(model, &mut router, layer, &normed2, &mut residual, &buf_a)?;
                 }
+
+                x = residual;
             }
             cache.advance();
 
