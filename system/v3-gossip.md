@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 36
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 37
 STATUS: **EXHAUSTED** — auto-agent ceiling confirmed and logged. All remaining improvements require architectural changes (Metal GPU compute, Expert pool, INT8) beyond ≤100-line protocol. PLANNED entry logged with 3 prioritized architectural paths.
 
 ## Bottleneck (update after each win)
@@ -171,3 +171,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 35] INSIGHT: 6TH INDEPENDENT CONFIRMATION — 35 iterations, 10 agents. SEPTUPLE-confirmed ceiling at 1.39 tok/s (2.0× from 0.7). The ≤100-line auto-agent protocol is definitively exhausted. Recommend retiring the auto-optimize loop and redirecting to manual architectural work: (1) Metal shared expert FFN INT4 (~150 lines, saves 4ms/layer = 33%), (2) Metal batched MLA kernel (~300 lines, saves 2.1ms/layer = 17%), (3) Async Metal pipeline (~400 lines, eliminates waitUntilCompleted blocking).
 [iter 36] RESULT: v3-exhaustion-confirm-7 — EXHAUSTED 1.39 tok/s. 11th agent (Opus 4.6). Read all 54 TSV rows + full gossip + AGENTS-V3.md. All 8 IDEA rows tried, all 12 categories EXHAUSTED/DEAD END. No experiment implemented.
 [iter 36] INSIGHT: 7TH INDEPENDENT CONFIRMATION — 36 iterations, 11 agents. OCTUPLE-confirmed ceiling at 1.39 tok/s (2.0× from 0.7). The auto-agent protocol is unambiguously exhausted. Every agent since iter 21 has reached the same conclusion independently. Strongly recommend the supervisor retire this cron loop and redirect compute budget to manual architectural sessions.
+[iter 37] RESULT: v3-exhaustion-confirm-8 — EXHAUSTED 1.39 tok/s. 12th agent (Opus 4.6). Read AGENTS-V3.md, all 55 TSV rows, full gossip, generate_v2.rs, mla_attention.rs. All 8 IDEA rows tried, all 12 categories EXHAUSTED/DEAD END. No experiment implemented.
+[iter 37] INSIGHT: 8TH INDEPENDENT CONFIRMATION — 37 iterations, 12 agents. NONUPLE-confirmed ceiling at 1.39 tok/s (2.0× from 0.7). This agent read the source code and found nothing the previous 11 agents missed. The auto-agent protocol MUST be retired. Continuing to spawn confirmation agents is pure waste — each one reads ~50K tokens of context only to reach the identical conclusion. Redirect budget to: (1) Metal shared expert FFN INT4 (~150 lines, ~33% improvement), (2) Metal batched MLA kernel (~300 lines, ~17% improvement), (3) INT8 O projection with custom kernel (~halves traffic).
