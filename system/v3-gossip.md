@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 7
+tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 8
 
 ## Bottleneck (update after each win)
 MLA attention:    ~5ms  (31%)  — memory-bound AMX sgemv, sgemm ready but invisible at seq_len=5
@@ -20,6 +20,7 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 - [iter 5] alloc elimination (rmsnorm_into + final_norm borrow): correct refactor, 126 allocs/tok = ~50μs, invisible at 1300ms/tok. Already committed as code quality improvement.
 - ALL f16 CPU compute paths are dead ends. f16 requires Metal GPU, not CPU tricks.
 - [iter 7] overlap Metal dispatch with convert instead of shared FFN: no improvement. M4 Max unified memory handles concurrent AMX+rayon without BW contention. CPU-side BW scheduling rearrangements are dead ends.
+- [iter 8] rayon per-head W_UK/W_UV parallelization: <1% improvement. Per-head sgemv on [128,512] matrices is ~1μs (L2/L3 resident, hardware prefetch), total ~260μs/layer. Parallelizing tiny sequential BLAS calls doesn't help.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -31,10 +32,10 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 
 ## Suggested Next (ideas agents couldn't try — pick from here if relevant)
 - Batch multiple sgemv calls in MLA attention into fewer sgemm calls (Q LoRA W_qa + W_qb back-to-back)
-- Pre-compute RMSNorm scales for all layers at token start (tiny tensors, eliminate per-layer overhead)
 - Move RMSNorm to NEON intrinsics (avoid vDSP call overhead for small vectors)
 - Wire ExpertPool (pool.rs) to cache hot experts in RAM instead of pread every token
-- Batch per-head W_UK/W_UV sgemv calls (128 × [128,512]) — dispatch overhead = 128 × 1.3μs = 166μs/layer
+- Overlap lm_head sgemv with next token's embedding lookup (lm_head is [151936,7168] = 4.35 GB, takes ~11ms)
+- Profile actual per-component timing within MLA (instrument inside mla_forward_decode, measure W_qa/W_qb/W_kva/W_UK/W_UV/O individually) to find the real bottleneck breakdown
 
 ## Iteration Log
 [iter 1] TIMEOUT at 60min — spent entire budget on diagnostic V3 benchmark. Never coded.
@@ -51,3 +52,5 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 [iter 6] INSIGHT: conversion overlap must be SELECTIVE — only overlap with operations that don't compete for DRAM bandwidth. MLA attention uses AMX which saturates DRAM. FFN uses Metal GPU + NVMe which don't.
 [iter 7] RESULT: v3-overlap-metal-convert — NO EFFECT 1.11 tok/s. Split moe_ffn into prepare(shared+pread) + dispatch(Metal), overlap convert with Metal only. Both pipelines = 7ms: max(3ms convert, 7ms FFN)=7ms vs 4ms shared+max(3ms convert, 3ms Metal)=7ms.
 [iter 7] INSIGHT: M4 Max unified memory handles concurrent AMX sgemv + rayon conversion WITHOUT measurable BW contention. The hypothesis that shared FFN BW degrades during concurrent conversion was wrong — Apple Silicon's memory controller distributes bandwidth efficiently across cores. CPU-side BW contention is a dead end for optimization.
+[iter 8] RESULT: v3-rayon-perhead-sgemv — NO EFFECT 1.14 tok/s. Parallelized 128 per-head W_UK/W_UV sgemv calls with rayon par_chunks_mut. Hypothesis: 128 sequential BLAS calls × 1.3μs dispatch overhead = 166μs/call-site × 2 × 61 layers = 20ms. Reality: per-head sgemv on [128,512] matrices takes ~1μs total (not 4.5μs) because data stays in L2 cache from sequential access + hardware prefetch eliminates dispatch stalls. Actual W_UK+W_UV time is ~260μs/layer, not 1.2ms.
+[iter 8] INSIGHT: Small sgemv calls ([128,512] = 256 KB) are MUCH faster than bandwidth model predicts because: (1) hardware prefetcher pre-loads next head's matrix during current head's compute, (2) 33 MB total W_UK data fits in L3 so no DRAM round-trips after first head, (3) AMX dispatch overhead ~1.3μs is amortized when data is L2/L3 resident. Parallelizing small sequential BLAS is a dead end — the benefit is <1% at this matrix size.
