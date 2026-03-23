@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 21
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 23
 STATUS: **EXHAUSTED** — auto-agent ceiling reached. All remaining improvements require architectural changes (Metal GPU compute, Expert pool, INT8) beyond ≤100-line protocol.
 
 ## Bottleneck (update after each win)
@@ -67,12 +67,12 @@ FFN total:        ~8.4ms (64%)
 - BLAS batching: EXHAUSTED (sgemm-attention win at 1.39 baseline; Q LoRA has norm between W_qa/W_qb, can't batch)
 - Metal GPU overlap: DEAD END (1 experiment — Metal API CPU overhead contends with concurrent sgemv)
 - Metal GPU compute: OPEN (dedicated Metal kernels for MLA untried — biggest untapped potential, needs arch session)
-- Expert caching/pool: OPEN (ExpertPool built, unwired — borderline: pread hidden by overlap)
+- Expert caching/pool: MEASURED (ExpertPool sim shows 90.6% hit rate, 0 evictions at cap=2000. Wiring cache won't help until pread exceeds shared FFN time — currently 1.5ms vs 4ms)
 - Memory layout: OPEN (INT8 KV cache in L2/L3 → no DRAM savings; INT8 weight quantization for O proj/Q proj theoretically halves traffic but needs custom sgemv_int8)
 - LM head optimization: OPEN but SMALL (4.35 GB, ~10ms/token = 1.4% of 720ms)
 - Small tensor pre-conversion: BELOW NOISE (s4: norms+router total ~7.3 MB/layer, conversion <0.03ms/layer = 1.4ms/token = 0.2%)
 - Scratch buffer reuse: BELOW NOISE (s8: ~640 KB allocs/layer × 61 = 39 MB, alloc time ~92µs = 0.01%)
-- Profiling/instrumentation: DONE (s1-mla-profiling: per-component MLA timing via RUSTANE_MLA_PROFILE=1)
+- Profiling/instrumentation: DONE (s1-mla-profiling: per-component MLA timing via RUSTANE_MLA_PROFILE=1, s6-pool-stats: ExpertPool simulation via RUSTANE_POOL_SIM=1)
 
 ## Suggested Next (ranked by expected impact)
 ### ARCHITECTURAL CHANGES needed (>100 lines, needs design session):
@@ -84,7 +84,7 @@ FFN total:        ~8.4ms (64%)
 - s3-lmhead-overlap: ANALYZED NOT VIABLE — nothing useful to overlap (embedding is 0.02ms)
 - s4-preconvert-small: CONFIRMED NO EFFECT (iter 22, 1.37 tok/s). Router conversion hidden by pipeline overlap headroom.
 - s5-batch-qlora: NOT VIABLE — norm between W_qa and W_qb prevents batching
-- s6-pool-stats: profiling only
+- s6-pool-stats: DONE (90.6% hit rate warm, 0 evictions at cap=2000)
 - s7-rmsnorm-neon: 0.01% savings — below noise
 - s8-reuse-attn-scratch: 0.01% savings — below noise
 
@@ -137,3 +137,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 21] INSIGHT: The auto-agent reached its ceiling at 1.39 tok/s (2.0× from 0.7 baseline) after 21 iterations across 11 categories. The 5 wins came from fundamentally different hardware resource overlap (CPU||SSD, CPU||GPU, cache elimination, BLAS batching). All remaining paths to 5+ tok/s require Metal GPU native f16 compute — this cannot be achieved within the ≤100 line incremental protocol and requires an architectural design session. KEY ARCHITECTURAL TARGETS: (1) Metal f16 sgemv for O projection saves 2.1ms/layer = 17%, (2) Metal shared expert FFN saves 4ms/layer = 33%, (3) combined Metal MLA+FFN saves ~50% theoretically, but requires ~300 lines of Metal shaders + dispatch code.
 [iter 22] RESULT: s4-preconvert-small — NO EFFECT 1.37 tok/s. Pre-converted router weights [256,7168] f16→f32 at load time (58 layers, 426 MB RAM). Median 1.37 across 3 runs. Router conversion (~0.012ms/layer) is fully hidden by pipeline overlap headroom. Confirms exhaustion analysis prediction.
 [iter 22] INSIGHT: Pipeline overlap thread has ~5ms headroom (FFN=7ms, total convert=1.5ms). Eliminating any sub-component of the conversion work cannot improve throughput because the pipeline thread already finishes before the main thread. Only optimizations that reduce MAIN THREAD work (MLA or FFN critical path) can produce measurable gains. This is the final confirmation that all pipeline-thread optimizations are exhausted.
+[iter 23] RESULT: s6-pool-stats — DIAGNOSTIC 1.36 tok/s. Added env-gated ExpertPool simulation (RUSTANE_POOL_SIM=1) using thread_local RefCell. Tracks routed expert IDs in moe_ffn_v2 decode loop, reports hit/miss/eviction stats after decode. Zero overhead when disabled. 4 unit tests added. Median 1.36 across 3 runs with pool disabled (within noise of 1.39 baseline).
+[iter 23] INSIGHT: ExpertPool sim data validates ~90% hit rate prediction: 90.6% warm (7989 hits, 827 misses), 89.9% cold (7924 hits, 892 misses), 0 evictions at cap=2000. All unique experts across 58 MoE layers × 8 top-k fit in 2000 slots without eviction. This means if ExpertPool is wired into actual pread caching, ~90% of expert loads could be served from RAM cache instead of SSD — but pread is already hidden by shared FFN overlap (1.5ms pread vs 4ms FFN). Expert caching only becomes valuable when pread exceeds FFN time (longer sequences, or after Metal offloads shared FFN to GPU).

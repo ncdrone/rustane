@@ -22,6 +22,21 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
+use std::cell::RefCell;
+
+/// Whether to run ExpertPool simulation (set RUSTANE_POOL_SIM=1).
+fn pool_sim_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_SIM").is_ok())
+}
+
+// Thread-local ExpertPool simulation for measuring decode-phase hit rates.
+// When Some, moe_ffn_v2 calls pool.request() for each routed expert (tracking only).
+// When None (default), no overhead. Gated by RUSTANE_POOL_SIM=1.
+thread_local! {
+    static POOL_SIM: RefCell<Option<ExpertPool>> = RefCell::new(None);
+}
+
 /// Pre-converted f32 MLA weights for one layer.
 pub struct MlaLayerF32 {
     pub q_proj: Vec<f32>,
@@ -774,6 +789,15 @@ fn moe_ffn_v2(
         router.route_softmax(&gate_logits)
     };
 
+    // Pool simulation: track which experts are routed (decode-phase only)
+    POOL_SIM.with(|p| {
+        if let Some(pool) = p.borrow_mut().as_mut() {
+            for &eid in &route.expert_ids {
+                pool.request(layer as u32, eid as u32);
+            }
+        }
+    });
+
     // 2. Shared experts (computed eagerly on non-pread path, overlapped with pread on pread path)
     let use_pread = model.expert_loaders.contains_key(&layer);
     let mut combined = if !use_pread {
@@ -1071,6 +1095,12 @@ pub fn generate_v2(
         // Fix: run MLA attention FIRST with no background thread (full bandwidth),
         // then overlap convert(N+1) with FFN (which uses Metal GPU + SSD pread,
         // not competing for memory bandwidth).
+
+        // Initialize ExpertPool simulation (RUSTANE_POOL_SIM=1 to enable).
+        if pool_sim_enabled() {
+            POOL_SIM.with(|p| *p.borrow_mut() = Some(ExpertPool::new(2000)));
+        }
+
         let t_decode = std::time::Instant::now();
         let mut pos = input_ids.len();
         let mut first_token_logged = false;
@@ -1142,6 +1172,19 @@ pub fn generate_v2(
             pos += 1;
         }
         let decode_secs = t_decode.elapsed().as_secs_f64();
+
+        // Log ExpertPool simulation results (if enabled)
+        if pool_sim_enabled() {
+            POOL_SIM.with(|p| {
+                if let Some(pool) = p.borrow().as_ref() {
+                    eprintln!("ExpertPool sim (cap=2000): hits={} misses={} rate={:.1}% evictions={}",
+                        pool.stats.hits, pool.stats.misses,
+                        pool.stats.hit_rate() * 100.0, pool.stats.evictions);
+                }
+                *p.borrow_mut() = None;
+            });
+        }
+
         (prefill_secs, decode_secs)
     } else {
         // --- Pre-converted path (small models like V2-Lite) ---
