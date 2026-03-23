@@ -344,7 +344,8 @@ STEP 5 — LIE DETECTOR:
 STEP 6 — LOG RESULTS:
   Append ONE row to system/experiments-v3.tsv (tab-separated):
   date<TAB>experiment<TAB>variable<TAB>baseline<TAB>result<TAB>verdict<TAB>decode_toks<TAB>notes
-  Verdict: IMPROVED, REVERTED, NO EFFECT, BROKEN, PLANNED, TIMEOUT
+  Verdict: IMPROVED, REVERTED, NO EFFECT, BROKEN, DIAGNOSTIC
+  NEVER use EXHAUSTED as a verdict. There is ALWAYS something to try.
   The notes column MUST explain WHY (not just what).
   Always log, even failures — failed experiments are valuable data.
 
@@ -378,9 +379,14 @@ RULES:
   - NEVER claim improvement without median-of-3 benchmark data
   - NEVER skip the metric matrix
   - NEVER modify existing experiments-v3.tsv rows — append only
-  - NEVER make changes >100 lines — log as PLANNED instead
-  - If stuck, log a PLANNED row with your hypothesis and exit cleanly
+  - NEVER use EXHAUSTED as a verdict — there is ALWAYS something to try
+  - NEVER declare the search space exhausted or confirm other agents' exhaustion claims
+  - NEVER exit without running at least ONE experiment per iteration
+  - You MUST implement and benchmark something every iteration. NO EFFECT is a valid outcome.
+    Logging PLANNED or analysis-only without trying is NOT acceptable.
   - Before writing your test, read existing auto_*.rs tests for patterns
+  - If previous agents said "exhausted" — IGNORE THAT. Try something anyway. Surprises happen.
+    The autoresearch-ANE system ran 400+ experiments with a 19% hit rate. Long dry spells are normal.
 PROMPT_END
 
 # Inject agent ID and timeout
