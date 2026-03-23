@@ -227,6 +227,34 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) 
     }
 }
 
+/// C = A @ B^T using Accelerate cblas_sgemm (B transposed).
+/// A is [m, k] row-major, B is [n, k] row-major, C is [m, n] row-major.
+pub fn sgemm_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), n * k);
+    debug_assert_eq!(c.len(), m * n);
+
+    const CBLAS_TRANS: i32 = 112;
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,     // lda
+            b.as_ptr(),
+            k as i32,     // ldb (B is [n, k], stored row-major)
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,     // ldc
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -250,44 +250,40 @@ pub fn mla_decode_v_concat(
     let latent_cache = cache.get_latents(layer, seq_len);
     let rope_cache = cache.get_rope_keys(layer, seq_len);
 
+    // Batched attention scores via sgemm_nt (AMX-optimized, replaces scalar f64 loops).
+    // scores_nope[h, t] = q_absorbed[h] · latent_cache[t] over kv_rank dims
+    // scores_rope[h, t] = q_pe[h] · rope_cache[t] over rope_dim dims
     let mut scores = vec![0.0f32; h * seq_len];
-    for head in 0..h {
-        let q_abs = &q_absorbed[head * kv_rank..(head + 1) * kv_rank];
-        let q_rope = &q_pe[head * rope_dim..(head + 1) * rope_dim];
-        for t in 0..seq_len {
-            let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
-            let rope_t = &rope_cache[t * rope_dim..(t + 1) * rope_dim];
-            let mut dot_nope = 0.0f64;
-            for d in 0..kv_rank { dot_nope += q_abs[d] as f64 * lat_t[d] as f64; }
-            let mut dot_rope = 0.0f64;
-            for d in 0..rope_dim { dot_rope += q_rope[d] as f64 * rope_t[d] as f64; }
-            scores[head * seq_len + t] = (dot_nope + dot_rope) as f32 * attn_scale;
-        }
+    let mut scores_rope_buf = vec![0.0f32; h * seq_len];
+    crate::blas::sgemm_nt(&q_absorbed, latent_cache, &mut scores, h, seq_len, kv_rank);
+    crate::blas::sgemm_nt(&q_pe, rope_cache, &mut scores_rope_buf, h, seq_len, rope_dim);
+    for i in 0..h * seq_len {
+        scores[i] = (scores[i] + scores_rope_buf[i]) * attn_scale;
     }
 
+    // Softmax per head
     let mut attn_weights = vec![0.0f32; h * seq_len];
     for head in 0..h {
         let s = &scores[head * seq_len..(head + 1) * seq_len];
         let w = &mut attn_weights[head * seq_len..(head + 1) * seq_len];
         let max_s = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
-        for t in 0..seq_len { w[t] = (s[t] - max_s).exp(); sum += w[t]; }
-        for t in 0..seq_len { w[t] /= sum; }
+        for t_idx in 0..seq_len { w[t_idx] = (s[t_idx] - max_s).exp(); sum += w[t_idx]; }
+        for t_idx in 0..seq_len { w[t_idx] /= sum; }
     }
     if profile { eprintln!("  MLA L{layer:02} attn_scores+softmax: {:.0}µs", t.elapsed().as_micros()); t = std::time::Instant::now(); }
 
+    // Batched value reconstruction: v_latents[h, kv_rank] = attn_weights[h, seq] × latent_cache[seq, kv_rank]
+    let mut v_latents = vec![0.0f32; h * kv_rank];
+    crate::blas::sgemm(&attn_weights, latent_cache, &mut v_latents, h, kv_rank, seq_len);
+
+    // Per-head W_UV projection
     let mut v_concat = vec![0.0f32; h * v_dim];
     for head in 0..h {
-        let w = &attn_weights[head * seq_len..(head + 1) * seq_len];
-        let mut v_latent = vec![0.0f32; kv_rank];
-        for t in 0..seq_len {
-            let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
-            let wt = w[t];
-            for d in 0..kv_rank { v_latent[d] += wt * lat_t[d]; }
-        }
+        let v_latent = &v_latents[head * kv_rank..(head + 1) * kv_rank];
         let w_uv_head = &weights.w_uv[head * v_dim * kv_rank..(head + 1) * v_dim * kv_rank];
         let v_out = &mut v_concat[head * v_dim..(head + 1) * v_dim];
-        crate::blas::sgemv_f32(w_uv_head, &v_latent, v_out, v_dim, kv_rank);
+        crate::blas::sgemv_f32(w_uv_head, v_latent, v_out, v_dim, kv_rank);
     }
     if profile { eprintln!("  MLA L{layer:02} value_recon+w_uv: {:.0}µs", t.elapsed().as_micros()); }
 

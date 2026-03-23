@@ -4,15 +4,15 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.31 | ms/layer: 13.2 | baseline: 0.7 | wins: 4 | iterations: 18
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 20
 
 ## Bottleneck (update after each win)
 ### Per-layer (13.2ms, warm decode, seq_len≈20):
 MLA total:        ~4.8ms (36%)  — MEASURED via s1-mla-profiling (RUSTANE_MLA_PROFILE=1)
   O projection:   ~2.1ms (44% of MLA) — sgemv [7168,16384] = 470 MB f32. LARGEST single component.
   Q LoRA:         ~0.9ms (20% of MLA) — W_qa [1536,7168] + norm + W_qb [24576,1536]
-  Attn scores:    ~0.9ms (19% of MLA) — scalar f64 loops, scales LINEARLY with seq_len
-  Value recon:    ~0.5ms (10% of MLA) — weighted sum + W_UV per-head sgemv
+  Attn scores:    ~0.01ms (0.2% of MLA) — sgemm_nt batched (was 0.9ms scalar f64, iter 20 win)
+  Value recon:    ~0.3ms (8% of MLA) — sgemm batched + W_UV per-head sgemv (was 0.5ms)
   W_UK absorb:    ~0.2ms (5% of MLA)  — 128 per-head sgemv_f32_trans
   KV compress:    ~0.1ms (2% of MLA)  — W_kva + norm + RoPE
 FFN total:        ~8.4ms (64%)
@@ -44,6 +44,8 @@ FFN total:        ~8.4ms (64%)
 - GENERAL: sgemv_f16_par CANNOT be used inside thread::scope that also spawns rayon pread work. The rayon global thread pool sees both workloads and cannot prioritize — I/O-blocked threads hold pool slots, starving CPU-bound chunks. This closes ALL variants of "f16_par inside pread overlap scope".
 - [iter 17] sgemv_f16_par for O projection during uncontested MLA phase: 50% REGRESSION (1.31→0.66 tok/s). Used sgemv_f16_par on f16 o_proj from mmap in run_mla_only (no background rayon). Replaced Accelerate's internally-threaded sgemv_f32 on pre-warmed f32 heap buffer. Even without rayon contention, mmap page-table overhead at 16 KB granularity for 235 MB data (~14700 page table walks) makes mmap reads fundamentally slower than heap reads for large sequential scans.
 - GENERAL: mmap access is ALWAYS slower than heap access for large weight matrices (>100 MB). mmap uses 16 KB pages (macOS), requiring ~14700 TLB/page-table entries for 235 MB vs contiguous heap memory that benefits from Accelerate's sequential access patterns. This is a FUNDAMENTAL platform limitation, not a warmth or contention issue. ALL paths that read f16 weights from backbone.bin mmap for compute are permanently closed. The ONLY viable f16 path is: copy f16 from mmap to heap buffer at pipeline time, then sgemv_f16_par on the heap buffer — but the copy + convert overhead negates savings.
+- [iter 19] overlap Metal expert dispatch (GPU) with shared_expert_ffn (CPU sgemv): 8.4% REGRESSION (1.31→1.20 tok/s median, high variance 0.80-1.26). Moved pread→Metal dispatch to background thread::scope, ran shared_FFN concurrently on main. Hypothesis: GPU and CPU use different hardware resources. Reality: Metal API has non-trivial CPU-side overhead (command buffer encoding, ObjC dispatch, constant buffer HashMap allocation, waitUntilCompleted polling/spin). This CPU footprint interferes with Accelerate's internally-threaded sgemv on the main thread. High variance across runs confirms thread scheduling interference.
+- GENERAL: Metal dispatch is NOT a pure GPU operation. It has significant CPU-side overhead from the Metal API (ObjC messaging, IOKit calls, buffer management, driver polling). Overlapping Metal dispatch with CPU-intensive work (sgemv, rayon) causes contention. Metal dispatch should remain SEQUENTIAL after CPU work completes. This closes the "overlap Metal with CPU" family of optimizations.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -59,8 +61,9 @@ FFN total:        ~8.4ms (64%)
 - Allocation elimination: EXHAUSTED (<50µs invisible at 940ms/token)
 - f16 CPU compute: DEAD END (7 experiments, needs Metal not CPU — includes f16 mmap direct read, f16_par inside pread scope, AND f16_par on uncontested mmap)
 - I/O alignment: EXHAUSTED (1 experiment — pread hidden by overlap, alignment cannot help)
-- BLAS batching: OPEN (sgemm-attention tried but invisible at seq_len=5; Q LoRA batching untried)
-- Metal GPU compute: OPEN (untried — biggest untapped potential, needs arch session)
+- BLAS batching: PARTIALLY EXHAUSTED (sgemm-attention now a win at 1.31 baseline; Q LoRA batching untried)
+- Metal GPU overlap: DEAD END (1 experiment — Metal API CPU overhead contends with concurrent sgemv)
+- Metal GPU compute: OPEN (dedicated Metal kernels for MLA untried — biggest untapped potential, needs arch session)
 - Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt; dense layer caching PROVEN effective)
 - Memory layout: OPEN (INT8 KV, f16 buffers untried)
 - LM head optimization: OPEN (4.35 GB, ~11ms/token)
@@ -115,3 +118,7 @@ EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and alloc
 [iter 17] INSIGHT: mmap access is ALWAYS slower than heap access for large weight matrices (>100 MB) on macOS. This is a FUNDAMENTAL platform limitation — 16 KB pages require ~14700 TLB/page-table entries for 235 MB vs contiguous heap memory that benefits from Accelerate's sequential access patterns. Not a warmth or contention issue. ALL paths that read f16 weights from backbone.bin mmap for compute are permanently closed. This DEFINITIVELY closes the f16 CPU compute category after 7 failed experiments across 5 iterations.
 [iter 18] RESULT: s2-2mb-aligned-bufs — NO EFFECT 1.30 tok/s. posix_memalign(2MB) for expert_staging buffer (~178 MB). Median 1.30 across 3 runs (13.2, 13.3, 13.1 ms/layer). Identical to baseline.
 [iter 18] INSIGHT: pread is fully hidden by shared FFN overlap (1.5ms pread vs 4ms shared FFN), so improved I/O alignment cannot affect the critical path. Also: macOS already promotes large anonymous mappings (>2MB) to superpages automatically — explicit 2MB posix_memalign provides no additional benefit over Vec's default 16KB alignment for a 178 MB buffer. This closes the "io-alignment" family: alignment only matters when I/O is on the critical path, which it isn't after the pread||FFN overlap (iter 5).
+[iter 19] RESULT: v3-overlap-metal-shared-ffn — REVERTED 1.20 tok/s (8.4% regression). Overlapped Metal expert dispatch (GPU, 3ms) with shared_expert_ffn (CPU sgemv, 4ms) via thread::scope. Background thread does pread→build ops→Metal dispatch while main thread does shared_FFN. Median 1.20 across 3 runs (1.20, 1.26, 0.80 tok/s). High variance confirms thread scheduling interference.
+[iter 19] INSIGHT: Metal dispatch is NOT purely GPU compute. The Metal API has significant CPU-side overhead: command buffer creation, ObjC method dispatch, constant buffer HashMap allocation, scratch buffer memcpy, and waitUntilCompleted polling/spin. When this CPU overhead runs concurrently with Accelerate's internally-threaded sgemv, both compete for CPU cache, memory bandwidth, and thread scheduling priority. The high variance (0.80-1.26 across 3 runs) proves scheduler-dependent contention. This DEFINITIVELY closes the "overlap Metal with CPU" family: Metal dispatch must remain sequential after CPU work completes.
+[iter 20] RESULT: v3-sgemm-attention-v2 — KEPT, 1.31→1.39 tok/s (6.1%). Re-tested sgemm_nt/sgemm for attention scores and value reconstruction. Replaced scalar f64 per-head loops with batched BLAS calls. attn_scores+softmax dropped 883µs→5-22µs/layer (profiled). Also replaces 128 per-head allocs/layer with 2 batch allocs.
+[iter 20] INSIGHT: The SAME optimization that was NO EFFECT at baseline 0.8 (iter 4, 0.81 tok/s) became a measurable win at baseline 1.31 (+6.1%). Two factors explain this: (1) After cached-dense reduced per-layer time from 22ms to 13ms, MLA is now 36% of layer time (up from ~22%). The same absolute savings (~0.9ms/layer) becomes a larger percentage improvement. (2) The benchmark seq_len is ~20 (not ~5 as in iter 4), making the scalar f64 loop cost ~4x higher. This teaches: revisit previously-tested optimizations when the baseline changes significantly — the threshold for visibility drops as the total per-layer time shrinks.
