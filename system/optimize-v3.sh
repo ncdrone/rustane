@@ -138,12 +138,13 @@ cleanup_on_exit() {
         wait "$WATCHDOG_PID" 2>/dev/null || true
     fi
     if [ -n "${CLAUDE_PID:-}" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
-        log "Killing claude process..."
+        log "Killing claude process (PID=$CLAUDE_PID)..."
         kill "$CLAUDE_PID" 2>/dev/null
         sleep 1
         kill -9 "$CLAUDE_PID" 2>/dev/null || true
     fi
-    pkill -f "claude.*dangerously-skip-permissions" 2>/dev/null || true
+    # NEVER pkill by pattern — it kills ALL claude processes including supervisor sessions.
+    # Always kill by specific PID only.
 }
 
 on_signal() {
