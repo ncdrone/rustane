@@ -104,6 +104,18 @@ Read this before modifying any system/ scripts. Updated after every incident.
 
 ---
 
+## L8: Check for merge conflict markers after worktree merge
+
+**Date:** 2026-03-22
+**Severity:** HIGH
+**Incident:** The worktree merge of v3-optimize into v3-opt/auto-alpha produced conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) in experiments-v3.tsv. Both branches had appended different rows to the same file. The script's `git merge --no-edit` silently left markers in the file. Agent would have read a corrupted TSV.
+
+**Fix:** After merge, check for conflict markers: `grep -l '<<<<<<' system/*.tsv system/*.md`. Resolve manually if found. Could also add this check to the script after the merge step.
+
+**Rule:** Always verify merge results in accumulating files (TSV, gossip). These are the most likely to conflict when both sides append.
+
+---
+
 ## General Principles
 
 1. **Stateless agents need filesystem memory.** Gossip files, experiment logs, and state files bridge the gap between invocations.
