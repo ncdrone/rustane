@@ -197,6 +197,8 @@ pub fn route_sigmoid_v3(
     let num_experts = gate_logits.len();
     assert_eq!(bias.len(), num_experts);
     assert_eq!(num_experts % n_group, 0);
+    assert!(topk_group <= n_group,
+        "topk_group ({topk_group}) > n_group ({n_group}) — K2 uses n_group=1, topk_group must be 1");
     let group_size = num_experts / n_group;
 
     // 1. Sigmoid scores (unbiased)
