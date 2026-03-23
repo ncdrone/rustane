@@ -11,6 +11,12 @@ use crate::config::InferConfig;
 use crate::rmsnorm::rmsnorm;
 use crate::yarn_rope::YarnRopeTables;
 
+/// Whether to emit per-component MLA timing (set RUSTANE_MLA_PROFILE=1).
+fn mla_profile_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RUSTANE_MLA_PROFILE").is_ok())
+}
+
 /// MLA configuration extracted from InferConfig.
 #[derive(Clone, Debug)]
 pub struct MlaDecodeConfig {
@@ -163,8 +169,10 @@ pub fn mla_forward_decode(
     let (v_concat, out_dim, v_total) = mla_decode_v_concat(
         x, weights, cache, layer, pos, rope, cfg, attn_scale,
     );
+    let t = std::time::Instant::now();
     let mut output = vec![0.0f32; out_dim];
     crate::blas::sgemv_f32(&weights.o_proj, &v_concat, &mut output, out_dim, v_total);
+    if mla_profile_enabled() { eprintln!("  MLA L{layer:02} o_proj: {:.0}µs", t.elapsed().as_micros()); }
     output
 }
 
@@ -186,6 +194,8 @@ pub fn mla_decode_v_concat(
     let v_dim = cfg.v_head_dim;
     let kv_rank = cfg.kv_lora_rank;
     let hidden = cfg.hidden_size;
+    let profile = mla_profile_enabled();
+    let mut t = std::time::Instant::now();
 
     // 1. Q projection (direct or LoRA)
     let q_total = h * (nope + rope_dim);
@@ -201,6 +211,7 @@ pub fn mla_decode_v_concat(
     } else {
         crate::blas::sgemv_f32(&weights.q_proj, x, &mut q, q_total, hidden);
     }
+    if profile { eprintln!("  MLA L{layer:02} q_proj: {:.0}µs", t.elapsed().as_micros()); t = std::time::Instant::now(); }
 
     let mut q_nope = vec![0.0f32; h * nope];
     let mut q_pe = vec![0.0f32; h * rope_dim];
@@ -225,6 +236,7 @@ pub fn mla_decode_v_concat(
     rope.apply(&mut k_pe, pos);
     cache.write(layer, pos, &kv_latent, &k_pe);
     let seq_len = pos + 1;
+    if profile { eprintln!("  MLA L{layer:02} kv_compress: {:.0}µs", t.elapsed().as_micros()); t = std::time::Instant::now(); }
 
     let mut q_absorbed = vec![0.0f32; h * kv_rank];
     for head in 0..h {
@@ -233,6 +245,7 @@ pub fn mla_decode_v_concat(
         let out = &mut q_absorbed[head * kv_rank..(head + 1) * kv_rank];
         crate::blas::sgemv_f32_trans(w_uk_head, q_head, out, kv_rank, nope);
     }
+    if profile { eprintln!("  MLA L{layer:02} w_uk_absorb: {:.0}µs", t.elapsed().as_micros()); t = std::time::Instant::now(); }
 
     let latent_cache = cache.get_latents(layer, seq_len);
     let rope_cache = cache.get_rope_keys(layer, seq_len);
@@ -261,6 +274,7 @@ pub fn mla_decode_v_concat(
         for t in 0..seq_len { w[t] = (s[t] - max_s).exp(); sum += w[t]; }
         for t in 0..seq_len { w[t] /= sum; }
     }
+    if profile { eprintln!("  MLA L{layer:02} attn_scores+softmax: {:.0}µs", t.elapsed().as_micros()); t = std::time::Instant::now(); }
 
     let mut v_concat = vec![0.0f32; h * v_dim];
     for head in 0..h {
@@ -275,6 +289,7 @@ pub fn mla_decode_v_concat(
         let v_out = &mut v_concat[head * v_dim..(head + 1) * v_dim];
         crate::blas::sgemv_f32(w_uv_head, &v_latent, v_out, v_dim, kv_rank);
     }
+    if profile { eprintln!("  MLA L{layer:02} value_recon+w_uv: {:.0}µs", t.elapsed().as_micros()); }
 
     (v_concat, hidden, h * v_dim)
 }

@@ -4,14 +4,23 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.31 | ms/layer: 13.2 | baseline: 0.7 | wins: 4 | iterations: 14
+tok/s: 1.31 | ms/layer: 13.2 | baseline: 0.7 | wins: 4 | iterations: 15
 
 ## Bottleneck (update after each win)
-MLA attention:    ~5ms  (31%)  — memory-bound AMX sgemv, sgemm ready but invisible at seq_len=5
-Metal dispatch:   ~3ms  (19%)  — GPU compute + waitUntilCompleted sync
-Residual compute: ~3ms  (19%)  — RMSNorm, routing, residuals
-Conversion:       ~2ms  (15%)  — hidden by pipeline overlap for MoE layers; zero for dense (cached f32)
-Expert pread:     ~1.5ms (11%) — hidden by shared FFN overlap (was 3ms serial)
+### Per-layer (13.2ms, warm decode, seq_len≈20):
+MLA total:        ~4.8ms (36%)  — MEASURED via s1-mla-profiling (RUSTANE_MLA_PROFILE=1)
+  O projection:   ~2.1ms (44% of MLA) — sgemv [7168,16384] = 470 MB f32. LARGEST single component.
+  Q LoRA:         ~0.9ms (20% of MLA) — W_qa [1536,7168] + norm + W_qb [24576,1536]
+  Attn scores:    ~0.9ms (19% of MLA) — scalar f64 loops, scales LINEARLY with seq_len
+  Value recon:    ~0.5ms (10% of MLA) — weighted sum + W_UV per-head sgemv
+  W_UK absorb:    ~0.2ms (5% of MLA)  — 128 per-head sgemv_f32_trans
+  KV compress:    ~0.1ms (2% of MLA)  — W_kva + norm + RoPE
+FFN total:        ~8.4ms (64%)
+  Shared FFN:     ~4ms   — 3× sgemv (gate+up+down)
+  Metal dispatch: ~3ms   — GPU compute + waitUntilCompleted sync
+  Residual+norm:  ~1ms   — RMSNorm × 2, routing, residual adds
+  Conversion:     ~2ms   — hidden by pipeline overlap for MoE; zero for dense (cached f32)
+  Expert pread:   ~1.5ms — hidden by shared FFN overlap
 
 ## Dead Ends (append-only — DO NOT RETRY these or variations of them)
 - [iter 2] manual NEON sgemv: 3x slower than AMX BLAS for [128,512]. AMX dispatch overhead only 1.3μs/call.
@@ -31,6 +40,8 @@ Expert pread:     ~1.5ms (11%) — hidden by shared FFN overlap (was 3ms serial)
 - GENERAL: Single-layer CPU-side "skip work" optimizations are below noise. Multi-layer caching can work when cumulative savings + systemic BW contention reduction cross the threshold (see iter 14: 15.9% from caching 3 dense layers vs 0.5% from caching 1).
 - [iter 13] f16 O projection from mmap via sgemv_f16_par: 24% REGRESSION (1.13→0.86 tok/s). Skipped o_proj f32 conversion, read 235 MB f16 directly from mmap instead of 470 MB pre-converted f32. Reality: pre-converted f32 buffer is warm in RAM from background pipeline thread; mmap f16 pages are cold (last accessed during previous token). The chunked rayon convert+sgemv on cold mmap pages incurs page faults and serialization that vastly outweigh the halved DRAM traffic. Additionally, sgemv_f16_par defeats Accelerate's internal multi-threading for large matrices (same issue as iter 11).
 - GENERAL: reading f16 weights from mmap on the critical path is ALWAYS slower than using pre-warmed f32 from the pipeline overlap buffer. The pipeline background thread (running during FFN) pre-faults and converts pages into hot RAM. Bypassing this to read cold mmap pages is a net loss even at half the data volume. This closes the "f16 mmap direct read" family of optimizations.
+- [iter 15] sgemv_f16_par for shared expert FFN from mmap: 39% REGRESSION (1.31→0.80 tok/s). Replaced shared_expert_ffn's sgemv_f32 with sgemv_f16_par reading f16 directly from mmap. The rayon tasks from sgemv_f16_par compete with pread rayon tasks inside thread::scope for the same global thread pool. 8 pread workers blocked on SSD I/O starve sgemv_f16_par chunks of CPU workers. Worse than iter 13 (o_proj) because shared expert FFN runs INSIDE the pread overlap scope, not outside it.
+- GENERAL: sgemv_f16_par CANNOT be used inside thread::scope that also spawns rayon pread work. The rayon global thread pool sees both workloads and cannot prioritize — I/O-blocked threads hold pool slots, starving CPU-bound chunks. This closes ALL variants of "f16_par inside pread overlap scope".
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -44,13 +55,13 @@ Expert pread:     ~1.5ms (11%) — hidden by shared FFN overlap (was 3ms serial)
 - CPU overlap/scheduling: EXHAUSTED (6 experiments, 3 wins then ceiling)
 - CPU parallelization: EXHAUSTED (4 experiments, Apple BLAS already multi-threads internally)
 - Allocation elimination: EXHAUSTED (<50µs invisible at 940ms/token)
-- f16 CPU compute: DEAD END (4 experiments, needs Metal not CPU — includes f16 mmap direct read)
+- f16 CPU compute: DEAD END (5 experiments, needs Metal not CPU — includes f16 mmap direct read AND f16_par inside pread scope)
 - BLAS batching: OPEN (sgemm-attention tried but invisible at seq_len=5; Q LoRA batching untried)
 - Metal GPU compute: OPEN (untried — biggest untapped potential, needs arch session)
 - Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt; dense layer caching PROVEN effective)
 - Memory layout: OPEN (INT8 KV, f16 buffers, 2MB alignment untried)
 - LM head optimization: OPEN (4.35 GB, ~11ms/token)
-- Profiling/instrumentation: OPEN (no per-component MLA breakdown exists)
+- Profiling/instrumentation: DONE (s1-mla-profiling: per-component MLA timing via RUSTANE_MLA_PROFILE=1)
 
 ## Suggested Next (pick from OPEN categories only, ranked by expected impact)
 1. [Profiling] Per-component MLA timing — instrument mla_forward_decode: W_qa, W_qb, W_kva, W_UK, W_UV, attn scores, value recon, O_proj individually. ~20 lines. Reveals real targets.
@@ -93,3 +104,7 @@ EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and alloc
 [iter 13] INSIGHT: The pipeline overlap buffer is a WARM CACHE — the background thread pre-faults and converts mmap pages into hot f32 during the FFN phase. Reading from this buffer is fast because pages are already in the TLB and L3. Reading f16 from mmap on the critical path bypasses this warm cache, hitting cold pages that need page faults + TLB misses. The 50% bandwidth reduction from f16 is completely negated by the page fault latency. This is the same fundamental issue as iter 4 (f16 bypass) but at a different level — not single-core conversion speed, but page cache warmth.
 [iter 14] RESULT: v3-cached-dense — KEPT, 1.13→1.31 tok/s (15.9%). Cached ALL 3 dense layers (0..first_k_dense_replace) permanently in f32 (~6.6 GB RAM). Modified warmup to pre-convert dense layers into cached_dense[]. Modified decode loop to use cached weights for dense layers, skip pipeline convert for dense-to-dense transitions. Median 1.31 across 3 runs (13.1, 13.2, 13.2 ms/layer).
 [iter 14] INSIGHT: Caching 1 dense layer (iter 12) was 0.5% = noise. Caching ALL 3 dense layers is 15.9% — a 32x larger effect than linear extrapolation (3 × 0.5% = 1.5%) would predict. The nonlinear amplification comes from: (1) eliminating dense-to-dense pipeline stalls where convert(N+1) ~10ms exceeds FFN(N) ~7ms, causing 3ms stalls × 2 transitions = 6ms, (2) eliminating 3 full rayon conversion tasks, reducing memory BW contention across ALL 61 layers (not just the 3 dense ones), (3) the serial convert(0) + stalls + BW contention are multiplicative, not additive. This teaches: small wins that individually test below noise can combine nonlinearly when they reduce systemic resource contention.
+[iter 15] RESULT: v3-shared-expert-f16-par — REVERTED 0.80 tok/s (39% regression). Replaced shared_expert_ffn's sgemv_f32 on pre-converted f32 buffer with sgemv_f16_par reading f16 from mmap. Expected 8-10% improvement from explicit rayon multi-core parallelism on 28 MB matrices below Accelerate's 100 MB auto-thread threshold. Got massive regression because sgemv_f16_par rayon tasks compete with pread rayon tasks inside thread::scope for the same global rayon thread pool.
+[iter 15] INSIGHT: The rayon global thread pool is a SHARED RESOURCE. Inside thread::scope, pread spawns 8 rayon tasks that block on SSD I/O (holding rayon worker threads hostage). sgemv_f16_par spawns 32 rayon conversion+compute tasks that need CPU workers. With 12 pool threads, 8 blocked on I/O leaves only 4 for sgemv chunks — worse than the original single-core sgemv_f32 which ran entirely on the main thread without touching rayon at all. KEY LESSON: never add rayon parallelism to the main thread's work inside a thread::scope where the spawned thread also uses rayon for I/O. The main thread's non-rayon work (sgemv_f32) was actually OPTIMAL because it didn't compete for pool resources.
+[iter 16] RESULT: s1-mla-profiling — DIAGNOSTIC 1.30 tok/s. Added env-gated per-component timing to mla_decode_v_concat (RUSTANE_MLA_PROFILE=1). Zero overhead when disabled. Median 1.30 across 3 runs (13.1, 13.1, 13.4 ms/layer). No regression.
+[iter 16] INSIGHT: MLA per-layer breakdown at seq_len≈20: o_proj 2110µs (44%), q_proj 947µs (20%), attn_scores+softmax 883µs (19%), value_recon+w_uv 471µs (10%), w_uk_absorb 237µs (5%), kv_compress 116µs (2%). Total MLA ~4.8ms = 36% of 13.2ms/layer. KEY FINDING: O projection is the single largest MLA component at 2.1ms/layer reading 470 MB f32. Attention scores (scalar f64 loops) scale linearly with seq_len — 883µs at seq_len=20 would become ~4ms at seq_len=100 and dominate MLA at longer contexts. The previously estimated "~5ms MLA" was close but now we know the internal distribution.
