@@ -39,7 +39,7 @@ MODEL="claude-opus-4-6"
 AGENT_ID="alpha"
 DRY_RUN=false
 SHOW_STATUS=false
-ITER_TIMEOUT_MIN=60
+ITER_TIMEOUT_MIN=120
 WORKTREE_BASE="/Users/dan/Dev/rustane-v3-auto"
 BASE_BRANCH="v3-optimize"
 RESEARCH_REPO="/Users/dan/Dev/rustane-research"
@@ -169,7 +169,12 @@ if ! git -C "$REPO_ROOT" show-ref --quiet "refs/heads/${BRANCH}"; then
     git -C "$REPO_ROOT" branch "$BRANCH" "${BASE_BRANCH}"
     log "Created branch ${BRANCH} from ${BASE_BRANCH}"
 else
-    log "Reusing existing branch ${BRANCH}"
+    # Fast-forward agent branch to pick up any new commits on base branch
+    log "Fast-forwarding ${BRANCH} to latest ${BASE_BRANCH}..."
+    git -C "$REPO_ROOT" checkout "$BRANCH" --quiet 2>/dev/null
+    git -C "$REPO_ROOT" merge "${BASE_BRANCH}" --ff-only --quiet 2>/dev/null || \
+        log "WARNING: could not fast-forward (diverged commits). Using existing branch as-is."
+    git -C "$REPO_ROOT" checkout - --quiet 2>/dev/null || true
 fi
 
 # Create worktree
@@ -251,6 +256,7 @@ Think: buffer sizes, loop ordering, BLAS call batching, threading parameters,
 allocation elimination, memory layout, constant tuning.
 
 STEP 1 — READ CONTEXT (do this first, do not skip):
+  - system/v3-gossip.md (READ THIS FIRST — what previous iterations learned, dead ends, insights, suggested experiments)
   - AGENTS-V3.md (THE source of truth — metric matrix, dead ends, bottlenecks, memory budget)
   - system/experiments-v3.tsv (every V3 experiment tried — do NOT repeat)
   - system/v3-phase2-optimize.md (ranked Phase 2 optimization targets)
@@ -328,13 +334,26 @@ STEP 6 — LOG RESULTS:
   The notes column MUST explain WHY (not just what).
   Always log, even failures — failed experiments are valuable data.
 
+STEP 6.5 — UPDATE GOSSIP:
+  Append to system/v3-gossip.md:
+  a) In "## Iteration Log" section, add:
+     [iter N] RESULT: <experiment> — <VERDICT> <tok/s>. <one-line WHY it worked or failed>
+  b) If you learned something non-obvious, add:
+     [iter N] INSIGHT: <what you learned that would help the next agent>
+  c) If your experiment changed the bottleneck breakdown, update "## Bottleneck"
+  d) If you confirmed a dead end, append to "## Dead Ends" with reasoning
+  e) If you thought of an experiment you couldn't try (scope/time), append to "## Suggested Next"
+  f) Update the tok/s and wins count in "## Current State"
+  IMPORTANT: always include the iteration reasoning, not just the verdict.
+  The next agent will read this to avoid repeating your mistakes.
+
 STEP 7 — COMMIT OR REVERT:
   If IMPROVED and all gates pass:
-    git add changed source + auto_*.rs test + system/experiments-v3.tsv
+    git add changed source + auto_*.rs test + system/experiments-v3.tsv + system/v3-gossip.md
     git commit -m "perf: <what> — <before> → <after> tok/s (<X>%)"
   If REVERTED/BROKEN/NO EFFECT:
     git checkout -- . (revert code + test)
-    git add system/experiments-v3.tsv
+    git add system/experiments-v3.tsv system/v3-gossip.md
     git commit -m "Log experiment: <name> (<verdict>)"
 
   Update status: echo "DONE: <verdict> <tok/s>" > /tmp/rustane-v3-status-%%AGENT_ID%%
@@ -417,7 +436,7 @@ ${INJECT_CONTENT}"
 
     # Run Claude
     log "Launching claude -p --model ${MODEL} ..."
-    echo "READING" > "$STATUSFILE"
+    echo "READING: context files (iter $i/$MAX_ITERS)" > "$STATUSFILE"
     set +e
     claude -p \
         --dangerously-skip-permissions \
@@ -447,9 +466,14 @@ ${INJECT_CONTENT}"
 
     if [ $CLAUDE_EXIT -ne 0 ]; then
         if [ $CLAUDE_EXIT -eq 137 ] || [ $CLAUDE_EXIT -eq 143 ]; then
-            log "Claude was killed (timeout). Reverting partial changes."
+            log "Claude was killed (timeout). Reverting partial changes (preserving experiments log)."
             cd "$WORKTREE"
+            # Preserve experiments + gossip before reverting — don't lose findings
+            cp "system/experiments-v3.tsv" "/tmp/rustane-v3-experiments-backup.tsv" 2>/dev/null || true
+            cp "system/v3-gossip.md" "/tmp/rustane-v3-gossip-backup.md" 2>/dev/null || true
             git checkout -- . 2>/dev/null || true
+            cp "/tmp/rustane-v3-experiments-backup.tsv" "system/experiments-v3.tsv" 2>/dev/null || true
+            cp "/tmp/rustane-v3-gossip-backup.md" "system/v3-gossip.md" 2>/dev/null || true
         else
             log "Claude exited with code $CLAUDE_EXIT."
         fi
@@ -457,9 +481,12 @@ ${INJECT_CONTENT}"
         continue
     fi
 
-    # Sync experiments-v3.tsv back to main repo
+    # Sync experiments + gossip back to main repo
     if [ -f "${WORKTREE}/system/experiments-v3.tsv" ]; then
         cp "${WORKTREE}/system/experiments-v3.tsv" "${REPO_ROOT}/system/experiments-v3.tsv" 2>/dev/null || true
+    fi
+    if [ -f "${WORKTREE}/system/v3-gossip.md" ]; then
+        cp "${WORKTREE}/system/v3-gossip.md" "${REPO_ROOT}/system/v3-gossip.md" 2>/dev/null || true
     fi
 
     # Check for consecutive reverts — auto-pause if thrashing
