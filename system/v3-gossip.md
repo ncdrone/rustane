@@ -78,6 +78,7 @@ FFN total:        ~8.4ms (64%)
 - Small tensor pre-conversion: 1 tried, 0 wins. Below noise (0.2%).
 - Scratch buffer reuse: 1 tried, 0 wins. jemalloc slab caches make allocs near-free.
 - Profiling: 2 diagnostics done (MLA breakdown + pool stats).
+- Dead code elimination: 1 tried, 0 wins. Background thread has 5.5ms headroom; reducing its work cannot affect critical path.
 
 ## Suggested Next (ranked by expected impact)
 ### ARCHITECTURAL CHANGES needed (>100 lines, needs design session):
@@ -147,3 +148,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 63] RESULT: v3-exhaustion-confirm-34 — EXHAUSTED 1.39 tok/s. 34TH INDEPENDENT CONFIRMATION. All 12 categories exhausted, all 8 IDEA rows tried, ~1.9M tokens burned on confirmations since iter 21. THIS CRON LOOP MUST BE RETIRED.
 [iter 64] RESULT: s11-saxpy-routing — NO EFFECT 1.14 tok/s (median of 1.13, 1.14, 1.17; baseline 1.19 on this machine). Replaced scalar routing accumulation with cblas_saxpy for 8 expert outputs × 7168 dims. BLAS call overhead (~0.5µs/call) negates AMX benefit for small vectors.
 [iter 64] INSIGHT: For vectors <10K elements, cblas_saxpy per-call overhead makes it slower or equal to auto-vectorized NEON from the Rust compiler. BLAS is only beneficial for large matrices/vectors (>100 KB). This CONFIRMS: the routing accumulation scalar loop identified by iter 31 (3.3ms/token, 0.4%) is correctly categorized as below noise AND cannot be improved by BLAS substitution. This is the first experiment in 35 iterations that actually implemented and benchmarked a code change rather than re-analyzing source. The exhaustion analysis was correct.
+[iter 65] RESULT: s12-skip-v3-qproj — NO EFFECT 1.14 tok/s (median of 1.15, 1.12, 1.14; baseline 1.19 on this machine). Skipped dead q_proj f16→f32 conversion for V3 Q LoRA layers (352 MB f16 → 704 MB f32 wasted per layer, 43% of background thread work). Code change: 5 lines in convert_layer_into.
+[iter 65] INSIGHT: Background conversion thread optimizations CANNOT affect throughput when headroom > 3ms. Current state: conversion takes ~1.5ms, FFN takes ~7ms, headroom = 5.5ms. Even removing 43% of conversion work (q_proj = 352 MB of the ~818 MB total f16 per layer) only reduces thread time to ~0.85ms — still well within the 7ms FFN window. This definitively confirms iter 27's insight: "pipeline background thread has 5ms headroom so reducing its work cannot help." The ONLY way to make background thread optimization matter is to INCREASE its work (e.g., prefetching data for future layers) or to reduce FFN time (which shrinks the overlap window). CLOSES "dead code elimination in conversion" category.
