@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 23
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | iterations: 24
 STATUS: **EXHAUSTED** — auto-agent ceiling reached. All remaining improvements require architectural changes (Metal GPU compute, Expert pool, INT8) beyond ≤100-line protocol.
 
 ## Bottleneck (update after each win)
@@ -50,6 +50,9 @@ FFN total:        ~8.4ms (64%)
 - [iter 20] sgemv_f16_par on HEAP data for O projection: 6.8x SLOWER than sgemv_f32 (micro-benchmark: 13871µs vs 2039µs for [7168,16384]). Even on contiguous heap memory with no mmap overhead and uncontested rayon, the f16→f32 chunked conversion creates 2.4x MORE total memory traffic per element: read 2B f16 from DRAM + write 4B f32 to L2 + read 4B f32 from L2 in sgemv = 10 bytes/element, vs 4 bytes/element for direct f32 sgemv. The sgemv_f16_par per-chunk Vec allocation (4 MB × 112 chunks = 448 MB allocation churn) adds further overhead.
 - GENERAL (DEFINITIVE): ALL CPU-based f16 compute paths are dead ends regardless of data source (mmap OR heap). The root cause is NOT mmap page tables, NOT rayon contention, NOT page warmth — it's the FUNDAMENTAL memory traffic amplification of f16→f32 conversion: any path through Accelerate's f32 BLAS requires materializing f32 data in at least L2, which adds 6+ bytes of traffic per element on top of the 2B f16 read. The ONLY viable f16 path is Metal GPU which processes f16 natively in register without f32 materialization.
 
+- [iter 24] overlap lm_head with pre-converting first MoE layer: NO EFFECT 1.37 tok/s. Hypothesis: move conversion from layer 2 dense FFN to lm_head phase to eliminate BW contention. Reality: lm_head sgemv (4.35 GB, Accelerate internally multi-threaded) experiences comparable BW contention from concurrent rayon conversion as dense FFN sgemv does. The contention is moved, not eliminated. Also: layer 2 conversion is only ~2ms out of ~8ms FFN, so the BW degradation (15% of 2ms = 0.3ms) is invisible at 720ms/token.
+- GENERAL: overlapping ANY sgemv (whether lm_head or dense FFN) with rayon f16→f32 conversion causes ~15% BW degradation during the overlap period. The degradation is symmetric — moving conversion from one sgemv to another doesn't help. This definitively closes "move conversion to different overlap target" optimizations.
+
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
 - [iter 5] pread || shared_FFN overlap: SSD I/O (NVMe controller) and memory BW (DRAM) don't compete. 5.8ms/layer saved.
@@ -69,7 +72,7 @@ FFN total:        ~8.4ms (64%)
 - Metal GPU compute: OPEN (dedicated Metal kernels for MLA untried — biggest untapped potential, needs arch session)
 - Expert caching/pool: MEASURED (ExpertPool sim shows 90.6% hit rate, 0 evictions at cap=2000. Wiring cache won't help until pread exceeds shared FFN time — currently 1.5ms vs 4ms)
 - Memory layout: OPEN (INT8 KV cache in L2/L3 → no DRAM savings; INT8 weight quantization for O proj/Q proj theoretically halves traffic but needs custom sgemv_int8)
-- LM head optimization: OPEN but SMALL (4.35 GB, ~10ms/token = 1.4% of 720ms)
+- LM head optimization: EXHAUSTED (s3: overlap lm_head with pre-convert first MoE layer → NO EFFECT 1.37, contention just moved not eliminated. No viable overlap target.)
 - Small tensor pre-conversion: BELOW NOISE (s4: norms+router total ~7.3 MB/layer, conversion <0.03ms/layer = 1.4ms/token = 0.2%)
 - Scratch buffer reuse: BELOW NOISE (s8: ~640 KB allocs/layer × 61 = 39 MB, alloc time ~92µs = 0.01%)
 - Profiling/instrumentation: DONE (s1-mla-profiling: per-component MLA timing via RUSTANE_MLA_PROFILE=1, s6-pool-stats: ExpertPool simulation via RUSTANE_POOL_SIM=1)
@@ -80,13 +83,13 @@ FFN total:        ~8.4ms (64%)
 2. [Metal shared expert] Run shared expert FFN on Metal with INT4 quantization (like MoE experts). Saves 4ms CPU/layer. Need separate INT4 weight packing for shared expert at model load.
 3. [INT8 O projection] Custom INT8 sgemv kernel: read 117.5 MB int8 + dequant on-the-fly. Halves O proj time. Needs calibration for quantization error.
 
-### SMALL EXPERIMENTS remaining (<100 lines, all likely BELOW NOISE):
-- s3-lmhead-overlap: ANALYZED NOT VIABLE — nothing useful to overlap (embedding is 0.02ms)
-- s4-preconvert-small: CONFIRMED NO EFFECT (iter 22, 1.37 tok/s). Router conversion hidden by pipeline overlap headroom.
+### SMALL EXPERIMENTS remaining (<100 lines, ALL EXHAUSTED):
+- s3-lmhead-overlap: TESTED NO EFFECT (iter 24, 1.37 tok/s). Overlap lm_head with pre-convert → BW contention moved, not eliminated.
+- s4-preconvert-small: TESTED NO EFFECT (iter 22, 1.37 tok/s). Router conversion hidden by pipeline overlap headroom.
 - s5-batch-qlora: NOT VIABLE — norm between W_qa and W_qb prevents batching
 - s6-pool-stats: DONE (90.6% hit rate warm, 0 evictions at cap=2000)
-- s7-rmsnorm-neon: 0.01% savings — below noise
-- s8-reuse-attn-scratch: 0.01% savings — below noise
+- s7-rmsnorm-neon: 0.01% savings — below noise (not worth implementing)
+- s8-reuse-attn-scratch: 0.01% savings — below noise (not worth implementing)
 
 EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimization categories. Every remaining path to >3% improvement requires either: (a) Metal GPU compute for MLA components, (b) weight quantization with custom kernels, or (c) architectural changes to the pipeline. The autonomous optimization agent has reached diminishing returns for incremental optimizations.
 
@@ -139,3 +142,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 22] INSIGHT: Pipeline overlap thread has ~5ms headroom (FFN=7ms, total convert=1.5ms). Eliminating any sub-component of the conversion work cannot improve throughput because the pipeline thread already finishes before the main thread. Only optimizations that reduce MAIN THREAD work (MLA or FFN critical path) can produce measurable gains. This is the final confirmation that all pipeline-thread optimizations are exhausted.
 [iter 23] RESULT: s6-pool-stats — DIAGNOSTIC 1.36 tok/s. Added env-gated ExpertPool simulation (RUSTANE_POOL_SIM=1) using thread_local RefCell. Tracks routed expert IDs in moe_ffn_v2 decode loop, reports hit/miss/eviction stats after decode. Zero overhead when disabled. 4 unit tests added. Median 1.36 across 3 runs with pool disabled (within noise of 1.39 baseline).
 [iter 23] INSIGHT: ExpertPool sim data validates ~90% hit rate prediction: 90.6% warm (7989 hits, 827 misses), 89.9% cold (7924 hits, 892 misses), 0 evictions at cap=2000. All unique experts across 58 MoE layers × 8 top-k fit in 2000 slots without eviction. This means if ExpertPool is wired into actual pread caching, ~90% of expert loads could be served from RAM cache instead of SSD — but pread is already hidden by shared FFN overlap (1.5ms pread vs 4ms FFN). Expert caching only becomes valuable when pread exceeds FFN time (longer sequences, or after Metal offloads shared FFN to GPU).
+[iter 24] RESULT: s3-lmhead-overlap — NO EFFECT 1.37 tok/s (median of 1.36, 1.37, 1.38). Overlapped lm_head sgemv (4.35 GB) with pre-converting first MoE layer (layer 3, ~1.1 GB f16) via thread::scope. Modified layer loop to skip conversion at dense→MoE transition when pre-converted. Expected to save ~0.3ms by eliminating BW contention during layer 2's dense FFN.
+[iter 24] INSIGHT: The BW contention from concurrent Accelerate sgemv + rayon f16→f32 conversion is approximately symmetric regardless of which sgemv is the "host." Moving the conversion from layer 2 FFN (1.58 GB sgemv) to lm_head (4.35 GB sgemv) just shifts the ~15% BW degradation from one location to another. The net token time is unchanged because: (a) the degradation percentage is similar for both sgemv targets, and (b) the conversion is only ~2ms out of a 720ms token, so any differential is <0.3ms = 0.04%. This CLOSES the "LM head optimization" category — there is no viable overlap target between tokens. ALL remaining IDEA rows (s5 NOT VIABLE: norm between projections; s7 0.01%; s8 0.01%) are below noise. 24 iterations have now exhausted ALL ≤100-line CPU-side optimization categories.
