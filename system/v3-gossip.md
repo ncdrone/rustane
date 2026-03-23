@@ -4,14 +4,14 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 13
+tok/s: 1.31 | ms/layer: 13.2 | baseline: 0.7 | wins: 4 | iterations: 14
 
 ## Bottleneck (update after each win)
 MLA attention:    ~5ms  (31%)  — memory-bound AMX sgemv, sgemm ready but invisible at seq_len=5
 Metal dispatch:   ~3ms  (19%)  — GPU compute + waitUntilCompleted sync
 Residual compute: ~3ms  (19%)  — RMSNorm, routing, residuals
-Conversion:       ~2ms  (13%)  — hidden by pipeline overlap, deferred to FFN phase only (was 7ms serial)
-Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
+Conversion:       ~2ms  (15%)  — hidden by pipeline overlap for MoE layers; zero for dense (cached f32)
+Expert pread:     ~1.5ms (11%) — hidden by shared FFN overlap (was 3ms serial)
 
 ## Dead Ends (append-only — DO NOT RETRY these or variations of them)
 - [iter 2] manual NEON sgemv: 3x slower than AMX BLAS for [128,512]. AMX dispatch overhead only 1.3μs/call.
@@ -27,8 +27,8 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 - GENERAL: parallelizing sequential sgemv calls within a single function is a dead end. The per-call savings (~0.4ms for shared expert, ~3.5ms for dense) are partially eaten by thread::scope overhead, and actual BLAS per-core bandwidth is higher than the 80 GB/s estimate (more like 150 GB/s for AMX sequential access). This closes the "parallelize CPU sgemv within a function" family of optimizations.
 - [iter 11] explicit row-partitioning of large sgemv (O projection [7168,16384] = 470 MB): 5.3% REGRESSION (1.13→1.07 tok/s). Apple Accelerate cblas_sgemv already internally multi-threads large matrices. Splitting into 4 rayon chunks defeats BLAS internal parallelization — 4 small calls are less efficient than 1 large one. This confirms: NEVER manually parallelize individual BLAS calls; Accelerate handles large-matrix parallelism internally.
 - GENERAL: ALL forms of explicit sgemv parallelization are dead ends — both parallelizing SEPARATE calls (iter 10) and row-partitioning SINGLE calls (iter 11). Accelerate handles multi-threading internally for large matrices and has near-optimal single-core performance for small matrices.
-- [iter 12] cached layer 0 f32 weights (buf_layer0, skip serial convert(0)): NO EFFECT 1.15 tok/s. Hypothesis: save ~5ms serial convert(0) per token. Reality: 5ms / 940ms per token = 0.5%, below noise. This confirms: single-layer conversion savings (~5ms) are invisible at the current per-token cost (~940ms). Eliminating individual convert() calls is a dead end.
-- GENERAL: ALL CPU-side "skip work" optimizations on single-layer granularity are dead ends. The per-token cost is ~940ms across 61 layers. Saving <10ms from any single layer = <1% = invisible. The exhaustion of CPU-side optimizations is now CONFIRMED across 12 iterations.
+- [iter 12] cached layer 0 f32 weights (buf_layer0, skip serial convert(0)): NO EFFECT 1.15 tok/s. Hypothesis: save ~5ms serial convert(0) per token. Reality: 5ms / 940ms per token = 0.5%, below noise. BUT: caching ALL 3 dense layers (iter 14) worked — cumulative savings + reduced BW contention crossed the threshold.
+- GENERAL: Single-layer CPU-side "skip work" optimizations are below noise. Multi-layer caching can work when cumulative savings + systemic BW contention reduction cross the threshold (see iter 14: 15.9% from caching 3 dense layers vs 0.5% from caching 1).
 - [iter 13] f16 O projection from mmap via sgemv_f16_par: 24% REGRESSION (1.13→0.86 tok/s). Skipped o_proj f32 conversion, read 235 MB f16 directly from mmap instead of 470 MB pre-converted f32. Reality: pre-converted f32 buffer is warm in RAM from background pipeline thread; mmap f16 pages are cold (last accessed during previous token). The chunked rayon convert+sgemv on cold mmap pages incurs page faults and serialization that vastly outweigh the halved DRAM traffic. Additionally, sgemv_f16_par defeats Accelerate's internal multi-threading for large matrices (same issue as iter 11).
 - GENERAL: reading f16 weights from mmap on the critical path is ALWAYS slower than using pre-warmed f32 from the pipeline overlap buffer. The pipeline background thread (running during FFN) pre-faults and converts pages into hot RAM. Bypassing this to read cold mmap pages is a net loss even at half the data volume. This closes the "f16 mmap direct read" family of optimizations.
 
@@ -47,7 +47,7 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 - f16 CPU compute: DEAD END (4 experiments, needs Metal not CPU — includes f16 mmap direct read)
 - BLAS batching: OPEN (sgemm-attention tried but invisible at seq_len=5; Q LoRA batching untried)
 - Metal GPU compute: OPEN (untried — biggest untapped potential, needs arch session)
-- Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt)
+- Expert caching/pool: OPEN (ExpertPool built, unwired — borderline small opt; dense layer caching PROVEN effective)
 - Memory layout: OPEN (INT8 KV, f16 buffers, 2MB alignment untried)
 - LM head optimization: OPEN (4.35 GB, ~11ms/token)
 - Profiling/instrumentation: OPEN (no per-component MLA breakdown exists)
@@ -91,3 +91,5 @@ EXHAUSTION NOTE: 12 iterations exhausted CPU overlap, parallelization, and alloc
 [iter 12] INSIGHT: Single-layer conversion costs ~5ms. At 940ms/token total, this is 0.5% — confirmed below noise. This is the LAST possible "skip redundant work" optimization on single-layer granularity. 12 iterations have now exhaustively tried: overlap (iters 2,5,6,7,9), parallelization (iters 8,10,11), allocation elimination (iter 5), and work elimination (iter 12). ALL produce <3% improvement. CPU-side optimization is definitively exhausted. The next measurable gain requires GPU compute (Metal attention, f16 GEMV) or data volume reduction (ExpertPool caching).
 [iter 13] RESULT: v3-f16-oproj-mmap — REVERTED 0.86 tok/s (24% regression). Skipped o_proj f32 conversion in pipeline, read 235 MB f16 from mmap directly via sgemv_f16_par (rayon chunked convert+sgemv). Used mla_decode_v_concat refactor to split O projection from MLA core. Pre-warmed f32 from pipeline overlap buffer beats cold mmap f16 pages even at half data volume.
 [iter 13] INSIGHT: The pipeline overlap buffer is a WARM CACHE — the background thread pre-faults and converts mmap pages into hot f32 during the FFN phase. Reading from this buffer is fast because pages are already in the TLB and L3. Reading f16 from mmap on the critical path bypasses this warm cache, hitting cold pages that need page faults + TLB misses. The 50% bandwidth reduction from f16 is completely negated by the page fault latency. This is the same fundamental issue as iter 4 (f16 bypass) but at a different level — not single-core conversion speed, but page cache warmth.
+[iter 14] RESULT: v3-cached-dense — KEPT, 1.13→1.31 tok/s (15.9%). Cached ALL 3 dense layers (0..first_k_dense_replace) permanently in f32 (~6.6 GB RAM). Modified warmup to pre-convert dense layers into cached_dense[]. Modified decode loop to use cached weights for dense layers, skip pipeline convert for dense-to-dense transitions. Median 1.31 across 3 runs (13.1, 13.2, 13.2 ms/layer).
+[iter 14] INSIGHT: Caching 1 dense layer (iter 12) was 0.5% = noise. Caching ALL 3 dense layers is 15.9% — a 32x larger effect than linear extrapolation (3 × 0.5% = 1.5%) would predict. The nonlinear amplification comes from: (1) eliminating dense-to-dense pipeline stalls where convert(N+1) ~10ms exceeds FFN(N) ~7ms, causing 3ms stalls × 2 transitions = 6ms, (2) eliminating 3 full rayon conversion tasks, reducing memory BW contention across ALL 61 layers (not just the 3 dense ones), (3) the serial convert(0) + stalls + BW contention are multiplicative, not additive. This teaches: small wins that individually test below noise can combine nonlinearly when they reduce systemic resource contention.

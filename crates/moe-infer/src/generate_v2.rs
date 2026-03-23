@@ -1018,13 +1018,28 @@ pub fn generate_v2(
         let mut buf_a = MlaLayerF32::empty();
         let mut buf_b = MlaLayerF32::empty();
 
+        // Cache dense layers (0..first_k_dense_replace) permanently in f32.
+        // Dense layers have large FFN weights ([18432,7168] × 3), making their
+        // f16→f32 conversion ~10ms — longer than FFN compute (~7ms). This causes
+        // the pipeline to stall waiting for conversion. Caching eliminates:
+        // 1. Serial convert(0) at start of each token (~10ms)
+        // 2. Convert stalls for dense-to-dense transitions (~3ms × 2)
+        let num_dense = model.config.ffn.first_k_dense_replace;
+        let mut cached_dense: Vec<MlaLayerF32> = (0..num_dense)
+            .map(|_| MlaLayerF32::empty())
+            .collect();
+
         // Warmup: pre-fault all backbone pages into page cache
         let t_warmup = std::time::Instant::now();
         for layer in 0..num_layers {
-            convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+            if layer < num_dense {
+                convert_layer_into(&mut cached_dense[layer], &model.weights, &model.config, layer)?;
+            } else {
+                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+            }
         }
-        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers)",
-            t_warmup.elapsed().as_secs_f64(), num_layers);
+        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers, cached {} dense)",
+            t_warmup.elapsed().as_secs_f64(), num_layers, num_dense);
 
         // --- Prefill ---
         let t_prefill = std::time::Instant::now();
@@ -1032,8 +1047,13 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
             for layer in 0..num_layers {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &buf_a)?;
+                let lf = if layer < num_dense {
+                    &cached_dense[layer]
+                } else {
+                    convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+                    &buf_a
+                };
+                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, lf)?;
             }
             cache.advance();
             if i == input_ids.len() - 1 {
@@ -1066,27 +1086,41 @@ pub fn generate_v2(
             // Extract field refs so spawn closure doesn't capture &ModelV2
             let weights_ref = &model.weights;
             let config_ref = &model.config;
-            convert_layer_into(&mut buf_a, weights_ref, config_ref, 0)?;
+            // No serial convert(0) — dense layers use cached_dense
             for layer in 0..num_layers {
+                // Use cached weights for dense layers, dynamic buffer for MoE
+                let lf: &MlaLayerF32 = if layer < num_dense {
+                    &cached_dense[layer]
+                } else {
+                    &buf_a
+                };
+
                 // Phase 1: MLA attention — no background thread, full memory bandwidth
                 let (mut residual, normed2) = run_mla_only(
-                    model, &mut cache, layer, &x, pos, &buf_a,
+                    model, &mut cache, layer, &x, pos, lf,
                 )?;
 
-                // Phase 2: convert(N+1) overlapped with FFN
+                // Phase 2: FFN, with optional convert(N+1) overlap
                 if layer + 1 < num_layers {
                     let next = layer + 1;
-                    std::thread::scope(|s| -> Result<()> {
-                        let h = s.spawn(|| {
-                            convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
-                        });
-                        run_ffn_only(model, &mut router, layer, &normed2, &mut residual, &buf_a)?;
-                        h.join().unwrap()?;
-                        Ok(())
-                    })?;
-                    std::mem::swap(&mut buf_a, &mut buf_b);
+                    if next < num_dense {
+                        // Next layer is cached — run FFN without background convert.
+                        // Avoids stalling on dense layer conversion (~10ms > FFN ~7ms).
+                        run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                    } else {
+                        // Next layer needs conversion — pipeline overlap
+                        std::thread::scope(|s| -> Result<()> {
+                            let h = s.spawn(|| {
+                                convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
+                            });
+                            run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                            h.join().unwrap()?;
+                            Ok(())
+                        })?;
+                        std::mem::swap(&mut buf_a, &mut buf_b);
+                    }
                 } else {
-                    run_ffn_only(model, &mut router, layer, &normed2, &mut residual, &buf_a)?;
+                    run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
                 }
 
                 x = residual;
