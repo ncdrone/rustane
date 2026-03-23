@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | experiments: 44
+tok/s: 1.39 | ms/layer: 12.5 | baseline: 0.7 | wins: 5 | experiments: 45
 NOTE: there is ALWAYS something to try. 400+ experiment systems find wins at 19% rate with long dry spells between. Never declare exhaustion.
 
 ## Bottleneck (update after each win)
@@ -55,6 +55,7 @@ FFN total:        ~8.4ms (64%)
 - [iter 20] sgemv_f16_par on HEAP data for O projection: 6.8x SLOWER than sgemv_f32 (micro-benchmark: 13871µs vs 2039µs for [7168,16384]). Even on contiguous heap memory with no mmap overhead and uncontested rayon, the f16→f32 chunked conversion creates 2.4x MORE total memory traffic per element: read 2B f16 from DRAM + write 4B f32 to L2 + read 4B f32 from L2 in sgemv = 10 bytes/element, vs 4 bytes/element for direct f32 sgemv. The sgemv_f16_par per-chunk Vec allocation (4 MB × 112 chunks = 448 MB allocation churn) adds further overhead.
 - GENERAL (DEFINITIVE): ALL CPU-based f16 compute paths are dead ends regardless of data source (mmap OR heap). The root cause is NOT mmap page tables, NOT rayon contention, NOT page warmth — it's the FUNDAMENTAL memory traffic amplification of f16→f32 conversion: any path through Accelerate's f32 BLAS requires materializing f32 data in at least L2, which adds 6+ bytes of traffic per element on top of the 2B f16 read. The ONLY viable f16 path is Metal GPU which processes f16 natively in register without f32 materialization.
 
+- [iter 73] vecLib vvexpf+vDSP_vmul for SiLU activation: NO EFFECT 1.35 tok/s. SiLU operates on L1-resident vectors (2048-18432 elements), scalar exp() already near-optimal from LLVM auto-vectorization at -O3. Total SiLU time ~1.8ms/token = 0.2%, vectorized saves 0.12%. CLOSES "vecLib intrinsics for non-BLAS activation functions" path.
 - [iter 24] overlap lm_head with pre-converting first MoE layer: NO EFFECT 1.37 tok/s. Hypothesis: move conversion from layer 2 dense FFN to lm_head phase to eliminate BW contention. Reality: lm_head sgemv (4.35 GB, Accelerate internally multi-threaded) experiences comparable BW contention from concurrent rayon conversion as dense FFN sgemv does. The contention is moved, not eliminated. Also: layer 2 conversion is only ~2ms out of ~8ms FFN, so the BW degradation (15% of 2ms = 0.3ms) is invisible at 720ms/token.
 - GENERAL: overlapping ANY sgemv (whether lm_head or dense FFN) with rayon f16→f32 conversion causes ~15% BW degradation during the overlap period. The degradation is symmetric — moving conversion from one sgemv to another doesn't help. This definitively closes "move conversion to different overlap target" optimizations.
 
@@ -86,6 +87,7 @@ FFN total:        ~8.4ms (64%)
 - Scratch buffer reuse: 1 tried, 0 wins. jemalloc slab caches make allocs near-free.
 - Profiling: 2 diagnostics done (MLA breakdown + pool stats).
 - Dead code elimination: 1 tried, 0 wins. Background thread has 5.5ms headroom; reducing its work cannot affect critical path.
+- vecLib intrinsics (non-BLAS): 1 tried, 0 wins. SiLU vectorization via vvexpf+vDSP_vmul saves ~0.9ms/token (0.12%), far below noise.
 
 ## Suggested Next (ranked by expected impact)
 ### ARCHITECTURAL CHANGES needed (>100 lines, needs design session):
@@ -173,3 +175,5 @@ EXHAUSTION NOTE: 20 iterations have now exhausted ALL <100 line CPU-side optimiz
 [iter 71] INSIGHT: Attention score computation at seq_len≈20 is already negligible (0.01ms/layer after iter 20's sgemm batching). Eliminating one allocation (10 KB) and one 2560-element loop saves ~0.05µs/layer = 3µs/token = 0.0004%. BLAS alpha/beta parameter fusion is mathematically correct but provides zero measurable benefit when the operation is already <1% of layer time. The sgemm_nt_ab function IS useful infrastructure for future work at longer seq_lens (>1000) where attention dominates. CLOSES "fuse attention score scale" path at short seq_len. The code is clean but NOT worth committing for pure performance — would only commit as code quality improvement.
 [iter 72] RESULT: s20-sgemm-oproj — NO EFFECT 1.33 tok/s (median of 1.30, 1.33, 1.35 warm). Used cblas_sgemm(M=7168,N=1,K=16384) instead of cblas_sgemv for O projection (470MB f32, largest single MLA component at 2.1ms/layer). 4 correctness tests passed (exact match <1e-5). No per-phase timing change.
 [iter 72] INSIGHT: Accelerate's sgemm with degenerate N=1 produces identical timing to sgemv — confirming that Accelerate detects the K=1 case and dispatches to the same internal sgemv codepath. There is no "hidden" BLAS-3 optimization path for matrix-vector operations accessed through sgemm instead of sgemv. CLOSES "BLAS routine selection" as an optimization vector. For the O projection (and all other sgemv calls), the ONLY path to faster execution is reducing data volume (INT8 quantization, f16 via Metal GPU natively) — not changing which BLAS entry point we call.
+[iter 73] RESULT: s21-veclib-silu — NO EFFECT 1.35 tok/s (median of 1.32, 1.36, 1.35 warm; baseline 1.39). Replaced 4 scalar SiLU loops with Accelerate vvexpf (vectorized NEON 4-wide exp) + vDSP_vmul in blas::silu_and_mul(). 4 correctness tests passed. SiLU total ~1.8ms/token (0.2%), vectorized exp saves ~50% = 0.9ms = 0.12%, far below noise.
+[iter 73] INSIGHT: Non-BLAS activation functions (SiLU, GELU, etc.) are negligible in the decode pipeline. The shared expert SiLU operates on 2048 elements (~8 KB), dense FFN on 18432 (~72 KB) — both L1-resident. At these sizes, scalar f32::exp() already runs at ~2ns/element (NEON auto-vectorized by LLVM -O3), so vvexpf's explicit SIMD provides at best 2-4× on the exp() portion, which is a fraction of the total SiLU (negate, exp, add, divide, multiply). Total savings: ~15µs/layer × 61 layers = ~0.9ms/token out of 760ms. CLOSES "vecLib intrinsics for non-BLAS activation functions" path. ALL element-wise activation functions are L1-bandwidth-bound at these vector sizes and already near-optimal from LLVM auto-vectorization.
