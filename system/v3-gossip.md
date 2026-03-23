@@ -4,7 +4,7 @@
 # this file has WHY things worked or failed.
 
 ## Current State
-tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 8
+tok/s: 1.13 | ms/layer: 15.2 | baseline: 0.7 | wins: 3 | iterations: 9
 
 ## Bottleneck (update after each win)
 MLA attention:    ~5ms  (31%)  — memory-bound AMX sgemv, sgemm ready but invisible at seq_len=5
@@ -21,6 +21,8 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 - ALL f16 CPU compute paths are dead ends. f16 requires Metal GPU, not CPU tricks.
 - [iter 7] overlap Metal dispatch with convert instead of shared FFN: no improvement. M4 Max unified memory handles concurrent AMX+rayon without BW contention. CPU-side BW scheduling rearrangements are dead ends.
 - [iter 8] rayon per-head W_UK/W_UV parallelization: <1% improvement. Per-head sgemv on [128,512] matrices is ~1μs (L2/L3 resident, hardware prefetch), total ~260μs/layer. Parallelizing tiny sequential BLAS calls doesn't help.
+- [iter 9] overlap convert(layer 0) with last layer's FFN: no improvement. Last layer (60) is dense FFN (CPU sgemv), not MoE. Rayon convert threads compete for same CPU memory bandwidth as dense sgemv. The ~2.5ms saved from skipping serial convert(0) is eaten by BW contention during dense FFN.
+- GENERAL: overlap only works when the two tasks use DIFFERENT hardware resources. Dense FFN + rayon convert = both CPU memory bandwidth = contention. This closes the "overlap within same resource" family of ideas.
 
 ## What Works (proven patterns — build on these)
 - [iter 2] thread::scope overlap: 21μs overhead per scope, can hide up to 7ms of work. Key: the overlapped work must use a DIFFERENT hardware resource than the main thread.
@@ -54,3 +56,5 @@ Expert pread:     ~2ms  (13%)  — hidden by shared FFN overlap (was 3ms serial)
 [iter 7] INSIGHT: M4 Max unified memory handles concurrent AMX sgemv + rayon conversion WITHOUT measurable BW contention. The hypothesis that shared FFN BW degrades during concurrent conversion was wrong — Apple Silicon's memory controller distributes bandwidth efficiently across cores. CPU-side BW contention is a dead end for optimization.
 [iter 8] RESULT: v3-rayon-perhead-sgemv — NO EFFECT 1.14 tok/s. Parallelized 128 per-head W_UK/W_UV sgemv calls with rayon par_chunks_mut. Hypothesis: 128 sequential BLAS calls × 1.3μs dispatch overhead = 166μs/call-site × 2 × 61 layers = 20ms. Reality: per-head sgemv on [128,512] matrices takes ~1μs total (not 4.5μs) because data stays in L2 cache from sequential access + hardware prefetch eliminates dispatch stalls. Actual W_UK+W_UV time is ~260μs/layer, not 1.2ms.
 [iter 8] INSIGHT: Small sgemv calls ([128,512] = 256 KB) are MUCH faster than bandwidth model predicts because: (1) hardware prefetcher pre-loads next head's matrix during current head's compute, (2) 33 MB total W_UK data fits in L3 so no DRAM round-trips after first head, (3) AMX dispatch overhead ~1.3μs is amortized when data is L2/L3 resident. Parallelizing small sequential BLAS is a dead end — the benefit is <1% at this matrix size.
+[iter 9] RESULT: v3-overlap-convert0-lastlayer — NO EFFECT 1.1 tok/s. Overlap convert(layer 0) with last layer (60) FFN via thread::scope, pre-warming buf_a for next token to skip serial convert(0). Hypothesis: save ~2.5ms per token. Reality: layer 60 is dense FFN (CPU sgemv, not MoE Metal+pread), so rayon convert threads compete for CPU memory bandwidth with dense sgemv. Net effect zero.
+[iter 9] INSIGHT: The overlap pattern ONLY works when the two concurrent tasks use different hardware resources. Dense FFN layers use CPU memory bandwidth (same as rayon conversion). MoE layers use Metal GPU + NVMe (different from rayon conversion). This definitively closes the "rearrange CPU overlap timing" family of optimizations — all remaining improvements require architectural changes (ExpertPool, Metal attention kernel, f16 compute path).
