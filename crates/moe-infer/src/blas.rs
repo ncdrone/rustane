@@ -99,6 +99,31 @@ pub fn sgemv_f16(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: us
     }
 }
 
+/// y = W @ x where W is f16 — multi-threaded chunked convert+sgemv.
+///
+/// Each rayon thread converts its chunk of rows from f16→f32 into an L2-resident
+/// buffer, then runs AMX-optimized sgemv on the chunk. Reads half the DRAM bytes
+/// vs pre-converted f32 path, with full multi-core parallelism.
+/// Use for large matrices (>100 MB) where DRAM bandwidth is the bottleneck.
+pub fn sgemv_f16_par(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    use rayon::prelude::*;
+    use half::slice::HalfFloatSliceExt;
+    debug_assert_eq!(w.len(), out_dim * in_dim);
+    debug_assert_eq!(x.len(), in_dim);
+    debug_assert_eq!(y.len(), out_dim);
+
+    const CHUNK_ROWS: usize = 64; // 64 × 16384 × 4B = 4 MB — fits in L2
+
+    y.par_chunks_mut(CHUNK_ROWS).enumerate().for_each(|(ci, y_chunk)| {
+        let chunk_start = ci * CHUNK_ROWS;
+        let chunk_rows = y_chunk.len();
+        let mut buf = vec![0.0f32; chunk_rows * in_dim];
+        let w_start = chunk_start * in_dim;
+        w[w_start..w_start + chunk_rows * in_dim].convert_to_f32_slice(&mut buf);
+        sgemv_f32(&buf, x, y_chunk, chunk_rows, in_dim);
+    });
+}
+
 /// y = W^T @ x where W is f16 — chunked convert+sgemv_trans.
 pub fn sgemv_f16_trans(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
     debug_assert_eq!(w.len(), in_dim * out_dim);
@@ -196,6 +221,34 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) 
             b.as_ptr(),
             n as i32,     // ldb
             0.0,          // beta
+            c.as_mut_ptr(),
+            n as i32,     // ldc
+        );
+    }
+}
+
+/// C = A @ B^T using Accelerate cblas_sgemm (B transposed).
+/// A is [m, k] row-major, B is [n, k] row-major, C is [m, n] row-major.
+pub fn sgemm_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), n * k);
+    debug_assert_eq!(c.len(), m * n);
+
+    const CBLAS_TRANS: i32 = 112;
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,     // lda
+            b.as_ptr(),
+            k as i32,     // ldb (B is [n, k], stored row-major)
+            0.0,
             c.as_mut_ptr(),
             n as i32,     // ldc
         );

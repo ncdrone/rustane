@@ -22,6 +22,21 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
+use std::cell::RefCell;
+
+/// Whether to run ExpertPool simulation (set RUSTANE_POOL_SIM=1).
+fn pool_sim_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_SIM").is_ok())
+}
+
+// Thread-local ExpertPool simulation for measuring decode-phase hit rates.
+// When Some, moe_ffn_v2 calls pool.request() for each routed expert (tracking only).
+// When None (default), no overhead. Gated by RUSTANE_POOL_SIM=1.
+thread_local! {
+    static POOL_SIM: RefCell<Option<ExpertPool>> = RefCell::new(None);
+}
+
 /// Pre-converted f32 MLA weights for one layer.
 pub struct MlaLayerF32 {
     pub q_proj: Vec<f32>,
@@ -247,12 +262,14 @@ impl ModelV2 {
     }
 }
 
-/// Fill dst Vec from f16 src using parallel chunk conversion.
+/// Fill dst Vec from f16 src using parallel bulk NEON conversion.
 /// Reuses existing Vec capacity (zero allocs after first call).
-/// For large tensors, splits across multiple threads via rayon.
+/// Uses half's convert_to_f32_slice (FCVTL: 4 f16→4 f32 per instruction)
+/// instead of per-element to_f32 (scalar fcvt + runtime detection overhead).
 #[inline]
 fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
     use rayon::prelude::*;
+    use half::slice::HalfFloatSliceExt;
     let n = src.len();
     dst.clear();
     if dst.capacity() < n {
@@ -262,18 +279,13 @@ fn fill_f32(dst: &mut Vec<f32>, src: &[f16]) {
 
     const PAR_THRESHOLD: usize = 500_000; // ~1 MB f16 = worth parallelizing
     if n >= PAR_THRESHOLD {
-        // Parallel conversion: split into chunks, each core converts a chunk
+        // Parallel conversion: each rayon thread uses vectorized FCVTL on its chunk
         dst.par_chunks_mut(256 * 1024).enumerate().for_each(|(chunk_idx, chunk)| {
             let base = chunk_idx * 256 * 1024;
-            for i in 0..chunk.len() {
-                chunk[i] = src[base + i].to_f32();
-            }
+            src[base..base + chunk.len()].convert_to_f32_slice(chunk);
         });
     } else {
-        let dst_s = dst.as_mut_slice();
-        for i in 0..n {
-            dst_s[i] = src[i].to_f32();
-        }
+        src.convert_to_f32_slice(dst.as_mut_slice());
     }
 }
 
@@ -363,6 +375,23 @@ struct LayerTiming {
     ffn_ms: f64,
 }
 
+/// Construct MLA attention weight borrows from pre-converted f32 layer.
+fn make_attn_weights(lf: &MlaLayerF32) -> MlaAttnWeights<'_> {
+    MlaAttnWeights {
+        q_proj: &lf.q_proj,
+        q_a_proj: lf.q_a_proj.as_deref(),
+        q_a_layernorm: lf.q_a_layernorm.as_deref(),
+        q_b_proj: lf.q_b_proj.as_deref(),
+        kv_a_proj: &lf.kv_a_proj,
+        kv_a_layernorm: &lf.kv_a_layernorm,
+        w_uk: &lf.w_uk,
+        w_uv: &lf.w_uv,
+        o_proj: &lf.o_proj,
+        input_norm: &lf.input_norm,
+        post_attn_norm: &lf.post_attn_norm,
+    }
+}
+
 /// Run one layer's compute given pre-converted f32 weights.
 /// This is the core compute path — no conversion, no allocation of weight buffers.
 fn run_layer_compute(
@@ -379,20 +408,7 @@ fn run_layer_compute(
 
     // 1. RMSNorm → MLA Attention → Residual
     let normed = rmsnorm(x, &lf.input_norm, eps);
-
-    let attn_weights = MlaAttnWeights {
-        q_proj: &lf.q_proj,
-        q_a_proj: lf.q_a_proj.as_deref(),
-        q_a_layernorm: lf.q_a_layernorm.as_deref(),
-        q_b_proj: lf.q_b_proj.as_deref(),
-        kv_a_proj: &lf.kv_a_proj,
-        kv_a_layernorm: &lf.kv_a_layernorm,
-        w_uk: &lf.w_uk,
-        w_uv: &lf.w_uv,
-        o_proj: &lf.o_proj,
-        input_norm: &lf.input_norm,
-        post_attn_norm: &lf.post_attn_norm,
-    };
+    let attn_weights = make_attn_weights(lf);
 
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
@@ -418,6 +434,54 @@ fn run_layer_compute(
     }
 
     Ok(residual)
+}
+
+/// MLA attention only — returns (residual_after_attn, normed2_for_ffn).
+/// Separated from FFN so the decode loop can defer convert(N+1) to overlap with
+/// FFN instead of MLA, avoiding memory bandwidth contention during sgemv calls.
+fn run_mla_only(
+    model: &ModelV2,
+    cache: &mut MlaKvCache,
+    layer: usize,
+    x: &[f32],
+    pos: usize,
+    lf: &MlaLayerF32,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let hidden = model.config.hidden_size();
+    let eps = model.config.rms_norm_eps();
+
+    let normed = rmsnorm(x, &lf.input_norm, eps);
+    let attn_weights = make_attn_weights(lf);
+
+    let attn_out = mla_forward_decode(
+        &normed, &attn_weights, cache, layer, pos,
+        &model.rope, &model.mla_config, model.attn_scale,
+    );
+
+    let mut residual = vec![0.0f32; hidden];
+    for d in 0..hidden { residual[d] = x[d] + attn_out[d]; }
+
+    let normed2 = rmsnorm(&residual, &lf.post_attn_norm, eps);
+    Ok((residual, normed2))
+}
+
+/// FFN only — adds FFN output into residual in place.
+fn run_ffn_only(
+    model: &ModelV2,
+    router: &mut MoeRouter,
+    layer: usize,
+    normed2: &[f32],
+    residual: &mut [f32],
+    lf: &MlaLayerF32,
+) -> Result<()> {
+    let hidden = model.config.hidden_size();
+    let ffn_out = if model.config.is_moe_layer(layer) {
+        moe_ffn_v2(model, router, layer, normed2, lf)?
+    } else {
+        dense_ffn(normed2, lf)
+    };
+    for d in 0..hidden { residual[d] += ffn_out[d]; }
+    Ok(())
 }
 
 /// Run one layer of the V2 model (MLA attention + FFN).
@@ -725,11 +789,22 @@ fn moe_ffn_v2(
         router.route_softmax(&gate_logits)
     };
 
-    // 2. Shared experts (unscaled — routed_scaling_factor applies only to routed experts)
-    let mut combined = if lf.shared_gate.is_some() {
-        shared_expert_ffn(x, lf)
+    // Pool simulation: track which experts are routed (decode-phase only)
+    POOL_SIM.with(|p| {
+        if let Some(pool) = p.borrow_mut().as_mut() {
+            for &eid in &route.expert_ids {
+                pool.request(layer as u32, eid as u32);
+            }
+        }
+    });
+
+    // 2. Shared experts (computed eagerly on non-pread path, overlapped with pread on pread path)
+    let use_pread = model.expert_loaders.contains_key(&layer);
+    let mut combined = if !use_pread {
+        // Non-pread path: compute shared FFN eagerly (no overlap opportunity)
+        if lf.shared_gate.is_some() { shared_expert_ffn(x, lf) } else { vec![0.0f32; hidden] }
     } else {
-        vec![0.0f32; hidden]
+        vec![0.0f32; hidden]  // placeholder — filled by thread::scope in pread path below
     };
 
     let routed_scale = model.config.ffn.routed_scaling_factor;
@@ -748,39 +823,50 @@ fn moe_ffn_v2(
     let dn_total = dn_packed + dn_scales * 2;
     let expert_stride = gu_total * 2 + dn_total;
 
-    // Use pread-based loading if available (large models), else fall back to mmap
-    let use_pread = model.expert_loaders.contains_key(&layer);
-
     if let Some(m) = model.metal.as_ref() {
         if use_pread {
-            // === PREAD PATH: parallel load needed experts, pack into staging buffer ===
+            // === PREAD PATH: overlap expert pread with shared FFN ===
             let loader = &model.expert_loaders[&layer];
             let staging = &model.expert_staging;
 
             // SAFETY: single-threaded access (pread writes to non-overlapping regions)
             let staging_ptr = staging.as_ptr() as *mut u8;
-            let staging_len = staging.len();
 
-            // Parallel pread using rayon (pre-warmed thread pool — no thread creation overhead)
             let expert_ids: Vec<(usize, usize, f32)> = route.expert_ids.iter()
                 .zip(route.weights.iter())
                 .enumerate()
                 .map(|(i, (&eid, &w))| (i, eid, w))
                 .collect();
 
-            // Parallel pread directly into staging via rayon (no thread creation, no alloc)
+            // Overlap: pread experts from SSD while CPU computes shared FFN.
+            // Saves ~min(pread_ms, shared_ffn_ms) per MoE layer.
             use rayon::prelude::*;
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
+            let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
-            // Split staging into per-expert chunks and load in parallel
-            staging_mut[..expert_ids.len() * expert_stride]
-                .chunks_mut(expert_stride)
-                .zip(expert_ids.iter())
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .for_each(|(chunk, &(_, eid, _))| {
-                    loader.load_expert(eid as u32, chunk).unwrap();
+            let mut combined = std::thread::scope(|s| {
+                // Spawn pread on background thread (uses rayon internally for QD>1)
+                let pread_handle = s.spawn(|| {
+                    pread_region
+                        .chunks_mut(expert_stride)
+                        .zip(expert_ids.iter())
+                        .collect::<Vec<_>>()
+                        .into_par_iter()
+                        .for_each(|(chunk, &(_, eid, _))| {
+                            loader.load_expert(eid as u32, chunk).unwrap();
+                        });
                 });
+
+                // Shared FFN on current thread (overlaps with pread I/O)
+                let result = if lf.shared_gate.is_some() {
+                    shared_expert_ffn(x, lf)
+                } else {
+                    vec![0.0f32; hidden]
+                };
+
+                pread_handle.join().unwrap();
+                result
+            });
 
             // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();
@@ -956,13 +1042,28 @@ pub fn generate_v2(
         let mut buf_a = MlaLayerF32::empty();
         let mut buf_b = MlaLayerF32::empty();
 
+        // Cache dense layers (0..first_k_dense_replace) permanently in f32.
+        // Dense layers have large FFN weights ([18432,7168] × 3), making their
+        // f16→f32 conversion ~10ms — longer than FFN compute (~7ms). This causes
+        // the pipeline to stall waiting for conversion. Caching eliminates:
+        // 1. Serial convert(0) at start of each token (~10ms)
+        // 2. Convert stalls for dense-to-dense transitions (~3ms × 2)
+        let num_dense = model.config.ffn.first_k_dense_replace;
+        let mut cached_dense: Vec<MlaLayerF32> = (0..num_dense)
+            .map(|_| MlaLayerF32::empty())
+            .collect();
+
         // Warmup: pre-fault all backbone pages into page cache
         let t_warmup = std::time::Instant::now();
         for layer in 0..num_layers {
-            convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+            if layer < num_dense {
+                convert_layer_into(&mut cached_dense[layer], &model.weights, &model.config, layer)?;
+            } else {
+                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+            }
         }
-        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers)",
-            t_warmup.elapsed().as_secs_f64(), num_layers);
+        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers, cached {} dense)",
+            t_warmup.elapsed().as_secs_f64(), num_layers, num_dense);
 
         // --- Prefill ---
         let t_prefill = std::time::Instant::now();
@@ -970,8 +1071,13 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
             for layer in 0..num_layers {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, &buf_a)?;
+                let lf = if layer < num_dense {
+                    &cached_dense[layer]
+                } else {
+                    convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
+                    &buf_a
+                };
+                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, lf)?;
             }
             cache.advance();
             if i == input_ids.len() - 1 {
@@ -983,7 +1089,18 @@ pub fn generate_v2(
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // --- Decode (sequential convert+compute, single reusable buffer) ---
+        // --- Decode (deferred-convert pipeline, double-buffered) ---
+        // Key insight: MLA attention is memory-bandwidth-bound (sgemv reads ~750 MB f32).
+        // Running f16→f32 conversion concurrently steals ~50% of bandwidth from sgemv.
+        // Fix: run MLA attention FIRST with no background thread (full bandwidth),
+        // then overlap convert(N+1) with FFN (which uses Metal GPU + SSD pread,
+        // not competing for memory bandwidth).
+
+        // Initialize ExpertPool simulation (RUSTANE_POOL_SIM=1 to enable).
+        if pool_sim_enabled() {
+            POOL_SIM.with(|p| *p.borrow_mut() = Some(ExpertPool::new(2000)));
+        }
+
         let t_decode = std::time::Instant::now();
         let mut pos = input_ids.len();
         let mut first_token_logged = false;
@@ -996,9 +1113,47 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
 
+            // Extract field refs so spawn closure doesn't capture &ModelV2
+            let weights_ref = &model.weights;
+            let config_ref = &model.config;
+            // No serial convert(0) — dense layers use cached_dense
             for layer in 0..num_layers {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, pos, &buf_a)?;
+                // Use cached weights for dense layers, dynamic buffer for MoE
+                let lf: &MlaLayerF32 = if layer < num_dense {
+                    &cached_dense[layer]
+                } else {
+                    &buf_a
+                };
+
+                // Phase 1: MLA attention — no background thread, full memory bandwidth
+                let (mut residual, normed2) = run_mla_only(
+                    model, &mut cache, layer, &x, pos, lf,
+                )?;
+
+                // Phase 2: FFN, with optional convert(N+1) overlap
+                if layer + 1 < num_layers {
+                    let next = layer + 1;
+                    if next < num_dense {
+                        // Next layer is cached — run FFN without background convert.
+                        // Avoids stalling on dense layer conversion (~10ms > FFN ~7ms).
+                        run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                    } else {
+                        // Next layer needs conversion — pipeline overlap
+                        std::thread::scope(|s| -> Result<()> {
+                            let h = s.spawn(|| {
+                                convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
+                            });
+                            run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                            h.join().unwrap()?;
+                            Ok(())
+                        })?;
+                        std::mem::swap(&mut buf_a, &mut buf_b);
+                    }
+                } else {
+                    run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                }
+
+                x = residual;
             }
             cache.advance();
 
@@ -1017,6 +1172,19 @@ pub fn generate_v2(
             pos += 1;
         }
         let decode_secs = t_decode.elapsed().as_secs_f64();
+
+        // Log ExpertPool simulation results (if enabled)
+        if pool_sim_enabled() {
+            POOL_SIM.with(|p| {
+                if let Some(pool) = p.borrow().as_ref() {
+                    eprintln!("ExpertPool sim (cap=2000): hits={} misses={} rate={:.1}% evictions={}",
+                        pool.stats.hits, pool.stats.misses,
+                        pool.stats.hit_rate() * 100.0, pool.stats.evictions);
+                }
+                *p.borrow_mut() = None;
+            });
+        }
+
         (prefill_secs, decode_secs)
     } else {
         // --- Pre-converted path (small models like V2-Lite) ---
