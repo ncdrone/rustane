@@ -309,6 +309,7 @@ kernel void fused_gate_up_silu(
 "#;
 
 /// Expert gate+up+SiLU fused operation layout.
+#[derive(Clone)]
 pub struct FusedGateUpSiluOp {
     pub gate_packed_offset: usize,
     pub gate_scales_offset: usize,
@@ -322,6 +323,7 @@ pub struct FusedGateUpSiluOp {
 }
 
 /// Expert GEMV layout info for zero-copy offset-based dispatch.
+#[derive(Clone)]
 pub struct ExpertGemvOp {
     /// Byte offset into mmap buffer for packed data
     pub packed_offset: usize,
@@ -661,6 +663,112 @@ impl MetalDequantGemv {
         }
         // Fallback: copy-based
         self.make_buffer(data.as_ptr() as *const u8, len)
+    }
+
+    /// Like fused_and_down_single_cmdbuf but each expert reads from its OWN Metal buffer.
+    /// Used for zero-copy ExpertPool: each pool slot IS a Metal buffer, no staging copy needed.
+    pub fn fused_and_down_per_expert_bufs(
+        &self,
+        expert_bufs: &[&ProtocolObject<dyn MTLBuffer>],
+        fused_ops: &[FusedGateUpSiluOp],
+        down_ops: &[ExpertGemvOp],
+        x: &[f32],
+    ) -> Vec<Vec<f32>> {
+        let n = fused_ops.len();
+        assert_eq!(n, down_ops.len());
+        assert_eq!(n, expert_bufs.len());
+        if n == 0 { return vec![]; }
+
+        let scratch_x = self.scratch_x.as_ref().expect("call init_scratch first");
+        unsafe {
+            let dst = scratch_x.contents().as_ptr() as *mut f32;
+            std::ptr::copy_nonoverlapping(x.as_ptr(), dst, x.len());
+        }
+
+        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
+            std::collections::HashMap::new();
+
+        for op in fused_ops {
+            in_feat_bufs.entry(op.in_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
+            group_bufs.entry(op.group_size as u32)
+                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
+            out_feat_bufs.entry(op.out_features as u32)
+                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
+        }
+
+        const ROWS_PER_TG: usize = 8;
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+
+        // Phase 1: Fused gate+up+SiLU — each expert from its own buffer
+        enc.setComputePipelineState(&self.pipeline_fused);
+        for (i, (op, buf)) in fused_ops.iter().zip(expert_bufs.iter()).enumerate() {
+            let ifb = &in_feat_bufs[&(op.in_features as u32)];
+            let gb = &group_bufs[&(op.group_size as u32)];
+            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+
+            unsafe {
+                // Offsets are relative to THIS expert's buffer (start at 0 for pool slots)
+                enc.setBuffer_offset_atIndex(Some(*buf), op.gate_packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.gate_scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.gate_zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.up_packed_offset, 3);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.up_scales_offset, 4);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.up_zeros_offset, 5);
+                enc.setBuffer_offset_atIndex(Some(scratch_x), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_activated[i]), 0, 7);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 8);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 9);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 10);
+
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
+                let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            }
+        }
+
+        // Phase 2: Down GEMV
+        enc.setComputePipelineState(&self.pipeline_v2);
+        for (i, (op, buf)) in down_ops.iter().zip(expert_bufs.iter()).enumerate() {
+            let ifb = &in_feat_bufs[&(op.in_features as u32)];
+            let gb = &group_bufs[&(op.group_size as u32)];
+            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(*buf), op.packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(*buf), op.zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_activated[i]), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_down_y[i]), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 5);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 7);
+
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
+                let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+            }
+        }
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        down_ops.iter().enumerate().map(|(i, op)| {
+            let mut out = vec![0.0f32; op.out_features];
+            unsafe {
+                let src = self.scratch_down_y[i].contents().as_ptr() as *const f32;
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), op.out_features);
+            }
+            out
+        }).collect()
     }
 
     /// Batched GEMV using pre-wrapped mmap buffer (zero-copy weights).
