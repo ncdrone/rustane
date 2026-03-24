@@ -775,11 +775,16 @@ fn moe_ffn_v2(
 ) -> Result<Vec<f32>> {
     let hidden = model.config.hidden_size();
 
+    // FFN profiling (env-gated: RUSTANE_FFN_PROFILE=1)
+    let ffn_profile = std::env::var("RUSTANE_FFN_PROFILE").is_ok();
+    let t_ffn_start = std::time::Instant::now();
+
     // 1. Router
     let router_w = lf.router.as_ref().expect("MoE layer needs router");
     let num_experts = model.config.num_experts();
     let mut gate_logits = vec![0.0f32; num_experts];
     crate::blas::sgemv_f32(router_w, x, &mut gate_logits, num_experts, hidden);
+    let t_after_router = std::time::Instant::now();
 
     let route = if model.config.ffn.scoring_func == "sigmoid" {
         if let Some(ref bias) = lf.e_score_correction_bias {
@@ -855,10 +860,10 @@ fn moe_ffn_v2(
             let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
             // Overlap pread with shared FFN via thread::scope.
-            // IMPORTANT: assign shared FFN result back to outer `combined`, don't shadow it.
+            let t_before_scope = std::time::Instant::now();
             let shared_result = std::thread::scope(|s| {
-                // Spawn pread on background thread (uses rayon internally for QD>1)
                 let pread_handle = s.spawn(|| {
+                    let t_pread = std::time::Instant::now();
                     pread_region
                         .chunks_mut(expert_stride)
                         .zip(expert_ids.iter())
@@ -867,19 +872,25 @@ fn moe_ffn_v2(
                         .for_each(|(chunk, &(_, eid, _))| {
                             loader.load_expert(eid as u32, chunk).unwrap();
                         });
+                    t_pread.elapsed()
                 });
 
-                // Shared FFN on current thread (overlaps with pread I/O)
+                let t_shared = std::time::Instant::now();
                 let result = if lf.shared_gate.is_some() {
                     shared_expert_ffn(x, lf)
                 } else {
                     vec![0.0f32; hidden]
                 };
+                let shared_elapsed = t_shared.elapsed();
 
-                pread_handle.join().unwrap();
+                let pread_elapsed = pread_handle.join().unwrap();
+                if ffn_profile && layer <= 3 {
+                    eprintln!("  FFN L{layer:02} pread: {:.0}µs  shared_ffn: {:.0}µs  (overlapped)",
+                        pread_elapsed.as_micros(), shared_elapsed.as_micros());
+                }
                 result
             });
-            // Write shared FFN result into outer combined (was being lost due to shadowing)
+            let t_after_scope = std::time::Instant::now();
             combined = shared_result;
 
             // Build Metal ops with packed offsets
@@ -911,14 +922,25 @@ fn moe_ffn_v2(
             }
 
             if !routing_weights.is_empty() {
-                // Use pre-wrapped Metal buffer (staging content updated in-place via pread)
+                let t_metal = std::time::Instant::now();
                 let metal_buf = model.expert_staging_metal.as_ref().unwrap();
                 let down_results = m.fused_and_down_single_cmdbuf(metal_buf, &fused_ops, &down_ops, x);
+                let metal_elapsed = t_metal.elapsed();
+
+                let t_accum = std::time::Instant::now();
                 for (i, weight) in routing_weights.iter().enumerate() {
                     let scaled_weight = weight * routed_scale;
                     for d in 0..hidden {
                         combined[d] += scaled_weight * down_results[i][d];
                     }
+                }
+                let accum_elapsed = t_accum.elapsed();
+
+                if ffn_profile && layer <= 3 {
+                    let scope_ms = t_after_scope.duration_since(t_before_scope).as_micros();
+                    eprintln!("  FFN L{layer:02} metal: {:.0}µs  accum: {:.0}µs  scope_total: {:.0}µs  LAYER_TOTAL: {:.0}µs",
+                        metal_elapsed.as_micros(), accum_elapsed.as_micros(), scope_ms,
+                        t_ffn_start.elapsed().as_micros());
                 }
             }
         } else {
