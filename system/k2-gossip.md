@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 | ms/layer: ~9.8 | wins: 3 | experiments: 15
+tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 16
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -104,6 +104,15 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Profiling** (warm): pread_gu: 2-5ms, pread_dn: ~1-2ms (inferred), Metal_fused: ~1.75ms, Metal_down: ~1.75ms. Overlap window ≈ 0 because pread_dn ≈ Metal_fused.
 - **Root cause**: pread_dn time (1/3 of total pread) roughly equals Metal_fused time. When pread_dn ≥ Metal_fused, savings = 0. Additionally, 2 command buffers add ~0.1ms overhead × 60 layers = 6ms/token. The split trades one large pread for two smaller ones without reducing total serial time.
 - **Correctness**: split dispatch is bit-identical to single-cmdbuf (test verified). Output unchanged.
+
+### Iteration 14: Remove x_cache from GPU shaders — NO EFFECT (committed for correctness)
+- **Experiment**: Remove `threadgroup half x_cache[7168]` from fused_gate_up_silu and `threadgroup float x_cache[4096]` from dequant_4bit_gemv_v2. x now read directly from device memory (GPU L2-cached).
+- **Result**: 1.71 tok/s (median warm: 1.72, 1.71, 1.70) vs 1.68 baseline
+- **Verdict**: NO EFFECT for speed (+1.8%, within noise). COMMITTED for:
+  1. **Correctness**: max_diff 0.088→0.000488 (180x improvement). f32 x reads replace the f32→f16 truncation in x_cache.
+  2. **Code quality**: removes hardcoded x_cache sizes that were the source of the OOB bug (iter 9). No more threadgroup barrier.
+  3. **Occupancy**: theoretical 2 TGs/EU → 4+ TGs/EU, but real improvement masked by pread variance.
+- **Insight**: For bandwidth-bound INT4 GEMV on M4 Max, threadgroup memory x_cache doesn't improve performance because GPU L2 cache (32 MB) is large enough to hold x (28 KB) and serves as an effective shared cache across TGs. The threadgroup barrier overhead is ~the same as the L2 latency.
 
 ### Iteration 13: F_NOCACHE on expert file fds — WIN (+46%, 1.15 → 1.68 tok/s)
 - **Experiment**: `fcntl(fd, F_NOCACHE, 1)` on expert file fds in ExpertLoader::open(). Bypasses OS page cache for expert pread, using direct SSD-to-user-buffer DMA.

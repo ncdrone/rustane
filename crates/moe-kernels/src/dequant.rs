@@ -138,12 +138,9 @@ kernel void dequant_4bit_gemv_v2(
     const uint num_groups = in_features / group_size;
     const uint groups_per_8 = group_size / 8;
 
-    // Cache x (shared across all 8 rows)
-    threadgroup float x_cache[4096];
-    for (uint i = tid; i < in_features; i += TG) {
-        x_cache[i] = x[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Read x directly from device memory (L2-cached after first TG reads it).
+    // Removes 16 KB threadgroup memory → allows 4+ concurrent TGs per EU
+    // instead of 2, doubling occupancy for better latency hiding.
 
     uint local_row = tid / THREADS_PER_ROW;  // 0..7
     uint lane = tid % THREADS_PER_ROW;       // 0..31 (SIMD lane)
@@ -162,14 +159,14 @@ kernel void dequant_4bit_gemv_v2(
 
         uint32_t pack = row_packed[pi];
 
-        float sx0 = scale * x_cache[col    ]; float bx0 = zero * x_cache[col    ];
-        float sx1 = scale * x_cache[col + 1]; float bx1 = zero * x_cache[col + 1];
-        float sx2 = scale * x_cache[col + 2]; float bx2 = zero * x_cache[col + 2];
-        float sx3 = scale * x_cache[col + 3]; float bx3 = zero * x_cache[col + 3];
-        float sx4 = scale * x_cache[col + 4]; float bx4 = zero * x_cache[col + 4];
-        float sx5 = scale * x_cache[col + 5]; float bx5 = zero * x_cache[col + 5];
-        float sx6 = scale * x_cache[col + 6]; float bx6 = zero * x_cache[col + 6];
-        float sx7 = scale * x_cache[col + 7]; float bx7 = zero * x_cache[col + 7];
+        float sx0 = scale * x[col    ]; float bx0 = zero * x[col    ];
+        float sx1 = scale * x[col + 1]; float bx1 = zero * x[col + 1];
+        float sx2 = scale * x[col + 2]; float bx2 = zero * x[col + 2];
+        float sx3 = scale * x[col + 3]; float bx3 = zero * x[col + 3];
+        float sx4 = scale * x[col + 4]; float bx4 = zero * x[col + 4];
+        float sx5 = scale * x[col + 5]; float bx5 = zero * x[col + 5];
+        float sx6 = scale * x[col + 6]; float bx6 = zero * x[col + 6];
+        float sx7 = scale * x[col + 7]; float bx7 = zero * x[col + 7];
 
         sum = fma(float((pack      ) & 0xF), sx0, sum) + bx0;
         sum = fma(float((pack >>  4) & 0xF), sx1, sum) + bx1;
@@ -220,15 +217,10 @@ kernel void fused_gate_up_silu(
     const uint num_groups = in_features / group_size;
     const uint groups_per_8 = group_size / 8;
 
-    // Cache x (shared across all 8 rows) in f16 to save threadgroup memory.
-    // 7168 = K2 hidden_size. Was float[4096] (OOB for in_features>4096).
-    // half[7168] = 14KB vs float[7168] = 28KB → allows 2 concurrent TGs (32KB limit).
-    // f32→f16 precision loss is negligible vs INT4 weight quantization.
-    threadgroup half x_cache[7168];
-    for (uint i = tid; i < in_features; i += TG) {
-        x_cache[i] = x[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Read x directly from device memory (L2-cached after first TG reads it).
+    // Removes 14 KB threadgroup memory → allows 4+ concurrent TGs per EU
+    // instead of 2, doubling occupancy for better latency hiding.
+    // Also eliminates f32→f16 precision loss from x_cache.
 
     uint local_row = tid / THREADS_PER_ROW;
     uint lane = tid % THREADS_PER_ROW;
@@ -255,10 +247,10 @@ kernel void fused_gate_up_silu(
         uint32_t u_pack = up_row_packed[pi];
 
         // Pre-factor x values (shared between gate and up)
-        float xv0 = x_cache[col    ]; float xv1 = x_cache[col + 1];
-        float xv2 = x_cache[col + 2]; float xv3 = x_cache[col + 3];
-        float xv4 = x_cache[col + 4]; float xv5 = x_cache[col + 5];
-        float xv6 = x_cache[col + 6]; float xv7 = x_cache[col + 7];
+        float xv0 = x[col    ]; float xv1 = x[col + 1];
+        float xv2 = x[col + 2]; float xv3 = x[col + 3];
+        float xv4 = x[col + 4]; float xv5 = x[col + 5];
+        float xv6 = x[col + 6]; float xv7 = x[col + 7];
 
         // Gate GEMV
         float gsx0 = g_scale * xv0; float gbx0 = g_zero * xv0;
