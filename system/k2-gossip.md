@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 21
+tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 22
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -180,6 +180,16 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Implementation**: ~15 lines. `effective_top_k` field on ModelV2, checked at all routing call sites. Env var RUSTANE_TOP_K=N overrides config. Staging buffer, Metal scratch, and router all use effective value.
 - **Insight**: Reducing top_k is a first-order lever for pread-dominated workloads. With 524 GB experts on SSD, each expert pread costs ~4ms. Cutting 2 experts/layer saves ~8ms/layer × 60 = 480ms/token. Quality impact is acceptable for INT4 quantized model. Future: try top_k=4 for another 33% reduction.
 
+### Iteration 20: Expert speculation with speculative pread — REVERTED (massive regression)
+- **Experiment**: Pre-load next layer's predicted experts during current layer's Metal dispatch. Cross-layer routing similarity >95% means most predictions are useful. madvise(MADV_WILLNEED) incompatible with F_NOCACHE, so pivoted to actual pread into separate staging buffer.
+- **Result**: 0.30 tok/s (warm) vs 0.51* session baseline. -41% regression.
+- **Three implementations tried**:
+  1. thread::scope wrapping Metal — scope blocks until ALL threads done, adding ~36ms/layer for sequential spec pread
+  2. thread::spawn + sequential pread — 8×23MB sequential reads take ~37ms, overlap window only ~3ms
+  3. thread::spawn + parallel pread (inner scope with 8 threads) — NVMe can serve 8 concurrent reads in ~5ms, but overlap window still only ~3ms, join blocks ~2ms/layer minimum
+- **Root cause**: Speculative pread adds 184 MB/layer of F_NOCACHE SSD I/O (8 experts × 23 MB) that competes for NVMe bandwidth. Even with >95% hit rate reducing normal pread to ~0.5 experts, the total SSD throughput increases. Thread spawn overhead (9600+ spawns/decode) and NVMe controller cache thrashing compound the regression.
+- **Key insight**: With F_NOCACHE, pread is already near-optimal — SSD serves direct DMA at ~5 GB/s. There's no "cold miss latency spike" to eliminate (unlike page-cache mode). Speculation only helps when there's a cache layer to warm ahead of time. F_NOCACHE eliminates the cache, making speculation pointless.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -196,6 +206,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Dead MLA code removal (mla_layer_weights + final_norm.to_vec)**: ~0.2ms/token dead overhead. Unmeasurable. Committed as code cleanup.
 - **Overlap conversion with MLA**: -9.5% regression. MLA sgemv needs full 273 GB/s DRAM bandwidth. Concurrent conversion (f16 mmap read + f32 write) steals half, doubling MLA from 135ms to 270ms. The 24ms convert_wait savings is dwarfed. MLA must run alone.
 - **Pre-cache all layers as f32 (~54 GB)**: -64% regression (0.6 vs 1.68). 54 GB heap exhausts DRAM, evicting backbone mmap pages → shared_ffn faults from SSD every layer. FFN 7ms→27ms/layer. On 128 GB system with 524 GB model, DRAM is scarce — never pin >10 GB of converted weights.
+- **Expert speculation (speculative pread for next layer)**: -41% regression (0.30 vs 0.51*). Three variants tried (scope, sequential spawn, parallel spawn). Incompatible with F_NOCACHE: direct DMA is already fast, no cache layer to pre-warm. 184 MB/layer spec I/O doubles SSD bandwidth usage. Thread spawn overhead (9600 spawns/decode) compounds. Dead end with F_NOCACHE.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
@@ -220,11 +231,11 @@ M4 Max has 56.5 TFLOPS total silicon. We use 2.5% of it. The ANE (19 TFLOPS at 2
 
 ### Immediately actionable (no ANE integration needed):
 
-1. **Expert speculation with madvise prefault** — previous token's routing predicts next layer's experts with >95% similarity after layer 3. After routing layer N, call `madvise(MADV_WILLNEED)` on predicted layer N+1 expert file regions. Pre-faults pages during Metal dispatch (GPU busy = CPU free). Cost: ~10 lines. Potential: eliminate cold-miss pread latency spikes.
+1. ~~**Expert speculation with madvise prefault**~~ — **DEAD END** (iter 20). Tested as speculative pread (madvise incompatible with F_NOCACHE). -41% regression. See dead ends list.
 
-2. **o_proj on Metal GPU** — o_proj is 1.2ms/layer on CPU (cblas_sgemv). K2 o_proj is [7168, 4096] at f32. Metal already has F32_GEMV_SHADER compiled in dequant.rs. Dispatch o_proj on GPU overlapped with next layer's convert. Saves ~73ms/token (1.2ms × 61 layers). ~50 lines.
+2. **o_proj on Metal GPU** — o_proj is 1.2ms/layer on CPU (cblas_sgemv). K2 o_proj is [7168, 4096] at f32. Metal already has F32_GEMV_SHADER compiled in dequant.rs. Dispatch o_proj on GPU overlapped with next layer's convert. Saves ~73ms/token (1.2ms × 61 layers). ~50 lines. **CAVEAT**: iter 12 showed that f16 o_proj from mmap regressed -21% because it bypassed warm f32 DRAM. GPU o_proj would need to use the pre-converted f32 buffer, not mmap.
 
-3. **Batch W_UK + W_UV as sgemm** — currently 64 sequential sgemv calls (already tried rayon, didn't help). Instead: reshape to single sgemm call. W_UK is [64, 128, 512] = [64×128, 512] = [8192, 512]. One sgemm replaces 64 sgemv. Same for W_UV. Potential: 2× faster absorption.
+3. **Batch W_UK + W_UV as sgemm** — currently 64 sequential sgemv calls (already tried rayon, didn't help). Instead: reshape to single sgemm call. W_UK is [64, 128, 512] = [64×128, 512] = [8192, 512]. One sgemm replaces 64 sgemv. Same for W_UV. Potential: 2× faster absorption. **CAVEAT**: Accelerate's cblas_sgemm doesn't support batched/block-diagonal. Would need to reshape and scatter-gather, which may negate BLAS gains.
 
 ### Medium-term (ANE integration — bigger lift):
 4. **ANE Conv1x1 for MLA projections** — Q LoRA + KV compression + W_UK absorption as compiled ANE graph. Conv1x1 is 3x faster than matmul on ANE. Saves ~6ms/layer. Needs: ane-bridge FFI, IOSurface weight staging, compilation. ~500 lines.
