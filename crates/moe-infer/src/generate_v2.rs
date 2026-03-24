@@ -30,12 +30,16 @@ fn pool_sim_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_SIM").is_ok())
 }
 
-/// Whether to write back pread'd expert data to pool (set RUSTANE_POOL_WRITEBACK=1).
-/// Previous attempt with 3000 slots (69 GB) caused 3x regression from page cache pressure.
-/// Use small RUSTANE_POOL_CAP (100-500) to keep memory footprint under ~12 GB.
+/// Whether to write back pread'd expert data to pool.
+/// Default: ON (when pool is active). Set RUSTANE_POOL_WRITEBACK=0 to disable.
+/// With F_NOCACHE (iter 13), write-back no longer evicts page cache.
 fn pool_writeback_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_WRITEBACK").is_ok())
+    *FLAG.get_or_init(|| {
+        std::env::var("RUSTANE_POOL_WRITEBACK")
+            .map(|v| v != "0")
+            .unwrap_or(true) // default ON
+    })
 }
 
 // Thread-local ExpertPool simulation for measuring decode-phase hit rates.
@@ -308,9 +312,10 @@ impl ModelV2 {
             // Lazy: start with empty Vecs, allocate on first miss per slot.
             let pool_cap_env = std::env::var("RUSTANE_POOL_CAP")
                 .ok().and_then(|v| v.parse::<usize>().ok());
-            // Default 0: pool write-back is disabled, so pool tracking adds ~0.3ms/layer
-            // of dead HashMap overhead with no caching benefit. RUSTANE_POOL_CAP=N re-enables.
-            let pool_cap = pool_cap_env.unwrap_or(0);
+            // Default 1000: DRAM pool caches hot experts, replacing SSD pread with memcpy.
+            // 1000 slots × ~23 MB = ~23 GB. Fits in 128 GB with backbone + KV.
+            // Set RUSTANE_POOL_CAP=0 to disable.
+            let pool_cap = pool_cap_env.unwrap_or(1000);
             if pool_cap == 0 {
                 eprintln!("ExpertPool: DISABLED (RUSTANE_POOL_CAP=0)");
                 (None, Vec::new())
