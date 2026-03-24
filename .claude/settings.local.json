@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:maderix.substack.com)",
+      "Bash(grep -r \"rsqrt\\\\|sqrt.*reduce\\\\|IOSurface.*width\\\\|ANE compiler\" /Users/dan/Dev/rustane/crates/engine/src/*.rs)",
+      "Bash(md5:*)",
+      "Bash(curl -s https://en.wikipedia.org/wiki/HDMI)",
+      "Bash(curl -s https://www.google.com/search?q=Apple+M4+Max+SSD+sequential+read+speed+PCIe+lanes+bandwidth)",
+      "Bash(curl -s https://www.google.com/search?q=M2+MacBook+Pro+SSD+sequential+read+speed+benchmark+GB/s)",
+      "Bash(curl -s https://en.wikipedia.org/wiki/Apple_M4)",
+      "Bash(curl -s https://www.google.com/search?q=Apple+M4+Max+MacBook+Pro+SSD+read+speed+benchmark+Blackmagic)"
+    ]
+  }
+}
