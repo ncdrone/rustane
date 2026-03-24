@@ -359,19 +359,25 @@ pub fn mla_forward_decode_f16(
         crate::blas::sgemv_f16_trans(w_uk_head, q_head, out, kv_rank, nope);
     }
 
-    // 7b-c. Attention scores via batched sgemm_nt (AMX-optimized, matches f32 path)
+    // 7b-c. Attention scores + softmax (same as f32 — works on cached f32 latents)
     let latent_cache = cache.get_latents(layer, seq_len);
     let rope_cache = cache.get_rope_keys(layer, seq_len);
 
     let mut scores = vec![0.0f32; h * seq_len];
-    let mut scores_rope_buf = vec![0.0f32; h * seq_len];
-    crate::blas::sgemm_nt(&q_absorbed, latent_cache, &mut scores, h, seq_len, kv_rank);
-    crate::blas::sgemm_nt(&q_pe, rope_cache, &mut scores_rope_buf, h, seq_len, rope_dim);
-    for i in 0..h * seq_len {
-        scores[i] = (scores[i] + scores_rope_buf[i]) * attn_scale;
+    for head in 0..h {
+        let q_abs = &q_absorbed[head * kv_rank..(head + 1) * kv_rank];
+        let q_rope = &q_pe[head * rope_dim..(head + 1) * rope_dim];
+        for t in 0..seq_len {
+            let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
+            let rope_t = &rope_cache[t * rope_dim..(t + 1) * rope_dim];
+            let mut dot_nope = 0.0f64;
+            for d in 0..kv_rank { dot_nope += q_abs[d] as f64 * lat_t[d] as f64; }
+            let mut dot_rope = 0.0f64;
+            for d in 0..rope_dim { dot_rope += q_rope[d] as f64 * rope_t[d] as f64; }
+            scores[head * seq_len + t] = (dot_nope + dot_rope) as f32 * attn_scale;
+        }
     }
 
-    // Softmax per head
     let mut attn_weights = vec![0.0f32; h * seq_len];
     for head in 0..h {
         let s = &scores[head * seq_len..(head + 1) * seq_len];
@@ -382,16 +388,20 @@ pub fn mla_forward_decode_f16(
         for t in 0..seq_len { w[t] /= sum; }
     }
 
-    // 8. Value reconstruction via batched sgemm + per-head W_UV (f16)
-    let mut v_latents = vec![0.0f32; h * kv_rank];
-    crate::blas::sgemm(&attn_weights, latent_cache, &mut v_latents, h, kv_rank, seq_len);
-
+    // 8. Value combination — f16 W_UV
     let mut v_concat = vec![0.0f32; h * v_dim];
     for head in 0..h {
-        let v_latent = &v_latents[head * kv_rank..(head + 1) * kv_rank];
+        let w = &attn_weights[head * seq_len..(head + 1) * seq_len];
+        let mut v_latent = vec![0.0f32; kv_rank];
+        for t in 0..seq_len {
+            let lat_t = &latent_cache[t * kv_rank..(t + 1) * kv_rank];
+            let wt = w[t];
+            for d in 0..kv_rank { v_latent[d] += wt * lat_t[d]; }
+        }
         let w_uv_head = &weights.w_uv[head * v_dim * kv_rank..(head + 1) * v_dim * kv_rank];
         let v_out = &mut v_concat[head * v_dim..(head + 1) * v_dim];
-        crate::blas::sgemv_f16(w_uv_head, v_latent, v_out, v_dim, kv_rank);
+        // W_UV sgemv: [v_dim, kv_rank] × [kv_rank] — small, f16 → f32
+        crate::blas::sgemv_f16(w_uv_head, &v_latent, v_out, v_dim, kv_rank);
     }
 
     // 9. O projection — f16 weights

@@ -75,6 +75,7 @@ pub fn sgemv_f32(w: &[f32], x: &[f32], y: &mut [f32], rows: usize, cols: usize) 
 /// cblas_sgemv on the chunk. Main memory reads only f16 weights (half of f32).
 /// The f32 chunk lives in L2 cache — sgemv reads it at ~1 TB/s, not ~200 GB/s.
 pub fn sgemv_f16(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    use half::slice::HalfFloatSliceExt;
     debug_assert_eq!(w.len(), out_dim * in_dim);
     debug_assert_eq!(x.len(), in_dim);
     debug_assert_eq!(y.len(), out_dim);
@@ -88,11 +89,9 @@ pub fn sgemv_f16(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: us
         let w_chunk = &w[chunk_start * in_dim..chunk_end * in_dim];
         let y_chunk = &mut y[chunk_start..chunk_end];
 
-        // Convert chunk from f16 to f32 (FCVTL auto-vectorized, writes to L2)
+        // SIMD bulk convert f16→f32 (FCVTL: 4 f16→4 f32 per instruction)
         let buf = &mut chunk_buf[..chunk_rows * in_dim];
-        for i in 0..buf.len() {
-            buf[i] = w_chunk[i].to_f32();
-        }
+        w_chunk.convert_to_f32_slice(buf);
 
         // AMX-optimized sgemv on the L2-resident chunk
         sgemv_f32(buf, x, y_chunk, chunk_rows, in_dim);
@@ -126,6 +125,7 @@ pub fn sgemv_f16_par(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim
 
 /// y = W^T @ x where W is f16 — chunked convert+sgemv_trans.
 pub fn sgemv_f16_trans(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    use half::slice::HalfFloatSliceExt;
     debug_assert_eq!(w.len(), in_dim * out_dim);
     debug_assert_eq!(x.len(), in_dim);
     debug_assert_eq!(y.len(), out_dim);
@@ -145,10 +145,9 @@ pub fn sgemv_f16_trans(w: &[f16], x: &[f32], y: &mut [f32], out_dim: usize, in_d
         let w_chunk = &w[chunk_start * out_dim..chunk_end * out_dim];
         let x_chunk = &x[chunk_start..chunk_end];
 
+        // SIMD bulk convert f16→f32
         let buf = &mut chunk_buf[..chunk_rows * out_dim];
-        for i in 0..buf.len() {
-            buf[i] = w_chunk[i].to_f32();
-        }
+        w_chunk.convert_to_f32_slice(buf);
 
         // Accumulate: y += chunk^T @ x_chunk
         // Using sgemv with beta=1.0 to accumulate
