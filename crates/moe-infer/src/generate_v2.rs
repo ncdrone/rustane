@@ -114,7 +114,10 @@ pub struct ModelV2 {
     /// UnsafeCell because pool state mutates during &self decode (single-threaded access).
     pub expert_pool: std::cell::UnsafeCell<Option<expert_pager::ExpertPool>>,
     /// Pool backing buffers: one Vec<u8> per pool slot, size = expert_stride.
+    /// Each buffer is page-aligned for zero-copy Metal wrapping.
     pub pool_buffers: std::cell::UnsafeCell<Vec<Vec<u8>>>,
+    /// Metal buffers wrapping pool_buffers (zero-copy: GPU reads pool memory directly).
+    pub pool_metal_bufs: std::cell::UnsafeCell<Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>>,
 }
 
 /// Sampling configuration.
@@ -297,6 +300,7 @@ impl ModelV2 {
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
             expert_loaders, expert_stride, expert_staging, expert_staging_metal,
             expert_pool: std::cell::UnsafeCell::new(expert_pool),
+            pool_metal_bufs: std::cell::UnsafeCell::new(vec![None; pool_buffers.len()]),
             pool_buffers: std::cell::UnsafeCell::new(pool_buffers),
         })
     }
@@ -1005,8 +1009,78 @@ fn moe_ffn_v2(
 
             if !routing_weights.is_empty() {
                 let t_metal = std::time::Instant::now();
-                let metal_buf = model.expert_staging_metal.as_ref().unwrap();
-                let down_results = m.fused_and_down_single_cmdbuf(metal_buf, &fused_ops, &down_ops, x);
+
+                // Zero-copy dispatch: each expert reads from its own buffer
+                // Pool hits → pool Metal buffer (zero copy, no staging)
+                // Pool misses → staging Metal buffer (pread'd data)
+                let pool_metal = unsafe { &mut *model.pool_metal_bufs.get() };
+                let pool_bufs_raw = unsafe { &*model.pool_buffers.get() };
+                let pool_opt = unsafe { &*model.expert_pool.get() };
+                let staging_metal = model.expert_staging_metal.as_ref().unwrap();
+
+                let mut use_per_expert = false;
+
+                // Pre-pass: ensure Metal buffers exist for all pool hits
+                if let Some(pool) = pool_opt.as_ref() {
+                    for &(i, eid, _) in &expert_ids {
+                        if !need_pread[i] {
+                            if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                if pool_metal[slot].is_none() && !pool_bufs_raw[slot].is_empty() {
+                                    pool_metal[slot] = Some(m.wrap_mmap(&pool_bufs_raw[slot]));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Build per-expert buffer list
+                let mut per_expert_bufs: Vec<&ProtocolObject<dyn MTLBuffer>> = Vec::with_capacity(expert_ids.len());
+                if let Some(pool) = pool_opt.as_ref() {
+                    for &(i, eid, _) in &expert_ids {
+                        if !need_pread[i] {
+                            if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                if let Some(ref mbuf) = pool_metal[slot] {
+                                    per_expert_bufs.push(mbuf.as_ref());
+                                    use_per_expert = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        per_expert_bufs.push(staging_metal.as_ref());
+                    }
+                }
+
+                let down_results = if use_per_expert {
+                    // Mix of pool buffers + staging: use per-expert dispatch
+                    // Adjust offsets: pool hits use offset 0, staging misses use i*expert_stride
+                    let mut adj_fused = fused_ops.clone();
+                    let mut adj_down = down_ops.clone();
+                    if let Some(pool) = pool_opt.as_ref() {
+                        for (idx, &(i, eid, _)) in expert_ids.iter().enumerate() {
+                            if !need_pread[i] {
+                                if let Some(_slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                    // Pool hit: offsets are relative to expert start (0-based in pool buf)
+                                    // The FusedGateUpSiluOp offsets were built as i*expert_stride
+                                    // Subtract i*expert_stride to make them 0-based
+                                    let base = i * expert_stride;
+                                    adj_fused[idx].gate_packed_offset -= base;
+                                    adj_fused[idx].gate_scales_offset -= base;
+                                    adj_fused[idx].gate_zeros_offset -= base;
+                                    adj_fused[idx].up_packed_offset -= base;
+                                    adj_fused[idx].up_scales_offset -= base;
+                                    adj_fused[idx].up_zeros_offset -= base;
+                                    adj_down[idx].packed_offset -= base;
+                                    adj_down[idx].scales_offset -= base;
+                                    adj_down[idx].zeros_offset -= base;
+                                }
+                            }
+                        }
+                    }
+                    m.fused_and_down_per_expert_bufs(&per_expert_bufs, &adj_fused, &adj_down, x)
+                } else {
+                    // All misses or no pool: use original staging dispatch
+                    m.fused_and_down_single_cmdbuf(staging_metal, &fused_ops, &down_ops, x)
+                };
                 let metal_elapsed = t_metal.elapsed();
 
                 let t_accum = std::time::Instant::now();
