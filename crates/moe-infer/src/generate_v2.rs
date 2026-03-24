@@ -30,6 +30,14 @@ fn pool_sim_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_SIM").is_ok())
 }
 
+/// Whether to write back pread'd expert data to pool (set RUSTANE_POOL_WRITEBACK=1).
+/// Previous attempt with 3000 slots (69 GB) caused 3x regression from page cache pressure.
+/// Use small RUSTANE_POOL_CAP (100-500) to keep memory footprint under ~12 GB.
+fn pool_writeback_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_WRITEBACK").is_ok())
+}
+
 // Thread-local ExpertPool simulation for measuring decode-phase hit rates.
 // When Some, moe_ffn_v2 calls pool.request() for each routed expert (tracking only).
 // When None (default), no overhead. Gated by RUSTANE_POOL_SIM=1.
@@ -284,13 +292,20 @@ impl ModelV2 {
             // Lazy: start with empty Vecs, allocate on first miss per slot.
             let pool_cap_env = std::env::var("RUSTANE_POOL_CAP")
                 .ok().and_then(|v| v.parse::<usize>().ok());
-            let pool_cap = pool_cap_env.unwrap_or(3000); // default 3000 (~70 GB max, lazy)
-            // Lazy: allocate empty Vecs (0 bytes each). Grow on first use.
-            let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| Vec::new()).collect();
-            eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB",
-                pool_cap, expert_stride as f64 / 1e6,
-                pool_cap as f64 * expert_stride as f64 / 1e9);
-            (Some(expert_pager::ExpertPool::new(pool_cap)), bufs)
+            // Default 0: pool write-back is disabled, so pool tracking adds ~0.3ms/layer
+            // of dead HashMap overhead with no caching benefit. RUSTANE_POOL_CAP=N re-enables.
+            let pool_cap = pool_cap_env.unwrap_or(0);
+            if pool_cap == 0 {
+                eprintln!("ExpertPool: DISABLED (RUSTANE_POOL_CAP=0)");
+                (None, Vec::new())
+            } else {
+                // Lazy: allocate empty Vecs (0 bytes each). Grow on first use.
+                let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| Vec::new()).collect();
+                eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB",
+                    pool_cap, expert_stride as f64 / 1e6,
+                    pool_cap as f64 * expert_stride as f64 / 1e9);
+                (Some(expert_pager::ExpertPool::new(pool_cap)), bufs)
+            }
         } else {
             (None, Vec::new())
         };
@@ -953,17 +968,21 @@ fn moe_ffn_v2(
             let t_after_scope = std::time::Instant::now();
             combined = shared_result;
 
-            // Update pool: copy pread misses into pool buffers (so future tokens hit)
-            {
+            // Pool write-back: cache pread'd data so future tokens hit.
+            // Gated by RUSTANE_POOL_WRITEBACK=1. Default: OFF.
+            // Previous attempt with 3000 slots (69 GB) caused page cache eviction.
+            // Use with small POOL_CAP (100-500) to stay under ~12 GB.
+            if pool_writeback_enabled() {
                 let pool_opt = unsafe { &*model.expert_pool.get() };
                 let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
+                let pool_metal_wb = unsafe { &mut *model.pool_metal_bufs.get() };
                 if let Some(pool) = pool_opt.as_ref() {
                     for &(i, eid, _) in &expert_ids {
                         if need_pread[i] {
                             if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
-                                // Lazy allocate pool buffer on first miss
                                 if pool_bufs[slot].is_empty() {
                                     pool_bufs[slot] = vec![0u8; expert_stride];
+                                    pool_metal_wb[slot] = None; // invalidate stale Metal buf
                                 }
                                 let staging_offset = i * expert_stride;
                                 pool_bufs[slot][..expert_stride]
@@ -1302,6 +1321,11 @@ pub fn generate_v2(
             if token_id == model.config.model.eos_token_id { break; }
 
             let t_tok = std::time::Instant::now();
+            let profile_tok = step < 2; // profile first 2 decode tokens
+            let mut tok_mla_us = 0u64;
+            let mut tok_ffn_us = 0u64;
+            let mut tok_join_us = 0u64;
+
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
 
@@ -1318,47 +1342,64 @@ pub fn generate_v2(
                 };
 
                 // Phase 1: MLA attention — no background thread, full memory bandwidth
+                let t_mla = std::time::Instant::now();
                 let (mut residual, normed2) = run_mla_only(
                     model, &mut cache, layer, &x, pos, lf,
                 )?;
+                if profile_tok { tok_mla_us += t_mla.elapsed().as_micros() as u64; }
 
                 // Phase 2: FFN, with optional convert(N+1) overlap
                 if layer + 1 < num_layers {
                     let next = layer + 1;
                     if next < num_dense {
-                        // Next layer is cached — run FFN without background convert.
-                        // Avoids stalling on dense layer conversion (~10ms > FFN ~7ms).
+                        let t_ffn = std::time::Instant::now();
                         run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                        if profile_tok { tok_ffn_us += t_ffn.elapsed().as_micros() as u64; }
                     } else {
                         // Next layer needs conversion — pipeline overlap
                         std::thread::scope(|s| -> Result<()> {
                             let h = s.spawn(|| {
                                 convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
                             });
+                            let t_ffn = std::time::Instant::now();
                             run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                            if profile_tok { tok_ffn_us += t_ffn.elapsed().as_micros() as u64; }
+                            let t_join = std::time::Instant::now();
                             h.join().unwrap()?;
+                            if profile_tok { tok_join_us += t_join.elapsed().as_micros() as u64; }
                             Ok(())
                         })?;
                         std::mem::swap(&mut buf_a, &mut buf_b);
                     }
                 } else {
+                    let t_ffn = std::time::Instant::now();
                     run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
+                    if profile_tok { tok_ffn_us += t_ffn.elapsed().as_micros() as u64; }
                 }
 
                 x = residual;
             }
             cache.advance();
 
+            let t_lm = std::time::Instant::now();
             let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
             let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+            let lm_us = t_lm.elapsed().as_micros() as u64;
             let next_token = sample(&logits, sampling, (pos + step) as u64);
             all_ids.push(next_token);
 
             let tok_ms = t_tok.elapsed().as_secs_f64() * 1000.0;
+            if profile_tok {
+                let accounted = (tok_mla_us + tok_ffn_us + tok_join_us + lm_us) as f64 / 1000.0;
+                eprintln!("--- decode token {step}: {tok_ms:.0}ms ({:.1}ms/layer) ---",
+                    tok_ms / num_layers as f64);
+                eprintln!("  MLA: {:.1}ms  FFN: {:.1}ms  convert_wait: {:.1}ms  lm_head: {:.1}ms  other: {:.1}ms",
+                    tok_mla_us as f64 / 1000.0, tok_ffn_us as f64 / 1000.0,
+                    tok_join_us as f64 / 1000.0, lm_us as f64 / 1000.0,
+                    tok_ms - accounted);
+            }
             if !first_token_logged {
                 first_token_logged = true;
-                eprintln!("--- decode token 0: {tok_ms:.0}ms ({:.1}ms/layer) ---",
-                    tok_ms / num_layers as f64);
             }
 
             pos += 1;

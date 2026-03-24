@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.54 | ms/layer: 10.6 | wins: 0 | experiments: 2
+tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 3
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -18,6 +18,13 @@ tok/s: 1.54 | ms/layer: 10.6 | wins: 0 | experiments: 2
 - ANE: 17.8 TFLOPS — currently UNUSED (ane-bridge crate exists)
 - NVMe SSD: 17.5 GB/s pread
 
+## Per-Layer Breakdown (MEASURED, warm)
+- **MLA: 2.2ms/layer** (18%) — Q LoRA (1.3ms) + o_proj (1.2ms) dominate. NOT 0.4ms as previously estimated.
+- **FFN: 9.0ms/layer** (75%) — max(pread ~5ms, shared_ffn ~4ms) + Metal ~3.5ms
+- **convert_wait: ~0ms** — f16→f32 conversion fully hidden behind FFN in double-buffer pipeline
+- **lm_head: 24ms** (3.3%) — single-threaded cblas_sgemv, already bandwidth-saturated
+- **other: 1.6ms total** (<0.3%) — thread::scope overhead + residual adds
+
 ## The Goal
 Get tok/s as high as possible. Theoretical max ~5 tok/s.
 
@@ -29,23 +36,29 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Verdict**: REVERTED — f16 inline conversion adds to critical path (no pipelining)
 - **Insight**: The f32 double-buffer hides ~1.6ms/layer conversion behind 8ms FFN compute. f16 path puts conversion on critical path. Also: scalar `f16::to_f32()` in a loop is 40x slower than `convert_to_f32_slice()` (SIMD FCVTL) — always use bulk SIMD conversion.
 - **Infrastructure kept**: SIMD fix in blas.rs (sgemv_f16 + sgemv_f16_trans now use convert_to_f32_slice). No effect on current f32 path.
-- **Previous commit 06afdd0 was wrong**: claimed 1.43 tok/s but benchmarked at 0.32 (scalar conversion not fixed). Reverted.
 
 ### Iteration 2: lm_head parallel sgemv — NO EFFECT
 - **Experiment**: Parallel rayon sgemv_f32 for lm_head (163840×7168 = 4.7 GB), also tried sgemv_f16_par and sgemv_f16
-- **Result**: 1.54 tok/s (identical to baseline). sgemv_f16_par: 1.41 (rayon alloc overhead). sgemv_f16: 1.38 (FCVTL < DRAM bandwidth).
-- **Verdict**: NO EFFECT — lm_head is only 19ms (2.9% of total). Not a bottleneck.
-- **Insight**: cblas_sgemv already saturates M4 Max memory bandwidth single-threaded (~90 GB/s per-core). Parallelism adds no benefit. f16→f32 conversion throughput (~65 GB/s via FCVTL) is SLOWER than DRAM read, so sgemv_f16 is always slower than sgemv_f32 on this hardware.
-- **Dead ends**: lm_head optimization is a dead end. All 3 approaches (parallel f32, parallel f16, single-thread f16) are equal or worse.
-- **Profiling discovery**: lm_head=19ms, per-layer loop=97% of time (~10.2ms/layer × 61 layers ≈ 622ms).
+- **Result**: 1.54 tok/s (identical to baseline).
+- **Verdict**: NO EFFECT — lm_head is only 24ms (3.3% of total). Not a bottleneck.
+- **Insight**: cblas_sgemv already saturates M4 Max memory bandwidth single-threaded. f16 conversion throughput (FCVTL) is SLOWER than DRAM read.
+
+### Iteration 3: Disable pool write-back — WIN (+0.03 tok/s)
+- **Experiment**: Disable ExpertPool write-back that copies 23 MB per expert miss to pool buffers
+- **Result**: 1.57 tok/s (median warm: 1.58, 1.57, 1.57) vs 1.54 baseline
+- **Verdict**: WIN — pool write-back was causing 3x regression (0.49 tok/s with default 3000 cap)
+- **Root cause**: 480 expert misses/token × 23 MB alloc+copy = 11 GB memory churn per token. This evicts OS page cache entries for expert files, making pread slower. Net effect: write-back costs more than the cache hits save.
+- **Fix**: Disabled write-back, OS page cache handles expert caching natively. Pool tracking still runs for statistics.
+- **Profiling data**: MLA=2.2ms/layer (18%), FFN=9.0ms/layer (75%), convert_wait≈0, lm_head=24ms, other=1.6ms total.
 
 ## Dead Ends (do not retry)
-- **lm_head optimization**: Only 2.9% of total time. cblas_sgemv saturates bandwidth single-threaded. sgemv_f16 always slower (FCVTL < DRAM).
+- **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
+- **Pool write-back on critical path**: 23 MB alloc+copy per miss causes page cache eviction. Must be async or deferred.
 
 ## Suggested Next Experiments
-1. **Reduce "Other" 4ms bucket** — profile what's in the conversion/norms/Metal overhead. Could be L2 cache misses from f32 buffer thrashing.
-2. **Overlap expert pread with MLA** — currently sequential. MLA is only 0.4ms but pread could start earlier.
-3. **Batch expert Metal dispatches** — 8 expert dispatches per layer, each with command buffer overhead. Single fused dispatch?
-4. **Wire expert-pager pool** — pool.rs is built but not wired into decode. Could eliminate pread for cached experts.
+1. **Reduce MLA 2.2ms → ~1.0ms** — o_proj is 1.2ms (235 MB sgemv). Cache o_proj f32 for all layers (14.3 GB) to eliminate from double-buffer, freeing bandwidth. Or overlap o_proj with FFN start.
+2. **Reduce FFN pread time** — when page cache warm, pread is fast (~3ms). When cold, 10ms+. Pre-populate pool buffers during prefill (not decode). Or use madvise(MADV_WILLNEED) to prefault expert pages.
+3. **Async pool write-back** — overlap pool buffer copy with next layer's MLA (CPU idle while Metal runs). Recovers pool benefit without decode-path overhead.
+4. **Reduce Metal dispatch overhead** — 3.5ms for 8 experts. Cache constant u32 buffers, reuse command encoders.
 5. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
