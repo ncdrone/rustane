@@ -222,6 +222,10 @@ impl ModelV2 {
                 effective_top_k,
                 config.quantization.group_size,
             );
+            // Ensure scratch + persistent weight buffer for GPU o_proj dispatch.
+            // K2: out_features=7168 (hidden), in_features=8192 (v_total = 64 heads × 128 v_head_dim)
+            let v_total = mla_config.num_heads * mla_config.v_head_dim;
+            m.ensure_oproj_scratch(config.hidden_size(), v_total);
             if !lazy_mode {
                 // Small models: wrap all expert mmaps (fits in memory)
                 for layer in 0..num_layers {

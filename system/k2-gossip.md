@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 22
+tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 23
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -190,6 +190,17 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: Speculative pread adds 184 MB/layer of F_NOCACHE SSD I/O (8 experts × 23 MB) that competes for NVMe bandwidth. Even with >95% hit rate reducing normal pread to ~0.5 experts, the total SSD throughput increases. Thread spawn overhead (9600+ spawns/decode) and NVMe controller cache thrashing compound the regression.
 - **Key insight**: With F_NOCACHE, pread is already near-optimal — SSD serves direct DMA at ~5 GB/s. There's no "cold miss latency spike" to eliminate (unlike page-cache mode). Speculation only helps when there's a cache layer to warm ahead of time. F_NOCACHE eliminates the cache, making speculation pointless.
 
+### Iteration 21: GPU o_proj (Metal f32 GEMV) — REVERTED
+- **Experiment**: Move o_proj [7168, 8192] sgemv from CPU cblas_sgemv to Metal GPU f32_gemv shader
+- **Result**: 0.48 tok/s median (of 0.48, 0.48, 0.50) vs 0.50* session baseline. MLA: 180-274ms (vs CPU 128-153ms).
+- **Three approaches tested**:
+  1. **Per-layer wrap_mmap**: Creates new 235 MB Metal buffer each layer → 12ms/layer GPU page table setup. Unusable.
+  2. **Persistent Metal buffer + memcpy**: Allocate once, copy 235 MB/layer via contents(). MLA=477ms (3.7x). memcpy at ~100 GB/s = 2.3ms/layer dominates.
+  3. **Pre-cached zero-copy buffers**: Large Vec allocs on macOS use mmap → page-aligned (confirmed: 0xf2e800000). wrap_mmap uses newBufferWithBytesNoCopy. Page tables set up once at warmup. MLA: 180-274ms — GPU dispatch overhead (~1.5ms/layer) still slower than CPU AMX sgemv.
+- **Root cause**: On UMA (M4 Max), CPU and GPU share ~273 GB/s memory bus. For bandwidth-bound sgemv, GPU can't beat CPU's AMX coprocessor. GPU adds overhead: command buffer creation/encoding (~0.5ms), waitUntilCompleted synchronization (~0.5ms), result copy. These overheads negate any potential bandwidth advantage.
+- **Key insight for UMA**: GPU offload only wins for compute-bound kernels (INT4 dequant+GEMV = ALU-bound). For pure f32 GEMV (bandwidth-bound), CPU AMX is faster due to zero dispatch overhead.
+- **Infrastructure kept**: oproj_gpu method, ensure_oproj_scratch(out_features, v_total), auto_oproj_metal.rs test (4 tests, max_diff<1e-3). Correctness confirmed: GPU produces identical results to CPU.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -207,6 +218,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Overlap conversion with MLA**: -9.5% regression. MLA sgemv needs full 273 GB/s DRAM bandwidth. Concurrent conversion (f16 mmap read + f32 write) steals half, doubling MLA from 135ms to 270ms. The 24ms convert_wait savings is dwarfed. MLA must run alone.
 - **Pre-cache all layers as f32 (~54 GB)**: -64% regression (0.6 vs 1.68). 54 GB heap exhausts DRAM, evicting backbone mmap pages → shared_ffn faults from SSD every layer. FFN 7ms→27ms/layer. On 128 GB system with 524 GB model, DRAM is scarce — never pin >10 GB of converted weights.
 - **Expert speculation (speculative pread for next layer)**: -41% regression (0.30 vs 0.51*). Three variants tried (scope, sequential spawn, parallel spawn). Incompatible with F_NOCACHE: direct DMA is already fast, no cache layer to pre-warm. 184 MB/layer spec I/O doubles SSD bandwidth usage. Thread spawn overhead (9600 spawns/decode) compounds. Dead end with F_NOCACHE.
+- **GPU o_proj (Metal f32 GEMV for o_proj)**: -4% regression (0.48 vs 0.50*). Three approaches: per-layer wrap_mmap (12ms page table), persistent memcpy (3.7x MLA), zero-copy pre-cached (still +40-100% MLA). On UMA, f32 GEMV is bandwidth-bound — GPU shares same 273 GB/s memory bus as CPU AMX. GPU dispatch overhead (~1.5ms/layer encode+sync) exceeds any bandwidth gain. GPU offload only viable for ALU-bound kernels (INT4 dequant).
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
