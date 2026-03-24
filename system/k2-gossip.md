@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 10
+tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 11
 NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → same experts → warm cache)
 
 ## Model Facts
@@ -105,6 +105,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Parallel per-head sgemv (W_UK/W_UV)**: 64×[128,512] sgemv = 320µs/layer total. Each call ~5µs, dominated by BLAS function-call overhead, not compute. Rayon parallelism saves <30µs/layer = 1.8ms/token.
 - **rayon::join for pread+shared_ffn**: Nested par_iter inside rayon::join causes work-stealing contention. thread::scope's independent OS thread avoids this. pthread overhead (~2-6ms) ≈ rayon contention cost.
 - **V2 down shader half x_cache**: Down pass with in_features=2048 is bandwidth-bound, not occupancy-limited. float[4096]=16KB already allows 2 concurrent TGs. half saves TG memory but no perf impact.
+- **fcntl(F_RDADVISE) prefetch before pread**: pread itself triggers DMA immediately. The hint-to-read window is microseconds — kernel can't start DMA before pread does it.
 
 ## Suggested Next Experiments
 NOTE: All timing estimates below are from the OLD (buggy) profiling. Need fresh per-layer breakdown with correct shader.
