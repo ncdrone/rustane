@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 20
+tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 21
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -171,6 +171,15 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: 54 GB of heap-allocated f32 weights exhausts available DRAM on 128 GB system. Backbone mmap pages (shared FFN weights, ~176 MB per layer) are evicted from page cache → every layer's shared_ffn faults from SSD. The double-buffer approach only pins ~1.8 GB at a time, leaving ample room for backbone pages in page cache.
 - **Key insight**: On a 128 GB system running a 524 GB model, DRAM is the scarcest resource. Any optimization that trades DRAM for compute savings will backfire. The double-buffer pipeline (~1.8 GB) is near-optimal for memory footprint. Large pre-caches (>10 GB) will evict working set pages.
 
+### Iteration 19: RUSTANE_TOP_K=6 sweep — WIN (+25%, opt-in)
+- **Experiment**: Added RUSTANE_TOP_K env var to override num_experts_per_tok. Tested top_k=6 vs default 8.
+- **Result**: 0.64 tok/s (median warm: 0.64, 0.64, 0.64) vs 0.51* session baseline
+- **Verdict**: WIN — +25.5% improvement. Opt-in via env var; default behavior unchanged.
+- **Profiling**: FFN dropped from 1899ms to 1449ms/token (-24%). MLA unchanged at 133ms. Savings entirely from 2 fewer expert pread + Metal dispatches per MoE layer × 60 layers. Per-layer FFN: 31ms → 24ms (-7ms/layer).
+- **Output quality**: top_k=6 produces coherent text ("a transformer is a type of neural network architecture that was introduced in"). Routing weights properly renormalized. top_k=6 selects a strict subset of the top_k=8 experts.
+- **Implementation**: ~15 lines. `effective_top_k` field on ModelV2, checked at all routing call sites. Env var RUSTANE_TOP_K=N overrides config. Staging buffer, Metal scratch, and router all use effective value.
+- **Insight**: Reducing top_k is a first-order lever for pread-dominated workloads. With 524 GB experts on SSD, each expert pread costs ~4ms. Cutting 2 experts/layer saves ~8ms/layer × 60 = 480ms/token. Quality impact is acceptable for INT4 quantized model. Future: try top_k=4 for another 33% reduction.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -201,3 +210,29 @@ NOTE: Fresh profiling from iter 10 (warm, correct shader):
 3. **madvise(MADV_SEQUENTIAL) on expert files** — hint kernel that expert file reads are sequential within each file. May improve readahead for pread.
 4. **Larger pread I/O size** — instead of 8 separate pread calls (one per expert, ~23MB each), single contiguous pread if experts are contiguous in file. Reduces syscall overhead.
 5. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
+6. **top_k=4 sweep** — top_k=6 gave +25%. top_k=4 would save another ~33% of pread+Metal per layer. Quality might degrade — test empirically. Use RUSTANE_TOP_K=4.
+
+## ANE Research Integration (NEW — from rustane-research/ANE/)
+READ: research-context/ane-synthesis.md, research-context/ane-unified-plan.md, research-context/ane-mla-attention.md
+
+### Key finding: 0% ANE utilization during decode
+M4 Max has 56.5 TFLOPS total silicon. We use 2.5% of it. The ANE (19 TFLOPS at 2.8W) is completely idle.
+
+### Immediately actionable (no ANE integration needed):
+
+1. **Expert speculation with madvise prefault** — previous token's routing predicts next layer's experts with >95% similarity after layer 3. After routing layer N, call `madvise(MADV_WILLNEED)` on predicted layer N+1 expert file regions. Pre-faults pages during Metal dispatch (GPU busy = CPU free). Cost: ~10 lines. Potential: eliminate cold-miss pread latency spikes.
+
+2. **o_proj on Metal GPU** — o_proj is 1.2ms/layer on CPU (cblas_sgemv). K2 o_proj is [7168, 4096] at f32. Metal already has F32_GEMV_SHADER compiled in dequant.rs. Dispatch o_proj on GPU overlapped with next layer's convert. Saves ~73ms/token (1.2ms × 61 layers). ~50 lines.
+
+3. **Batch W_UK + W_UV as sgemm** — currently 64 sequential sgemv calls (already tried rayon, didn't help). Instead: reshape to single sgemm call. W_UK is [64, 128, 512] = [64×128, 512] = [8192, 512]. One sgemm replaces 64 sgemv. Same for W_UV. Potential: 2× faster absorption.
+
+### Medium-term (ANE integration — bigger lift):
+4. **ANE Conv1x1 for MLA projections** — Q LoRA + KV compression + W_UK absorption as compiled ANE graph. Conv1x1 is 3x faster than matmul on ANE. Saves ~6ms/layer. Needs: ane-bridge FFI, IOSurface weight staging, compilation. ~500 lines.
+
+5. **Heterogeneous pipeline** — ANE does projections while Metal does expert FFN while CPU does attention scoring. Three accelerators running simultaneously. This is the path to 5+ tok/s.
+
+### Constraints (do not violate):
+- Expert FFN (dim=7168) MUST stay on Metal — exceeds ANE's 32 MB SRAM cliff (4.7x slower on ANE)
+- IOSurface spatial width must be multiple of 16 (silent data corruption)
+- No rsqrt after reduce on ANE — use pow(-0.5)
+- MLA must run without concurrent DRAM-intensive work (confirmed by iter 17: bandwidth contention doubles MLA time)

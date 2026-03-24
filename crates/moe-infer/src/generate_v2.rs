@@ -113,6 +113,8 @@ pub struct ModelV2 {
     pub expert_loaders: std::collections::HashMap<usize, ExpertLoader>,
     /// Expert stride in bytes (computed once at load time).
     pub expert_stride: usize,
+    /// Effective top_k (overridable via RUSTANE_TOP_K env var).
+    pub effective_top_k: usize,
     /// Staging buffer for packing selected experts before Metal dispatch.
     /// Size: top_k * expert_stride bytes. Reused across layers and tokens.
     pub expert_staging: Vec<u8>,
@@ -200,6 +202,15 @@ impl ModelV2 {
         }
         let lm_head_f32: Vec<f32> = weights.lm_head()?.iter().map(|v| v.to_f32()).collect();
 
+        // Effective top_k: overridable via RUSTANE_TOP_K env var for parameter sweeps.
+        // Reducing top_k (e.g. 6 vs 8) saves ~25% pread + Metal per layer.
+        let effective_top_k = std::env::var("RUSTANE_TOP_K")
+            .ok().and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(config.num_experts_per_tok());
+        if effective_top_k != config.num_experts_per_tok() {
+            eprintln!("RUSTANE_TOP_K={effective_top_k} (config: {})", config.num_experts_per_tok());
+        }
+
         // Metal setup
         let mut metal = MetalDequantGemv::new();
         let mut expert_metal_bufs = std::collections::HashMap::new();
@@ -208,7 +219,7 @@ impl ModelV2 {
             m.init_scratch(
                 config.hidden_size(),
                 config.moe_inter_size(),
-                config.num_experts_per_tok(),
+                effective_top_k,
                 config.quantization.group_size,
             );
             if !lazy_mode {
@@ -244,7 +255,7 @@ impl ModelV2 {
         let expert_stride = gu_total * 2 + dn_total;
 
         // Pre-allocate staging buffer for top-k experts
-        let top_k = config.num_experts_per_tok();
+        let top_k = effective_top_k;
         let expert_staging = vec![0u8; top_k * expert_stride];
 
         if lazy_mode {
@@ -314,7 +325,7 @@ impl ModelV2 {
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
-            expert_loaders, expert_stride, expert_staging, expert_staging_metal,
+            expert_loaders, expert_stride, effective_top_k, expert_staging, expert_staging_metal,
             expert_pool: std::cell::UnsafeCell::new(expert_pool),
             pool_metal_bufs: std::cell::UnsafeCell::new(vec![None; pool_buffers.len()]),
             pool_buffers: std::cell::UnsafeCell::new(pool_buffers),
@@ -671,7 +682,7 @@ fn moe_ffn_f16(
             moe_router::route_sigmoid_v3(
                 &gate_logits, bias,
                 model.config.ffn.n_group, model.config.ffn.topk_group,
-                model.config.num_experts_per_tok(), 1.0,
+                model.effective_top_k, 1.0,
             )
         } else {
             router.route(&gate_logits)
@@ -847,7 +858,7 @@ fn moe_ffn_v2(
                 bias,
                 model.config.ffn.n_group,
                 model.config.ffn.topk_group,
-                model.config.num_experts_per_tok(),
+                model.effective_top_k,
                 1.0,  // scaling applied separately in weight accumulation
             )
         } else {
@@ -1167,7 +1178,7 @@ pub fn generate_v2(
     // Create router
     let router_config = RouterConfig {
         num_experts: model.config.num_experts(),
-        top_k: model.config.num_experts_per_tok(),
+        top_k: model.effective_top_k,
         norm_topk_prob: model.config.ffn.norm_topk_prob,
         bias_lr: 0.0,
     };
