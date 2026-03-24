@@ -1,0 +1,3 @@
+date	experiment	variable	baseline	result	verdict	decode_toks	notes
+2026-03-23	k2-first-token	cold-start-inference	-	414s prefill, output "Hello\n"	baseline	0.005	Cold start, 524 GB paging from SSD. Correct output.
+2026-03-23	k2-warm-gen	warm-decode-10tok	0.005	"Paris France France..." repetition	baseline	0.005	Warm but still slow — expert files not cached. Repetition from greedy + INT4 quantization noise.
