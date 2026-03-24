@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 18
+tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 19
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -22,7 +22,7 @@ F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/to
 ## Per-Layer Breakdown (MEASURED, warm, with F_NOCACHE)
 - **MLA: ~2.2ms/layer** (22%) — Q LoRA (1.3ms) + o_proj (1.2ms) dominate
 - **FFN: ~7ms/layer** (72%) — max(pread ~3-5ms, shared_ffn ~1.5-2.7ms) + Metal ~3ms
-- **convert_wait: ~0ms** — f16→f32 conversion fully hidden behind FFN in double-buffer pipeline
+- **convert_wait: ~24ms total** (~0.4ms/layer) — f16→f32 conversion mostly hidden behind FFN, but some layers take slightly longer. Cannot overlap with MLA (iter 17: MLA needs full bandwidth).
 - **lm_head: 24ms** (4%) — single-threaded cblas_sgemv, already bandwidth-saturated
 - **other: ~1ms total** (<1%) — thread::scope overhead + residual adds
 - **Previous (no F_NOCACHE)**: FFN was 9ms/layer due to page cache pollution + bandwidth contention
@@ -156,6 +156,13 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: Same as iter 5 and 10. With F_NOCACHE, pread uses direct SSD→user DMA which is fast (~1.5ms for down portion). Metal_fused is ~1.5ms. The overlap window is ≈ 0 because they complete in roughly the same time. Extra command buffer overhead (~0.1ms × 60 layers = 6ms) further negates any micro-gain.
 - **Insight**: This is the 3rd attempt at split-pread (iters 5, 10, 16). Confirmed dead end across all conditions: pre-F_NOCACHE (iter 5), post-correctness-fix (iter 10), and post-F_NOCACHE (iter 16). The fundamental issue is that pread_dn ≈ Metal_fused, so there's nothing to overlap.
 
+### Iteration 17: Overlap conversion with MLA — REVERTED (regression)
+- **Experiment**: Move convert_layer_into to overlap with MLA + FFN (instead of FFN-only). Conversion thread starts before MLA, giving it an extra 2.2ms to complete. Reduces convert_wait from 24ms to 0.4ms.
+- **Result**: 1.24 tok/s (warm: 1.24, 1.24) vs 1.34* session baseline
+- **Verdict**: REVERTED — -9.5% regression.
+- **Root cause**: MLA sgemv operations (especially o_proj: 235 MB read) need full DRAM bandwidth (~273 GB/s). Concurrent conversion (reading f16 mmap + writing f32 buf_b) steals bandwidth, causing MLA to double from 135ms to 270ms (+135ms). The 24ms saved from eliminating convert_wait is dwarfed by the 135ms MLA slowdown.
+- **Key insight**: MLA is a DRAM bandwidth-critical section. ANY concurrent memory-intensive work during MLA degrades performance. The current design (MLA alone, then conversion overlaps FFN) is optimal because FFN's pread uses SSD DMA (not DRAM bandwidth) and Metal GPU dispatch uses GPU memory controller (also not CPU DRAM bandwidth).
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -170,6 +177,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **TG=512/ROWS_PER_TG=16 for fused+V2 shaders**: -8.7% regression (1.05 vs 1.15). Larger TGs reduce occupancy on M4 Max (40 EUs). TG=256 is optimal for bandwidth-bound INT4 GEMV.
 - **f16 o_proj via sgemv_f16_par from mmap**: -21% regression (0.91 vs 1.15). Double-buffer already pre-converts o_proj f16→f32 overlapped with FFN. f16_par bypasses warm DRAM, reads cold mmap during MLA, competes with expert pread for page cache. Same lesson as f16 inline decode: anything on MLA critical path that touches mmap loses to pre-staged f32.
 - **Dead MLA code removal (mla_layer_weights + final_norm.to_vec)**: ~0.2ms/token dead overhead. Unmeasurable. Committed as code cleanup.
+- **Overlap conversion with MLA**: -9.5% regression. MLA sgemv needs full 273 GB/s DRAM bandwidth. Concurrent conversion (f16 mmap read + f32 write) steals half, doubling MLA from 135ms to 270ms. The 24ms convert_wait savings is dwarfed. MLA must run alone.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):

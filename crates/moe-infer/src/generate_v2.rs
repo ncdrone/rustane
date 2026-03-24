@@ -1279,7 +1279,10 @@ pub fn generate_v2(
                     &buf_a
                 };
 
-                // Phase 1: MLA attention — no background thread, full memory bandwidth
+                // Phase 1: MLA attention — no background thread, full memory bandwidth.
+                // NOTE: Overlapping conversion with MLA tested (iter 17) — REGRESSION:
+                // MLA doubled from 135ms to 270ms due to DRAM bandwidth contention.
+                // MLA sgemv needs full 273 GB/s bandwidth; conversion steals half.
                 let t_mla = std::time::Instant::now();
                 let (mut residual, normed2) = run_mla_only(
                     model, &mut cache, layer, &x, pos, lf,
@@ -1294,7 +1297,7 @@ pub fn generate_v2(
                         run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
                         if profile_tok { tok_ffn_us += t_ffn.elapsed().as_micros() as u64; }
                     } else {
-                        // Next layer needs conversion — pipeline overlap
+                        // Next layer needs conversion — pipeline overlap with FFN only
                         std::thread::scope(|s| -> Result<()> {
                             let h = s.spawn(|| {
                                 convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
