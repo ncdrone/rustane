@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 3
+tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 4
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -50,6 +50,12 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: 480 expert misses/token × 23 MB alloc+copy = 11 GB memory churn per token. This evicts OS page cache entries for expert files, making pread slower. Net effect: write-back costs more than the cache hits save.
 - **Fix**: Disabled write-back, OS page cache handles expert caching natively. Pool tracking still runs for statistics.
 - **Profiling data**: MLA=2.2ms/layer (18%), FFN=9.0ms/layer (75%), convert_wait≈0, lm_head=24ms, other=1.6ms total.
+
+### Iteration 4: Pool disable default (pool_cap=0) — NO EFFECT
+- **Experiment**: Change default pool_cap from 3000→0 (pool=None) since write-back is disabled
+- **Result**: 1.55 tok/s (median warm: 1.37, 1.55, 1.57) vs 1.57 baseline
+- **Verdict**: NO EFFECT — -1.3%, within noise. Committed as code cleanup.
+- **Insight**: Pool HashMap tracking overhead (~0.3ms/layer = ~18ms/token) is real but too small to reliably measure against 650ms/token total. The 1.37 outlier shows page cache state dominates run-to-run variance. RUSTANE_POOL_CAP env var preserved for future pool experiments.
 
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
