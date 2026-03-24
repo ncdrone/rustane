@@ -42,6 +42,40 @@ fn pool_writeback_enabled() -> bool {
     })
 }
 
+/// Auto-detect system RAM and compute optimal pool capacity.
+/// Formula: (total_ram - 30 GB model overhead) × 0.85 / expert_stride.
+/// Capped at 3000 (empirical ceiling: 4000 causes memory pressure on 128 GB).
+/// Returns 0 (disabled) if system has <36 GB RAM.
+fn auto_pool_cap(expert_stride: usize) -> usize {
+    let total_ram = system_memory_bytes().unwrap_or(0);
+    if total_ram == 0 || expert_stride == 0 {
+        return 1000; // fallback to conservative default
+    }
+    const MODEL_OVERHEAD: u64 = 30_000_000_000; // ~30 GB (backbone + lm_head + KV + staging)
+    const SAFETY_FACTOR: f64 = 0.85; // keep 15% free for OS/system
+    const MAX_CAP: usize = 3000;
+    let available = total_ram.saturating_sub(MODEL_OVERHEAD);
+    let pool_budget = (available as f64 * SAFETY_FACTOR) as u64;
+    let cap = (pool_budget / expert_stride as u64) as usize;
+    cap.min(MAX_CAP)
+}
+
+/// Get total physical memory via sysctl hw.memsize (macOS).
+fn system_memory_bytes() -> Option<u64> {
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let ret = unsafe {
+        libc::sysctlbyname(
+            b"hw.memsize\0".as_ptr() as *const libc::c_char,
+            &mut size as *mut u64 as *mut libc::c_void,
+            &mut len as *mut usize,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret == 0 && size > 0 { Some(size) } else { None }
+}
+
 // Thread-local ExpertPool simulation for measuring decode-phase hit rates.
 // When Some, moe_ffn_v2 calls pool.request() for each routed expert (tracking only).
 // When None (default), no overhead. Gated by RUSTANE_POOL_SIM=1.
@@ -303,28 +337,23 @@ impl ModelV2 {
         // Expert pool: cache hot experts in RAM to avoid pread on repeated access.
         // K2 profiling shows pread is 71-84% of layer time. Pool eliminates hits entirely.
         let (expert_pool, pool_buffers) = if lazy_mode && expert_stride > 0 {
-            // Pool capacity: fit as many experts as RAM allows.
-            // Each slot = expert_stride bytes (~23 MB for K2).
-            // Budget: available RAM after backbone + staging + KV cache.
-            // Conservative: use ~60% of available memory for pool.
-            // Pool capacity: use most of available RAM but LAZY allocate.
-            // Pre-allocating 91 GB at once evicts OS page cache — disaster.
-            // Lazy: start with empty Vecs, allocate on first miss per slot.
+            // Auto-adaptive pool cap: detect system RAM and maximize pool usage.
+            // Lazy allocate: start with empty Vecs, grow on first miss per slot.
             let pool_cap_env = std::env::var("RUSTANE_POOL_CAP")
                 .ok().and_then(|v| v.parse::<usize>().ok());
-            // Default 1000: DRAM pool caches hot experts, replacing SSD pread with memcpy.
-            // 1000 slots × ~23 MB = ~23 GB. Fits in 128 GB with backbone + KV.
-            // Set RUSTANE_POOL_CAP=0 to disable.
-            let pool_cap = pool_cap_env.unwrap_or(1000);
+            let pool_cap = pool_cap_env.unwrap_or_else(|| auto_pool_cap(expert_stride));
             if pool_cap == 0 {
                 eprintln!("ExpertPool: DISABLED (RUSTANE_POOL_CAP=0)");
                 (None, Vec::new())
             } else {
                 // Lazy: allocate empty Vecs (0 bytes each). Grow on first use.
                 let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| Vec::new()).collect();
-                eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB",
+                let source = if pool_cap_env.is_some() { "manual" } else { "auto" };
+                let ram_gb = system_memory_bytes().unwrap_or(0) as f64 / 1e9;
+                eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB ({}, {:.0} GB RAM)",
                     pool_cap, expert_stride as f64 / 1e6,
-                    pool_cap as f64 * expert_stride as f64 / 1e9);
+                    pool_cap as f64 * expert_stride as f64 / 1e9,
+                    source, ram_gb);
                 (Some(expert_pager::ExpertPool::new(pool_cap)), bufs)
             }
         } else {

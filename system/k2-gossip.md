@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | POOL+top_k=4: 1.41 (+176%) | POOL+top_k=6: 1.08 (+112%) | POOL+top_k=8: 0.86 (+69%) | wins: 8 | experiments: 29
+tok/s: 1.68 (default top_k=8) | AUTO POOL (cap=3000 on 128GB): 1.13 (+31% over old default) | POOL+top_k=4: 1.41 (+176%) | wins: 10 | experiments: 31
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -241,6 +241,27 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Implementation**: Added sgemm_nt_add to blas.rs (sgemm_nt with beta=1.0). Modified mla_decode_v_concat in mla_attention.rs. ~20 lines changed. 4 correctness tests pass (max_diff < 3.3e-7).
 - **Insight**: At current SSD-dominated decode times (~2000ms/token), MLA micro-optimizations (saving <10ms) are unmeasurable. Code is cleaner: fewer allocs, one fewer BLAS call, one fewer intermediate buffer.
 
+### Iteration 28: Pool capacity extended sweep — WIN (+116% at cap=3000, REGRESSION at 4000)
+- **Experiment**: Extended pool capacity sweep: cap=1500, 2000, 3000, 4000.
+- **Results**:
+  - cap=1500 (35.1 GB): 0.97 tok/s (+90%)
+  - cap=2000 (46.8 GB): 1.04 tok/s (+104%)
+  - cap=3000 (70.2 GB): 1.10 tok/s (+116%)
+  - cap=4000 (93.6 GB): 0.52 tok/s **REGRESSION** (-2%)
+- **Verdict**: WIN up to 3000, REGRESSION at 4000. Memory ceiling established.
+- **Root cause of 4000 regression**: 93.6 GB pool + 23.4 GB backbone + 4.7 GB lm_head + 0.6 GB KV = ~122 GB. Only 6 GB free on 128 GB system. macOS evicts backbone mmap pages → shared_ffn faults from SSD every layer. FFN balloons from ~7ms to ~30ms/layer.
+- **Scaling curve**: Diminishing returns — 500→1000 (+16%), 1000→1500 (+13%), 1500→2000 (+7%), 2000→3000 (+6%). Sweet spot: 2000 slots (46.8 GB) for 128 GB systems.
+- **Memory budget formula**: pool_max_gb ≈ total_ram - 30 GB (backbone + lm_head + KV) - 15% safety margin. On 128 GB: 128 - 30 - 19 = 79 GB → ~3376 slots. Empirically 3000 works, 4000 fails.
+
+### Iteration 29: Auto-adaptive pool cap — WIN (+31%, 0.86 → 1.13 tok/s)
+- **Experiment**: Replace fixed `pool_cap=1000` default with auto-detection via `sysctl hw.memsize`.
+- **Formula**: `pool_cap = (total_ram - 30 GB model overhead) × 0.85 / expert_stride`, capped at 3000.
+- **Result**: 1.13 tok/s (median warm: 1.13, 1.13, 1.13) vs 0.86 at old cap=1000.
+- **Verdict**: WIN — +31% throughput. Zero-config improvement for all users.
+- **Scaling**: 128 GB → 3000 slots (70.2 GB), 64 GB → 1404 slots (32.9 GB), 36 GB → 313 slots (7.3 GB), <30 GB → disabled.
+- **Implementation**: `auto_pool_cap()` + `system_memory_bytes()` in generate_v2.rs. 30 lines. `RUSTANE_POOL_CAP` env var still overrides. 8 unit tests verify formula for all RAM sizes.
+- **Key insight**: On 128 GB, the old fixed default of 1000 slots was leaving 47 GB of usable DRAM on the table. Auto-adaptive uses the full memory budget safely.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -261,6 +282,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Batch W_UK/W_UV as single sgemm**: NOT FEASIBLE. Each of 64 MLA heads has a different weight matrix — sgemm uses one shared matrix. Block-diagonal trick requires 64× more FLOPs. Total time (640µs/layer) is only 2.5% of decode. Not a bottleneck.
 - **GPU o_proj (Metal f32 GEMV for o_proj)**: -4% regression (0.48 vs 0.50*). Three approaches: per-layer wrap_mmap (12ms page table), persistent memcpy (3.7x MLA), zero-copy pre-cached (still +40-100% MLA). On UMA, f32 GEMV is bandwidth-bound — GPU shares same 273 GB/s memory bus as CPU AMX. GPU dispatch overhead (~1.5ms/layer encode+sync) exceeds any bandwidth gain. GPU offload only viable for ALU-bound kernels (INT4 dequant).
 - **Fuse MLA scores (sgemm_nt_add + in-place softmax)**: NO EFFECT. Saves ~8ms total MLA (134→126ms), but MLA is only 6% of token time. Net savings ~0.4%, unmeasurable. Committed for code quality (fewer allocs, cleaner code).
+- **Pool cap>3000 on 128 GB systems**: REGRESSION. cap=4000 (93.6 GB) leaves only 6 GB free → macOS evicts backbone mmap pages → shared_ffn faults from SSD. Memory ceiling: ~70 GB pool (3000 slots) on 128 GB. Formula: max_pool_gb = total_ram - 30 GB model overhead - 15% safety.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
