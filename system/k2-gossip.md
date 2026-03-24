@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 7
+tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 8
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -78,6 +78,13 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Insight**: Per-head sgemv on [128,512] is ~5µs/call (compute-bound, data fits L2). 64 sequential calls = 320µs/layer. Rayon parallel dispatch overhead (~15µs) nearly cancels the parallelism benefit. AMX sgemv on tiny matrices has per-call overhead that dominates; parallelism doesn't help because the BLAS function-call overhead is already the bottleneck, not the sequential execution time.
 - **Infrastructure**: Fixed pre-existing build error in make_attn_weights (removed dead f16 field assignments that referenced non-existent struct fields).
 
+### Iteration 8: rayon::join for pread+shared_ffn overlap — NO EFFECT
+- **Experiment**: Replace std::thread::scope with rayon::join for the pread+shared_ffn overlap in moe_ffn_v2. Eliminates ~60 pthread_create/join per token by reusing rayon's warm thread pool.
+- **Result**: 1.53 tok/s (median warm: 1.53, 1.53, 1.51) vs 1.57 baseline
+- **Verdict**: NO EFFECT — -2.5%, within noise. REVERTED.
+- **Insight**: rayon::join with nested par_iter (pread uses into_par_iter inside join's second closure) causes work-stealing contention. Rayon's work-stealing scheduler can steal pread subtasks onto the thread running shared_ffn, partially serializing work. thread::scope avoids this because the spawned OS thread is independent of rayon's pool. The ~60 pthread_create/join calls cost ~2-6ms/token total but rayon contention costs a similar amount, netting zero.
+- **Infrastructure kept**: auto_rayon_join_ffn.rs test file (validates rayon::join concurrency properties).
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -85,6 +92,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Split pread + pipeline Metal fused/down**: pread_dn (1.5-2.5ms) > GPU fused (~1.75ms). No overlap benefit, extra cmd buffer overhead cancels.
 - **Metal constant buffer caching**: 4-byte u32 buffers are ~1μs each via newBufferWithBytes. ~360/token = 0.18ms, unmeasurable.
 - **Parallel per-head sgemv (W_UK/W_UV)**: 64×[128,512] sgemv = 320µs/layer total. Each call ~5µs, dominated by BLAS function-call overhead, not compute. Rayon parallelism saves <30µs/layer = 1.8ms/token.
+- **rayon::join for pread+shared_ffn**: Nested par_iter inside rayon::join causes work-stealing contention. thread::scope's independent OS thread avoids this. pthread overhead (~2-6ms) ≈ rayon contention cost.
 
 ## Suggested Next Experiments
 1. **Async Metal dispatch overlap with MLA** — Metal dispatch (3.5ms/layer) and MLA (2.2ms/layer) use different hardware (GPU vs CPU/AMX). Currently serial. If Metal were launched async and MLA(N+1) ran concurrently, saves 2.2ms/layer × 61 = 134ms (20%). Requires: split fused_and_down into launch+wait, double-buffer staging for Metal, restructure decode loop. ~150 lines.

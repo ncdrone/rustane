@@ -941,9 +941,11 @@ fn moe_ffn_v2(
             }
 
             // Overlap pread (misses only) with shared FFN via thread::scope.
+            // NOTE: rayon::join tested (iter 8) — NO EFFECT: nested par_iter inside
+            // join causes work-stealing contention, ~1.53 vs 1.57 baseline.
             let t_before_scope = std::time::Instant::now();
-            let need_pread_ref = &need_pread;
             let shared_result = std::thread::scope(|s| {
+                let need_pread_ref = &need_pread;
                 let pread_handle = s.spawn(|| {
                     let t_pread = std::time::Instant::now();
                     pread_region
@@ -966,10 +968,9 @@ fn moe_ffn_v2(
                     vec![0.0f32; hidden]
                 };
                 let shared_elapsed = t_shared.elapsed();
-
                 let pread_elapsed = pread_handle.join().unwrap();
                 if ffn_profile && layer <= 3 {
-                    eprintln!("  FFN L{layer:02} pread: {:.0}µs  shared_ffn: {:.0}µs  (overlapped)",
+                    eprintln!("  FFN L{layer:02} pread: {:.0}µs  shared_ffn: {:.0}µs",
                         pread_elapsed.as_micros(), shared_elapsed.as_micros());
                 }
                 result
