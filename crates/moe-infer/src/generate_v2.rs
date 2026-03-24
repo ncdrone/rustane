@@ -169,8 +169,9 @@ impl ModelV2 {
         eprintln!("MLA attn_scale={attn_scale:.6} (mscale={mscale:.4})");
 
         // Decide: pre-convert all layers (small models) or lazy per-layer (large models).
-        // Threshold: if num_heads > 64, the f32 pre-conversion would use too much RAM.
-        let lazy_mode = config.num_q_heads() > 64;
+        // Use lazy mode (pread) for any model with >256 experts or >64 heads.
+        // K2 has 64 heads but 384 experts (524 GB) — must use pread, not mmap.
+        let lazy_mode = config.num_q_heads() >= 64 || config.num_experts() > 256;
         let mut layers_f32 = Vec::new();
         if !lazy_mode {
             let t = std::time::Instant::now();
