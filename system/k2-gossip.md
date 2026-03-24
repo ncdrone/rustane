@@ -1,8 +1,17 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 22
+tok/s: 1.68 (default top_k=8) | AUTO POOL (cap=3000 on 128GB): 1.13 (+31% over old default) | POOL+top_k=4: 1.41 (+176%) | wins: 10 | experiments: 42
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
+
+## BENCHMARK PROTOCOL (CRITICAL — READ THIS)
+Benchmarks are now run by the bash loop AFTER you exit. Do NOT run bench_k2_tok_per_sec yourself.
+Just pass Tier 1 gates (build + correctness), commit, write experiment marker, and exit.
+The loop does: 2 warmup runs (SSD controller cache) + 3 measured runs (median).
+This eliminates page cache pollution from Claude (~1 GB RAM) and ensures consistent results.
+Three-layer cache: OS page cache (RAM) → SSD controller DRAM (1-4 GB) → NAND flash.
+Cold baseline: 0.51 tok/s. Warm baseline: 1.68 tok/s. Difference = SSD controller cache state.
+Apple SSD uses "Apple Fabric" protocol, not standard NVMe.
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -190,6 +199,84 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: Speculative pread adds 184 MB/layer of F_NOCACHE SSD I/O (8 experts × 23 MB) that competes for NVMe bandwidth. Even with >95% hit rate reducing normal pread to ~0.5 experts, the total SSD throughput increases. Thread spawn overhead (9600+ spawns/decode) and NVMe controller cache thrashing compound the regression.
 - **Key insight**: With F_NOCACHE, pread is already near-optimal — SSD serves direct DMA at ~5 GB/s. There's no "cold miss latency spike" to eliminate (unlike page-cache mode). Speculation only helps when there's a cache layer to warm ahead of time. F_NOCACHE eliminates the cache, making speculation pointless.
 
+### Iteration 21: GPU o_proj (Metal f32 GEMV) — REVERTED
+- **Experiment**: Move o_proj [7168, 8192] sgemv from CPU cblas_sgemv to Metal GPU f32_gemv shader
+- **Result**: 0.48 tok/s median (of 0.48, 0.48, 0.50) vs 0.50* session baseline. MLA: 180-274ms (vs CPU 128-153ms).
+- **Three approaches tested**:
+  1. **Per-layer wrap_mmap**: Creates new 235 MB Metal buffer each layer → 12ms/layer GPU page table setup. Unusable.
+  2. **Persistent Metal buffer + memcpy**: Allocate once, copy 235 MB/layer via contents(). MLA=477ms (3.7x). memcpy at ~100 GB/s = 2.3ms/layer dominates.
+  3. **Pre-cached zero-copy buffers**: Large Vec allocs on macOS use mmap → page-aligned (confirmed: 0xf2e800000). wrap_mmap uses newBufferWithBytesNoCopy. Page tables set up once at warmup. MLA: 180-274ms — GPU dispatch overhead (~1.5ms/layer) still slower than CPU AMX sgemv.
+- **Root cause**: On UMA (M4 Max), CPU and GPU share ~273 GB/s memory bus. For bandwidth-bound sgemv, GPU can't beat CPU's AMX coprocessor. GPU adds overhead: command buffer creation/encoding (~0.5ms), waitUntilCompleted synchronization (~0.5ms), result copy. These overheads negate any potential bandwidth advantage.
+- **Key insight for UMA**: GPU offload only wins for compute-bound kernels (INT4 dequant+GEMV = ALU-bound). For pure f32 GEMV (bandwidth-bound), CPU AMX is faster due to zero dispatch overhead.
+- **Infrastructure kept**: oproj_gpu method, ensure_oproj_scratch(out_features, v_total), auto_oproj_metal.rs test (4 tests, max_diff<1e-3). Correctness confirmed: GPU produces identical results to CPU.
+
+### Iteration 22: Batch W_UK/W_UV as sgemm — NOT FEASIBLE
+- **Experiment**: Reshape W_UK [64,128,512] to [8192,512], dispatch as single cblas_sgemm instead of 64 sequential cblas_sgemv.
+- **Result**: NOT FEASIBLE — mathematically impossible. Each of 64 heads has a DIFFERENT weight matrix. sgemm(Q[64,128], W[8192,512]) sums across heads (wrong). Block-diagonal trick requires 64x more FLOPs. Per-head weights are inherent to MLA architecture.
+- **Time analysis**: 64 sgemv × 5µs × 2 loops = 640µs/layer = 39ms for 61 layers = 2.5% of total decode. Not worth pursuing even if feasible.
+
+### Iteration 23: top_k=4 sweep — WIN (+79%)
+- **Experiment**: RUSTANE_TOP_K=4 vs default top_k=8
+- **Result**: 0.84 tok/s median warm (of 0.88, 0.84, 0.84) vs 0.47* session baseline. +79%.
+- **FFN**: 960ms vs 1900ms at top_k=8 (-50%). 4 fewer expert pread (92 MB less I/O) + 4 fewer Metal dispatches per layer × 60 layers.
+- **MLA**: 148ms (unchanged, expected).
+- **Quality**: Degraded — "more more" repetition, garbled syntax ("circuits through.") vs top_k=8 clean output ("a static electrical device which works on the principle of electromagnetic induction"). Still generating related content but noticeably worse.
+- **Comparison with top_k=6**: top_k=6 gave +25% with good quality. top_k=4 gives +79% but with quality trade-off. Diminishing returns on quality vs speed.
+- **Opt-in**: RUSTANE_TOP_K=4 (default unchanged).
+
+### Iteration 25: Pool staging-copy + LRU eviction — WIN (+45%, 0.51 → 0.74 tok/s)
+- **Experiment**: Re-enable expert DRAM pool with two fixes: (1) copy pool→staging on hits (DRAM memcpy replaces SSD pread), (2) LRU eviction (monotonic clock) replaces Least-Stale (layer-based).
+- **Result**: 0.74 tok/s (median warm: 0.73, 0.74, 0.74) vs 0.51 baseline. Cold: 0.86.
+- **Verdict**: WIN — +45% improvement. Opt-in via RUSTANE_POOL_CAP=500 RUSTANE_POOL_WRITEBACK=1.
+- **Two bugs fixed**:
+  1. **Stale staging on pool hit**: Pool hits skipped pread but left staging data stale. Metal would process wrong expert weights. Never triggered because write-back was disabled (iter 3). Fixed: copy pool→staging on hit.
+  2. **Least-Stale eviction bias**: `last_used_layer = layer` meant L01 entries always had lowest priority. During sequential layer processing, L01 entries from previous tokens got evicted first — exactly the entries needed soonest. Fixed: monotonic clock gives true LRU ordering.
+- **Why write-back is safe now**: iter 3 disabled write-back because 23 MB memcpy per miss evicted OS page cache entries, making pread slower. F_NOCACHE (iter 13) bypasses page cache entirely — memcpy no longer causes page cache eviction.
+- **Pool mechanics**: 500 slots × 23.4 MB = 11.7 GB DRAM. Hit rate builds over tokens: 0% (token 0), ~25% (token 1), ~50%+ (token 2+). Per-layer: L02 with 4/8 hits → pread drops from 28ms to 14ms. DRAM memcpy: 23 MB at ~200 GB/s = 0.12ms vs pread ~28ms = 233× faster.
+- **Memory impact**: 11.7 GB pool + 23.4 GB backbone + 0.6 GB KV + 4.7 GB lm_head = ~40 GB. 128 GB system has ~88 GB headroom. No page cache eviction observed.
+
+### Iteration 26: Pool capacity sweep (500 vs 1000) — WIN (+69% at cap=1000)
+- **Experiment**: Sweep RUSTANE_POOL_CAP from 500 to 1000 with write-back enabled.
+- **Result**: cap=1000 gives 0.86 tok/s median warm (0.86, 0.86, 0.86) vs 0.51 baseline.
+- **Verdict**: WIN — +69% improvement. cap=1000 is +16% over cap=500 (0.74).
+- **Pool scaling**: cap=1000 (23.4 GB) holds ~2 tokens' expert sets (480/token). Reduces eviction pressure from 4% miss-per-token (cap=500) to <1%. First warm token: 1032ms (0.97 tok/s instantaneous).
+- **Memory**: 23.4 GB pool + 23.4 GB backbone + 4.7 GB lm_head + 0.6 GB KV = ~52 GB of 128 GB.
+- **No code change** — config only. Recommended config: RUSTANE_POOL_CAP=1000 RUSTANE_POOL_WRITEBACK=1.
+
+### Iteration 24: Fuse MLA scores (sgemm_nt_add + in-place softmax) — NO EFFECT (committed for code quality)
+- **Experiment**: Replace two-buffer MLA score computation (sgemm_nt + sgemm_nt + element-wise add + separate softmax) with sgemm_nt_add (beta=1.0 accumulate rope scores in-place) + in-place softmax. Eliminates scores_rope_buf and attn_weights allocations (~13KB/layer at seq_len=26).
+- **Result**: 0.51 tok/s (median warm: 0.51, 0.51, 0.51) vs 0.47* session baseline
+- **Verdict**: NO EFFECT — MLA dropped from ~134ms to ~126ms (~6% of MLA phase), but MLA is only 6% of total token time. Net savings ~0.4% of decode, within noise.
+- **Implementation**: Added sgemm_nt_add to blas.rs (sgemm_nt with beta=1.0). Modified mla_decode_v_concat in mla_attention.rs. ~20 lines changed. 4 correctness tests pass (max_diff < 3.3e-7).
+- **Insight**: At current SSD-dominated decode times (~2000ms/token), MLA micro-optimizations (saving <10ms) are unmeasurable. Code is cleaner: fewer allocs, one fewer BLAS call, one fewer intermediate buffer.
+
+### Iteration 28: Pool capacity extended sweep — WIN (+116% at cap=3000, REGRESSION at 4000)
+- **Experiment**: Extended pool capacity sweep: cap=1500, 2000, 3000, 4000.
+- **Results**:
+  - cap=1500 (35.1 GB): 0.97 tok/s (+90%)
+  - cap=2000 (46.8 GB): 1.04 tok/s (+104%)
+  - cap=3000 (70.2 GB): 1.10 tok/s (+116%)
+  - cap=4000 (93.6 GB): 0.52 tok/s **REGRESSION** (-2%)
+- **Verdict**: WIN up to 3000, REGRESSION at 4000. Memory ceiling established.
+- **Root cause of 4000 regression**: 93.6 GB pool + 23.4 GB backbone + 4.7 GB lm_head + 0.6 GB KV = ~122 GB. Only 6 GB free on 128 GB system. macOS evicts backbone mmap pages → shared_ffn faults from SSD every layer. FFN balloons from ~7ms to ~30ms/layer.
+- **Scaling curve**: Diminishing returns — 500→1000 (+16%), 1000→1500 (+13%), 1500→2000 (+7%), 2000→3000 (+6%). Sweet spot: 2000 slots (46.8 GB) for 128 GB systems.
+- **Memory budget formula**: pool_max_gb ≈ total_ram - 30 GB (backbone + lm_head + KV) - 15% safety margin. On 128 GB: 128 - 30 - 19 = 79 GB → ~3376 slots. Empirically 3000 works, 4000 fails.
+
+### Iteration 29: Auto-adaptive pool cap — WIN (+31%, 0.86 → 1.13 tok/s)
+- **Experiment**: Replace fixed `pool_cap=1000` default with auto-detection via `sysctl hw.memsize`.
+- **Formula**: `pool_cap = (total_ram - 30 GB model overhead) × 0.85 / expert_stride`, capped at 3000.
+- **Result**: 1.13 tok/s (median warm: 1.13, 1.13, 1.13) vs 0.86 at old cap=1000.
+- **Verdict**: WIN — +31% throughput. Zero-config improvement for all users.
+- **Scaling**: 128 GB → 3000 slots (70.2 GB), 64 GB → 1404 slots (32.9 GB), 36 GB → 313 slots (7.3 GB), <30 GB → disabled.
+- **Implementation**: `auto_pool_cap()` + `system_memory_bytes()` in generate_v2.rs. 30 lines. `RUSTANE_POOL_CAP` env var still overrides. 8 unit tests verify formula for all RAM sizes.
+- **Key insight**: On 128 GB, the old fixed default of 1000 slots was leaving 47 GB of usable DRAM on the table. Auto-adaptive uses the full memory budget safely.
+
+### Iteration 30: Overlap pool write-back with Metal dispatch — PENDING BENCHMARK
+- **Experiment**: Overlap pool write-back (~0.3-0.5ms/layer) with Metal dispatch (~3ms/layer) via thread::scope. Write-back reads staging (shared), Metal reads staging_metal (same underlying buffer). No write conflict.
+- **Implementation**: Moved Metal ops build before write-back block. New thread::scope: spawned thread does pool write-back, main thread does Metal dispatch. MTLBuffer invalidation deferred to after scope (MTLBuffer is !Send). ~30 lines changed.
+- **Expected**: ~0.3-0.5ms/layer × 60 = 18-30ms savings (~2-3%). Likely NO EFFECT in benchmark — write-back is already short and Metal dominates the scope.
+- **Key insight**: This is a structural improvement — write-back no longer blocks Metal dispatch. Even if unmeasurable now, it removes a serial dependency that could matter with larger pool sizes or slower memcpy.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -207,6 +294,12 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Overlap conversion with MLA**: -9.5% regression. MLA sgemv needs full 273 GB/s DRAM bandwidth. Concurrent conversion (f16 mmap read + f32 write) steals half, doubling MLA from 135ms to 270ms. The 24ms convert_wait savings is dwarfed. MLA must run alone.
 - **Pre-cache all layers as f32 (~54 GB)**: -64% regression (0.6 vs 1.68). 54 GB heap exhausts DRAM, evicting backbone mmap pages → shared_ffn faults from SSD every layer. FFN 7ms→27ms/layer. On 128 GB system with 524 GB model, DRAM is scarce — never pin >10 GB of converted weights.
 - **Expert speculation (speculative pread for next layer)**: -41% regression (0.30 vs 0.51*). Three variants tried (scope, sequential spawn, parallel spawn). Incompatible with F_NOCACHE: direct DMA is already fast, no cache layer to pre-warm. 184 MB/layer spec I/O doubles SSD bandwidth usage. Thread spawn overhead (9600 spawns/decode) compounds. Dead end with F_NOCACHE.
+- **Batch W_UK/W_UV as single sgemm**: NOT FEASIBLE. Each of 64 MLA heads has a different weight matrix — sgemm uses one shared matrix. Block-diagonal trick requires 64× more FLOPs. Total time (640µs/layer) is only 2.5% of decode. Not a bottleneck.
+- **GPU o_proj (Metal f32 GEMV for o_proj)**: -4% regression (0.48 vs 0.50*). Three approaches: per-layer wrap_mmap (12ms page table), persistent memcpy (3.7x MLA), zero-copy pre-cached (still +40-100% MLA). On UMA, f32 GEMV is bandwidth-bound — GPU shares same 273 GB/s memory bus as CPU AMX. GPU dispatch overhead (~1.5ms/layer encode+sync) exceeds any bandwidth gain. GPU offload only viable for ALU-bound kernels (INT4 dequant).
+- **Fuse MLA scores (sgemm_nt_add + in-place softmax)**: NO EFFECT. Saves ~8ms total MLA (134→126ms), but MLA is only 6% of token time. Net savings ~0.4%, unmeasurable. Committed for code quality (fewer allocs, cleaner code).
+- **Pool cap>3000 on 128 GB systems**: REGRESSION. cap=4000 (93.6 GB) leaves only 6 GB free → macOS evicts backbone mmap pages → shared_ffn faults from SSD. Memory ceiling: ~70 GB pool (3000 slots) on 128 GB. Formula: max_pool_gb = total_ram - 30 GB model overhead - 15% safety.
+- **Prefill expert skipping (stride 0/2/4)**: MLA KV cache too sensitive. K2 has no delta-net layers like Qwen3.5. All MLA layers need routed experts for quality.
+- **Prefill layer-by-layer loop reorder**: 7% cold, 0% warm. With 6-8 tokens, backbone mmap stays hot. Needs 200+ tokens to matter.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):

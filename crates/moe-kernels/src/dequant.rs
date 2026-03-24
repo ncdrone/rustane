@@ -401,6 +401,9 @@ pub struct MetalDequantGemv {
     /// Cached constant u32 Metal buffers (key = value, e.g. 7168, 2048, 128).
     /// Pre-populated in init_scratch to avoid per-dispatch Metal buffer allocation.
     const_u32_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Persistent Metal buffer for o_proj weights (created once, memcpy'd each layer).
+    /// Avoids per-layer Metal buffer creation which costs ~12ms GPU page table setup.
+    oproj_weight_buf: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 impl MetalDequantGemv {
@@ -451,6 +454,7 @@ impl MetalDequantGemv {
             scratch_activated: Vec::new(),
             scratch_down_y: Vec::new(),
             const_u32_bufs: std::collections::HashMap::new(),
+            oproj_weight_buf: None,
         })
     }
 
@@ -480,6 +484,36 @@ impl MetalDequantGemv {
                 self.const_u32_bufs.insert(val, buf);
             }
         }
+    }
+
+    /// Ensure scratch_x is large enough for o_proj input (v_total), cache consts,
+    /// and create persistent weight buffer for GPU o_proj dispatch.
+    /// Call after init_scratch when using GPU o_proj dispatch.
+    pub fn ensure_oproj_scratch(&mut self, out_features: usize, v_total: usize) {
+        let needed = v_total * 4;
+        if let Some(ref existing) = self.scratch_x {
+            if (existing.length() as usize) < needed {
+                self.scratch_x = Some(
+                    self.device.newBufferWithLength_options(needed, MTLResourceOptions::StorageModeShared)
+                        .expect("scratch_x resize for oproj")
+                );
+            }
+        }
+        if !self.const_u32_bufs.contains_key(&(v_total as u32)) {
+            let buf = self.u32_buffer(v_total as u32);
+            self.const_u32_bufs.insert(v_total as u32, buf);
+        }
+        if !self.const_u32_bufs.contains_key(&(out_features as u32)) {
+            let buf = self.u32_buffer(out_features as u32);
+            self.const_u32_bufs.insert(out_features as u32, buf);
+        }
+        // Persistent weight buffer: allocated once, memcpy'd each layer.
+        // Metal page tables set up once → subsequent GPU dispatches are fast.
+        let weight_bytes = out_features * v_total * 4;
+        self.oproj_weight_buf = Some(
+            self.device.newBufferWithLength_options(weight_bytes, MTLResourceOptions::StorageModeShared)
+                .expect("oproj_weight_buf")
+        );
     }
 
     /// Look up a cached constant u32 buffer. Panics if not pre-cached in init_scratch.
@@ -807,6 +841,18 @@ impl MetalDequantGemv {
             std::ptr::copy_nonoverlapping(src, result.as_mut_ptr(), out_features);
         }
         result
+    }
+
+    /// GPU o_proj: memcpy weights into persistent Metal buffer, then dispatch f32 GEMV.
+    /// The persistent buffer avoids per-layer Metal buffer creation (~12ms GPU page table setup).
+    /// Cost: memcpy(235 MB) + GPU GEMV vs CPU cblas_sgemv.
+    pub fn oproj_gpu(&self, weights: &[f32], x: &[f32], out_features: usize, in_features: usize) -> Vec<f32> {
+        let w_buf = self.oproj_weight_buf.as_ref().expect("call ensure_oproj_scratch first");
+        unsafe {
+            let dst = w_buf.contents().as_ptr() as *mut f32;
+            std::ptr::copy_nonoverlapping(weights.as_ptr(), dst, weights.len());
+        }
+        self.gemv_f32_gpu(w_buf, x, out_features, in_features)
     }
 
     /// Encode a GEMV dispatch into an existing command encoder (no commit).

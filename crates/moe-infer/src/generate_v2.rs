@@ -30,12 +30,50 @@ fn pool_sim_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_SIM").is_ok())
 }
 
-/// Whether to write back pread'd expert data to pool (set RUSTANE_POOL_WRITEBACK=1).
-/// Previous attempt with 3000 slots (69 GB) caused 3x regression from page cache pressure.
-/// Use small RUSTANE_POOL_CAP (100-500) to keep memory footprint under ~12 GB.
+/// Whether to write back pread'd expert data to pool.
+/// Default: ON (when pool is active). Set RUSTANE_POOL_WRITEBACK=0 to disable.
+/// With F_NOCACHE (iter 13), write-back no longer evicts page cache.
 fn pool_writeback_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("RUSTANE_POOL_WRITEBACK").is_ok())
+    *FLAG.get_or_init(|| {
+        std::env::var("RUSTANE_POOL_WRITEBACK")
+            .map(|v| v != "0")
+            .unwrap_or(true) // default ON
+    })
+}
+
+/// Auto-detect system RAM and compute optimal pool capacity.
+/// Formula: (total_ram - 30 GB model overhead) × 0.85 / expert_stride.
+/// Capped at 3000 (empirical ceiling: 4000 causes memory pressure on 128 GB).
+/// Returns 0 (disabled) if system has <36 GB RAM.
+fn auto_pool_cap(expert_stride: usize) -> usize {
+    let total_ram = system_memory_bytes().unwrap_or(0);
+    if total_ram == 0 || expert_stride == 0 {
+        return 1000; // fallback to conservative default
+    }
+    const MODEL_OVERHEAD: u64 = 30_000_000_000; // ~30 GB (backbone + lm_head + KV + staging)
+    const SAFETY_FACTOR: f64 = 0.85; // keep 15% free for OS/system
+    const MAX_CAP: usize = 3000;
+    let available = total_ram.saturating_sub(MODEL_OVERHEAD);
+    let pool_budget = (available as f64 * SAFETY_FACTOR) as u64;
+    let cap = (pool_budget / expert_stride as u64) as usize;
+    cap.min(MAX_CAP)
+}
+
+/// Get total physical memory via sysctl hw.memsize (macOS).
+fn system_memory_bytes() -> Option<u64> {
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let ret = unsafe {
+        libc::sysctlbyname(
+            b"hw.memsize\0".as_ptr() as *const libc::c_char,
+            &mut size as *mut u64 as *mut libc::c_void,
+            &mut len as *mut usize,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret == 0 && size > 0 { Some(size) } else { None }
 }
 
 // Thread-local ExpertPool simulation for measuring decode-phase hit rates.
@@ -113,6 +151,8 @@ pub struct ModelV2 {
     pub expert_loaders: std::collections::HashMap<usize, ExpertLoader>,
     /// Expert stride in bytes (computed once at load time).
     pub expert_stride: usize,
+    /// Effective top_k (overridable via RUSTANE_TOP_K env var).
+    pub effective_top_k: usize,
     /// Staging buffer for packing selected experts before Metal dispatch.
     /// Size: top_k * expert_stride bytes. Reused across layers and tokens.
     pub expert_staging: Vec<u8>,
@@ -200,6 +240,15 @@ impl ModelV2 {
         }
         let lm_head_f32: Vec<f32> = weights.lm_head()?.iter().map(|v| v.to_f32()).collect();
 
+        // Effective top_k: overridable via RUSTANE_TOP_K env var for parameter sweeps.
+        // Reducing top_k (e.g. 6 vs 8) saves ~25% pread + Metal per layer.
+        let effective_top_k = std::env::var("RUSTANE_TOP_K")
+            .ok().and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(config.num_experts_per_tok());
+        if effective_top_k != config.num_experts_per_tok() {
+            eprintln!("RUSTANE_TOP_K={effective_top_k} (config: {})", config.num_experts_per_tok());
+        }
+
         // Metal setup
         let mut metal = MetalDequantGemv::new();
         let mut expert_metal_bufs = std::collections::HashMap::new();
@@ -208,9 +257,13 @@ impl ModelV2 {
             m.init_scratch(
                 config.hidden_size(),
                 config.moe_inter_size(),
-                config.num_experts_per_tok(),
+                effective_top_k,
                 config.quantization.group_size,
             );
+            // Ensure scratch + persistent weight buffer for GPU o_proj dispatch.
+            // K2: out_features=7168 (hidden), in_features=8192 (v_total = 64 heads × 128 v_head_dim)
+            let v_total = mla_config.num_heads * mla_config.v_head_dim;
+            m.ensure_oproj_scratch(config.hidden_size(), v_total);
             if !lazy_mode {
                 // Small models: wrap all expert mmaps (fits in memory)
                 for layer in 0..num_layers {
@@ -244,7 +297,7 @@ impl ModelV2 {
         let expert_stride = gu_total * 2 + dn_total;
 
         // Pre-allocate staging buffer for top-k experts
-        let top_k = config.num_experts_per_tok();
+        let top_k = effective_top_k;
         let expert_staging = vec![0u8; top_k * expert_stride];
 
         if lazy_mode {
@@ -284,27 +337,23 @@ impl ModelV2 {
         // Expert pool: cache hot experts in RAM to avoid pread on repeated access.
         // K2 profiling shows pread is 71-84% of layer time. Pool eliminates hits entirely.
         let (expert_pool, pool_buffers) = if lazy_mode && expert_stride > 0 {
-            // Pool capacity: fit as many experts as RAM allows.
-            // Each slot = expert_stride bytes (~23 MB for K2).
-            // Budget: available RAM after backbone + staging + KV cache.
-            // Conservative: use ~60% of available memory for pool.
-            // Pool capacity: use most of available RAM but LAZY allocate.
-            // Pre-allocating 91 GB at once evicts OS page cache — disaster.
-            // Lazy: start with empty Vecs, allocate on first miss per slot.
+            // Auto-adaptive pool cap: detect system RAM and maximize pool usage.
+            // Lazy allocate: start with empty Vecs, grow on first miss per slot.
             let pool_cap_env = std::env::var("RUSTANE_POOL_CAP")
                 .ok().and_then(|v| v.parse::<usize>().ok());
-            // Default 0: pool write-back is disabled, so pool tracking adds ~0.3ms/layer
-            // of dead HashMap overhead with no caching benefit. RUSTANE_POOL_CAP=N re-enables.
-            let pool_cap = pool_cap_env.unwrap_or(0);
+            let pool_cap = pool_cap_env.unwrap_or_else(|| auto_pool_cap(expert_stride));
             if pool_cap == 0 {
                 eprintln!("ExpertPool: DISABLED (RUSTANE_POOL_CAP=0)");
                 (None, Vec::new())
             } else {
                 // Lazy: allocate empty Vecs (0 bytes each). Grow on first use.
                 let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| Vec::new()).collect();
-                eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB",
+                let source = if pool_cap_env.is_some() { "manual" } else { "auto" };
+                let ram_gb = system_memory_bytes().unwrap_or(0) as f64 / 1e9;
+                eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB ({}, {:.0} GB RAM)",
                     pool_cap, expert_stride as f64 / 1e6,
-                    pool_cap as f64 * expert_stride as f64 / 1e9);
+                    pool_cap as f64 * expert_stride as f64 / 1e9,
+                    source, ram_gb);
                 (Some(expert_pager::ExpertPool::new(pool_cap)), bufs)
             }
         } else {
@@ -314,7 +363,7 @@ impl ModelV2 {
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
-            expert_loaders, expert_stride, expert_staging, expert_staging_metal,
+            expert_loaders, expert_stride, effective_top_k, expert_staging, expert_staging_metal,
             expert_pool: std::cell::UnsafeCell::new(expert_pool),
             pool_metal_bufs: std::cell::UnsafeCell::new(vec![None; pool_buffers.len()]),
             pool_buffers: std::cell::UnsafeCell::new(pool_buffers),
@@ -708,7 +757,7 @@ fn moe_ffn_f16(
             moe_router::route_sigmoid_v3(
                 &gate_logits, bias,
                 model.config.ffn.n_group, model.config.ffn.topk_group,
-                model.config.num_experts_per_tok(), 1.0,
+                model.effective_top_k, 1.0,
             )
         } else {
             router.route(&gate_logits)
@@ -884,7 +933,7 @@ fn moe_ffn_v2(
                 bias,
                 model.config.ffn.n_group,
                 model.config.ffn.topk_group,
-                model.config.num_experts_per_tok(),
+                model.effective_top_k,
                 1.0,  // scaling applied separately in weight accumulation
             )
         } else {
@@ -949,9 +998,11 @@ fn moe_ffn_v2(
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
             let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
-            // Expert pool: check cache before pread. Track misses for pread, skip staging copy for hits.
-            // Pool hits dispatch directly from pool Metal buffers (zero-copy) — staging copy is dead work.
+            // Expert pool: check cache before pread. Track hits/misses and slot assignments.
+            // Hits: copy pool→staging (DRAM memcpy ~0.12ms vs pread ~28ms from SSD).
+            // Misses: pread from SSD, then write-back to pool for future hits.
             let mut need_pread: Vec<bool> = vec![true; expert_ids.len()];
+            let mut hit_slots: Vec<Option<usize>> = vec![None; expert_ids.len()];
             let mut pool_hits = 0usize;
             {
                 // SAFETY: single-threaded access during decode. Pool is not accessed from thread::scope.
@@ -961,10 +1012,8 @@ fn moe_ffn_v2(
                     for &(i, eid, _) in &expert_ids {
                         let (slot, is_hit) = pool.request(layer as u32, eid as u32);
                         if is_hit && !pool_bufs[slot].is_empty() {
-                            // Cache hit: skip staging copy — Metal dispatches directly
-                            // from pool buffer via per-expert dispatch path (zero-copy).
-                            // Staging slot left stale; never read for hits.
                             need_pread[i] = false;
+                            hit_slots[i] = Some(slot);
                             pool_hits += 1;
                         }
                         // If hit but buffer empty: treat as miss (lazy alloc on write-back)
@@ -977,9 +1026,15 @@ fn moe_ffn_v2(
             // join causes work-stealing contention, ~1.53 vs 1.57 baseline.
             // NOTE: split-pread pipeline tested (iter 16) — NO EFFECT: pread_dn ≈ Metal_fused,
             // extra cmd buffer overhead negates overlap. See experiments-k2.tsv.
+            // Get pool buffer pointers for rayon access (read-only for hits).
+            // SAFETY: pool_bufs are pre-allocated, only read during rayon (no mutation).
+            // Write-back happens AFTER rayon completes (sequential, no race).
+            let pool_bufs_slice: &[Vec<u8>] = unsafe { &*model.pool_buffers.get() };
+
             let t_before_scope = std::time::Instant::now();
             let shared_result = std::thread::scope(|s| {
                 let need_pread_ref = &need_pread;
+                let hit_slots_ref = &hit_slots;
                 let pread_handle = s.spawn(|| {
                     let t_pread = std::time::Instant::now();
                     pread_region
@@ -990,6 +1045,10 @@ fn moe_ffn_v2(
                         .for_each(|(chunk, &(i, eid, _))| {
                             if need_pread_ref[i] {
                                 loader.load_expert(eid as u32, chunk).unwrap();
+                            } else if let Some(slot) = hit_slots_ref[i] {
+                                // Pool hit: DRAM memcpy (~0.12ms) replaces SSD pread (~28ms).
+                                chunk[..expert_stride]
+                                    .copy_from_slice(&pool_bufs_slice[slot][..expert_stride]);
                             }
                         });
                     t_pread.elapsed()
@@ -1012,37 +1071,12 @@ fn moe_ffn_v2(
             let t_after_scope = std::time::Instant::now();
             combined = shared_result;
 
-            // Pool write-back: cache pread'd data so future tokens hit.
-            // Gated by RUSTANE_POOL_WRITEBACK=1. Default: OFF.
-            // Previous attempt with 3000 slots (69 GB) caused page cache eviction.
-            // Use with small POOL_CAP (100-500) to stay under ~12 GB.
-            if pool_writeback_enabled() {
-                let pool_opt = unsafe { &*model.expert_pool.get() };
-                let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
-                let pool_metal_wb = unsafe { &mut *model.pool_metal_bufs.get() };
-                if let Some(pool) = pool_opt.as_ref() {
-                    for &(i, eid, _) in &expert_ids {
-                        if need_pread[i] {
-                            if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
-                                if pool_bufs[slot].is_empty() {
-                                    pool_bufs[slot] = vec![0u8; expert_stride];
-                                    pool_metal_wb[slot] = None; // invalidate stale Metal buf
-                                }
-                                let staging_offset = i * expert_stride;
-                                pool_bufs[slot][..expert_stride]
-                                    .copy_from_slice(&pread_region[staging_offset..staging_offset + expert_stride]);
-                            }
-                        }
-                    }
-                }
-            }
-
             if ffn_profile && layer <= 3 {
                 eprintln!("  FFN L{layer:02} pool: {pool_hits} hits / {} total",
                     expert_ids.len());
             }
 
-            // Build Metal ops with packed offsets
+            // Build Metal ops with packed offsets (before overlap scope)
             let mut fused_ops = Vec::new();
             let mut down_ops = Vec::new();
             let mut routing_weights = Vec::new();
@@ -1072,9 +1106,65 @@ fn moe_ffn_v2(
 
             if !routing_weights.is_empty() {
                 let t_metal = std::time::Instant::now();
-
                 let staging_metal = model.expert_staging_metal.as_ref().unwrap();
-                let down_results = m.fused_and_down_single_cmdbuf(staging_metal, &fused_ops, &down_ops, x);
+
+                // Overlap Metal dispatch with pool write-back via thread::scope.
+                // SAFETY: write-back reads pread_region (shared) and writes to pool_bufs (exclusive).
+                // Metal reads staging_metal (same underlying buffer, shared read via GPU DMA).
+                // No write conflict: different destination buffers, same read source.
+                let wb_enabled = pool_writeback_enabled();
+                let pread_ref: &[u8] = &*pread_region;
+                // SAFETY: single-threaded decode. Dereference UnsafeCell before scope
+                // so spawned closure captures Send references, not raw pointers.
+                let pool_opt = unsafe { &*model.expert_pool.get() };
+                let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
+                let expert_ids_ref = &expert_ids;
+                let need_pread_ref = &need_pread;
+
+                let down_results = std::thread::scope(|s| {
+                    // Pool write-back on background thread (~0.3-0.5ms, hidden behind Metal ~3ms)
+                    // Returns slots that need Metal buf invalidation (done after scope,
+                    // since MTLBuffer is !Send).
+                    let wb_handle = if wb_enabled {
+                        Some(s.spawn(move || {
+                            let mut invalidate_slots = Vec::new();
+                            if let Some(pool) = pool_opt.as_ref() {
+                                for &(i, eid, _) in expert_ids_ref {
+                                    if need_pread_ref[i] {
+                                        if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                            if pool_bufs[slot].is_empty() {
+                                                pool_bufs[slot] = vec![0u8; expert_stride];
+                                                invalidate_slots.push(slot);
+                                            }
+                                            let staging_offset = i * expert_stride;
+                                            pool_bufs[slot][..expert_stride]
+                                                .copy_from_slice(&pread_ref[staging_offset..staging_offset + expert_stride]);
+                                        }
+                                    }
+                                }
+                            }
+                            invalidate_slots
+                        }))
+                    } else {
+                        None
+                    };
+
+                    // Metal dispatch on main thread
+                    let dr = m.fused_and_down_single_cmdbuf(staging_metal, &fused_ops, &down_ops, x);
+
+                    // Join write-back and invalidate Metal bufs (MTLBuffer is !Send)
+                    if let Some(handle) = wb_handle {
+                        let invalidate = handle.join().unwrap();
+                        if !invalidate.is_empty() {
+                            let pool_metal_wb = unsafe { &mut *model.pool_metal_bufs.get() };
+                            for slot in invalidate {
+                                pool_metal_wb[slot] = None;
+                            }
+                        }
+                    }
+
+                    dr
+                });
                 let metal_elapsed = t_metal.elapsed();
 
                 let t_accum = std::time::Instant::now();
@@ -1204,7 +1294,7 @@ pub fn generate_v2(
     // Create router
     let router_config = RouterConfig {
         num_experts: model.config.num_experts(),
-        top_k: model.config.num_experts_per_tok(),
+        top_k: model.effective_top_k,
         norm_topk_prob: model.config.ffn.norm_topk_prob,
         bias_lr: 0.0,
     };

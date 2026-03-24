@@ -21,19 +21,20 @@ impl PoolStats {
     }
 }
 
-/// Least-Stale entry tracking.
+/// LRU entry tracking.
 struct Entry {
     /// Slot index in the buffer pool.
     slot: usize,
-    /// Layer index where this expert was last used.
-    last_used_layer: u32,
+    /// Monotonic clock value when this expert was last used.
+    /// True LRU: evicts least recently used across all requests.
+    last_used: u64,
 }
 
-/// Least-Stale expert weight cache.
+/// LRU expert weight cache.
 ///
 /// Manages a fixed number of buffer slots. When an expert is requested:
-/// - If resident (hit): returns the slot index, updates last_used_layer.
-/// - If not resident (miss): evicts the expert with lowest last_used_layer.
+/// - If resident (hit): returns the slot index, updates LRU clock.
+/// - If not resident (miss): evicts the expert with lowest clock value.
 pub struct ExpertPool {
     /// Max number of experts that can be resident simultaneously.
     capacity: usize,
@@ -41,6 +42,8 @@ pub struct ExpertPool {
     entries: HashMap<(u32, u32), Entry>,
     /// Free slot stack.
     free_slots: Vec<usize>,
+    /// Monotonic clock for true LRU ordering.
+    clock: u64,
     /// Performance counters.
     pub stats: PoolStats,
 }
@@ -52,6 +55,7 @@ impl ExpertPool {
             capacity,
             entries: HashMap::with_capacity(capacity),
             free_slots: (0..capacity).rev().collect(),
+            clock: 0,
             stats: PoolStats::default(),
         }
     }
@@ -59,11 +63,12 @@ impl ExpertPool {
     /// Request an expert. Returns (slot_index, is_hit).
     /// If miss, the returned slot is free and ready for loading.
     pub fn request(&mut self, layer: u32, expert_id: u32) -> (usize, bool) {
+        self.clock += 1;
         let key = (layer, expert_id);
 
         // Cache hit
         if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used_layer = layer;
+            entry.last_used = self.clock;
             self.stats.hits += 1;
             return (entry.slot, true);
         }
@@ -74,11 +79,11 @@ impl ExpertPool {
         let slot = if let Some(slot) = self.free_slots.pop() {
             slot
         } else {
-            // Evict Least-Stale: minimum last_used_layer
+            // Evict LRU: minimum clock value (least recently used)
             let (&victim_key, _) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, e)| e.last_used_layer)
+                .min_by_key(|(_, e)| e.last_used)
                 .expect("pool not empty but no entries");
             let evicted = self.entries.remove(&victim_key).unwrap();
             self.stats.evictions += 1;
@@ -87,7 +92,7 @@ impl ExpertPool {
 
         self.entries.insert(key, Entry {
             slot,
-            last_used_layer: layer,
+            last_used: self.clock,
         });
 
         (slot, false)
