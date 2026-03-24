@@ -235,7 +235,8 @@ impl ModelV2 {
                 expert_size: expert_stride,
                 num_experts: config.num_experts(),
             };
-            let expected_file_size = expert_stride * num_experts;
+            let n_experts = config.num_experts();
+            let expected_file_size = expert_stride * n_experts;
             for layer in 0..num_layers {
                 let expert_path = weights_dir.join(format!("layer_{layer:02}_experts.bin"));
                 if expert_path.exists() {
@@ -243,7 +244,7 @@ impl ModelV2 {
                     let file_size = std::fs::metadata(&expert_path)
                         .map(|m| m.len() as usize).unwrap_or(0);
                     if file_size != expected_file_size {
-                        eprintln!("WARNING: layer {layer:02} expert file is {} bytes, expected {} ({num_experts} experts × {expert_stride} bytes)",
+                        eprintln!("WARNING: layer {layer:02} expert file is {} bytes, expected {} ({n_experts} experts × {expert_stride} bytes)",
                             file_size, expected_file_size);
                     }
                     let loader = ExpertLoader::open(expert_path.to_str().unwrap(), layout.clone())
