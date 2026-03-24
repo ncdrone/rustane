@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | POOL_CAP=1000+WRITEBACK: +69% | wins: 7 | experiments: 28
+tok/s: 1.68 (default top_k=8) | POOL+top_k=4: 1.41 (+176%) | POOL+top_k=6: 1.08 (+112%) | POOL+top_k=8: 0.86 (+69%) | wins: 8 | experiments: 29
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
