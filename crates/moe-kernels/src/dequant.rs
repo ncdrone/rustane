@@ -220,8 +220,11 @@ kernel void fused_gate_up_silu(
     const uint num_groups = in_features / group_size;
     const uint groups_per_8 = group_size / 8;
 
-    // Cache x (shared across all 8 rows)
-    threadgroup float x_cache[4096];
+    // Cache x (shared across all 8 rows) in f16 to save threadgroup memory.
+    // 7168 = K2 hidden_size. Was float[4096] (OOB for in_features>4096).
+    // half[7168] = 14KB vs float[7168] = 28KB → allows 2 concurrent TGs (32KB limit).
+    // f32→f16 precision loss is negligible vs INT4 weight quantization.
+    threadgroup half x_cache[7168];
     for (uint i = tid; i < in_features; i += TG) {
         x_cache[i] = x[i];
     }

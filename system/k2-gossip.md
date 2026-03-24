@@ -1,7 +1,8 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 8
+tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 9
+NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → same experts → warm cache)
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -85,6 +86,16 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Insight**: rayon::join with nested par_iter (pread uses into_par_iter inside join's second closure) causes work-stealing contention. Rayon's work-stealing scheduler can steal pread subtasks onto the thread running shared_ffn, partially serializing work. thread::scope avoids this because the spawned OS thread is independent of rayon's pool. The ~60 pthread_create/join calls cost ~2-6ms/token total but rayon contention costs a similar amount, netting zero.
 - **Infrastructure kept**: auto_rayon_join_ffn.rs test file (validates rayon::join concurrency properties).
 
+### Iteration 9: Fix fused shader x_cache OOB (half[7168]) — CORRECTNESS WIN
+- **Experiment**: fused_gate_up_silu shader had `threadgroup float x_cache[4096]` but K2 in_features=7168. Columns 4096-7167 accessed OOB threadgroup memory. Fixed to `threadgroup half x_cache[7168]` (14KB, fits 32KB TG limit). Half precision saves threadgroup memory vs float[7168] (28KB) which would halve GPU occupancy.
+- **Result**: 1.15 tok/s (median warm: 1.15, 1.14, 1.15) vs 1.57* inflated baseline
+- **Verdict**: CORRECTNESS WIN — model output changed from degenerate repetition ("a transformer, a transformer is a transformer") to correct ("a static electrical device which works on the principle of electromagnetic induction and can transfer electrical energy from one circuit").
+- **Root cause of previous "fast" speed**: OOB x_cache zeroed cols 4096-7167, making expert FFN outputs degenerate → model repeated same tokens → same experts accessed every token → page cache warm → pread fast. The 1.57 measurement was an artifact of broken output.
+- **With correct output**: diverse token generation → diverse expert routing → more page cache misses → slower pread → true speed is 1.15 tok/s.
+- **Intermediate finding**: float[7168] (28KB) produced 1.10 tok/s. half[7168] (14KB) produced 1.15 tok/s. The 5% improvement from half confirms occupancy matters (28KB allows only 1 concurrent TG, 14KB allows 2).
+- **Precision**: max_diff between CPU ref and GPU fused at K2 dims: 0.088 (half) vs 0.0005 (float). Both well within INT4 quantization noise.
+- **New correct baseline: 1.15 tok/s**. All previous experiments measured against inflated baseline need re-evaluation.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -95,9 +106,10 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **rayon::join for pread+shared_ffn**: Nested par_iter inside rayon::join causes work-stealing contention. thread::scope's independent OS thread avoids this. pthread overhead (~2-6ms) ≈ rayon contention cost.
 
 ## Suggested Next Experiments
-1. **Async Metal dispatch overlap with MLA** — Metal dispatch (3.5ms/layer) and MLA (2.2ms/layer) use different hardware (GPU vs CPU/AMX). Currently serial. If Metal were launched async and MLA(N+1) ran concurrently, saves 2.2ms/layer × 61 = 134ms (20%). Requires: split fused_and_down into launch+wait, double-buffer staging for Metal, restructure decode loop. ~150 lines.
-2. **Reduce MLA 2.2ms → ~1.0ms** — o_proj is 1.2ms (235 MB sgemv). Dispatch o_proj on Metal GPU using F32_GEMV_SHADER already compiled in dequant.rs, overlapped with next layer's convert.
-3. **Reduce FFN pread time** — when page cache warm, pread is fast (~3ms). When cold, 10ms+. Pre-populate pool buffers during prefill (not decode). Or use madvise(MADV_WILLNEED) to prefault expert pages.
-4. **Async pool write-back** — overlap pool buffer copy with next layer's MLA (CPU idle while Metal runs). Recovers pool benefit without decode-path overhead.
-5. **Reduce Metal GPU kernel time** — 3.5ms for 8 experts. Try: larger threadgroups (TG_SIZE=512, ROWS_PER_TG=16), batching all 8 experts in single kernel dispatch, or compute-aware scheduling.
+NOTE: All timing estimates below are from the OLD (buggy) profiling. Need fresh per-layer breakdown with correct shader.
+1. **Fresh per-layer profiling** — Re-measure MLA, FFN, pread, Metal times with correct shader. The breakdown has fundamentally changed: diverse experts mean different pread/Metal characteristics.
+2. **Async Metal dispatch overlap with MLA** — Metal dispatch and MLA use different hardware (GPU vs CPU/AMX). Currently serial. Requires: split fused_and_down into launch+wait, double-buffer staging for Metal, restructure decode loop. ~150 lines.
+3. **Reduce FFN pread time** — diverse expert routing now causes more cache misses. Pre-populate with madvise(MADV_WILLNEED)/fcntl(F_RDADVISE) to prefault expert pages. Higher priority now that correct routing hits more unique experts.
+4. **Reduce Metal GPU kernel time** — try TG_SIZE=512 (ROWS_PER_TG=16), batching experts, or compute-aware scheduling.
+5. **V2 down shader x_cache to half** — V2 down shader still uses float x_cache[4096]. in_features=2048 fits, but half[2048]=4KB would improve occupancy there too.
 6. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
