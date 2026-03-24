@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 19
+tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 20
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -163,6 +163,14 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: MLA sgemv operations (especially o_proj: 235 MB read) need full DRAM bandwidth (~273 GB/s). Concurrent conversion (reading f16 mmap + writing f32 buf_b) steals bandwidth, causing MLA to double from 135ms to 270ms (+135ms). The 24ms saved from eliminating convert_wait is dwarfed by the 135ms MLA slowdown.
 - **Key insight**: MLA is a DRAM bandwidth-critical section. ANY concurrent memory-intensive work during MLA degrades performance. The current design (MLA alone, then conversion overlaps FFN) is optimal because FFN's pread uses SSD DMA (not DRAM bandwidth) and Metal GPU dispatch uses GPU memory controller (also not CPU DRAM bandwidth).
 
+### Iteration 18: Pre-cache all 61 layers as f32 (~54 GB) — REVERTED (massive regression)
+- **Experiment**: Replace double-buffer pipeline with upfront pre-cache of all layers' MLA weights as f32. Eliminates per-token conversion, thread::scope, convert_wait, and DRAM bandwidth contention during FFN.
+- **Result**: 0.6 tok/s (median warm: 0.6, 0.6, 0.6) vs 1.68 baseline
+- **Verdict**: REVERTED — -64% regression. The worst regression of all experiments.
+- **Implementation**: Vec of 61 MlaLayerF32 (~54 GB total), pre-converted at load time in 3.7s. Simplified decode loop: no thread::scope, no buf swap, direct `cached_all[layer]`. MLA unchanged at 2.1ms/layer. FFN regressed from 7ms to 27ms/layer (4x worse).
+- **Root cause**: 54 GB of heap-allocated f32 weights exhausts available DRAM on 128 GB system. Backbone mmap pages (shared FFN weights, ~176 MB per layer) are evicted from page cache → every layer's shared_ffn faults from SSD. The double-buffer approach only pins ~1.8 GB at a time, leaving ample room for backbone pages in page cache.
+- **Key insight**: On a 128 GB system running a 524 GB model, DRAM is the scarcest resource. Any optimization that trades DRAM for compute savings will backfire. The double-buffer pipeline (~1.8 GB) is near-optimal for memory footprint. Large pre-caches (>10 GB) will evict working set pages.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -178,6 +186,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **f16 o_proj via sgemv_f16_par from mmap**: -21% regression (0.91 vs 1.15). Double-buffer already pre-converts o_proj f16→f32 overlapped with FFN. f16_par bypasses warm DRAM, reads cold mmap during MLA, competes with expert pread for page cache. Same lesson as f16 inline decode: anything on MLA critical path that touches mmap loses to pre-staged f32.
 - **Dead MLA code removal (mla_layer_weights + final_norm.to_vec)**: ~0.2ms/token dead overhead. Unmeasurable. Committed as code cleanup.
 - **Overlap conversion with MLA**: -9.5% regression. MLA sgemv needs full 273 GB/s DRAM bandwidth. Concurrent conversion (f16 mmap read + f32 write) steals half, doubling MLA from 135ms to 270ms. The 24ms convert_wait savings is dwarfed. MLA must run alone.
+- **Pre-cache all layers as f32 (~54 GB)**: -64% regression (0.6 vs 1.68). 54 GB heap exhausts DRAM, evicting backbone mmap pages → shared_ffn faults from SSD every layer. FFN 7ms→27ms/layer. On 128 GB system with 524 GB model, DRAM is scarce — never pin >10 GB of converted weights.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
