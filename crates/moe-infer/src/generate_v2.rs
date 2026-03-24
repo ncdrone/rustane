@@ -1034,37 +1034,12 @@ fn moe_ffn_v2(
             let t_after_scope = std::time::Instant::now();
             combined = shared_result;
 
-            // Pool write-back: cache pread'd data so future tokens hit.
-            // Gated by RUSTANE_POOL_WRITEBACK=1. Default: OFF.
-            // Previous attempt with 3000 slots (69 GB) caused page cache eviction.
-            // Use with small POOL_CAP (100-500) to stay under ~12 GB.
-            if pool_writeback_enabled() {
-                let pool_opt = unsafe { &*model.expert_pool.get() };
-                let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
-                let pool_metal_wb = unsafe { &mut *model.pool_metal_bufs.get() };
-                if let Some(pool) = pool_opt.as_ref() {
-                    for &(i, eid, _) in &expert_ids {
-                        if need_pread[i] {
-                            if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
-                                if pool_bufs[slot].is_empty() {
-                                    pool_bufs[slot] = vec![0u8; expert_stride];
-                                    pool_metal_wb[slot] = None; // invalidate stale Metal buf
-                                }
-                                let staging_offset = i * expert_stride;
-                                pool_bufs[slot][..expert_stride]
-                                    .copy_from_slice(&pread_region[staging_offset..staging_offset + expert_stride]);
-                            }
-                        }
-                    }
-                }
-            }
-
             if ffn_profile && layer <= 3 {
                 eprintln!("  FFN L{layer:02} pool: {pool_hits} hits / {} total",
                     expert_ids.len());
             }
 
-            // Build Metal ops with packed offsets
+            // Build Metal ops with packed offsets (before overlap scope)
             let mut fused_ops = Vec::new();
             let mut down_ops = Vec::new();
             let mut routing_weights = Vec::new();
@@ -1094,9 +1069,65 @@ fn moe_ffn_v2(
 
             if !routing_weights.is_empty() {
                 let t_metal = std::time::Instant::now();
-
                 let staging_metal = model.expert_staging_metal.as_ref().unwrap();
-                let down_results = m.fused_and_down_single_cmdbuf(staging_metal, &fused_ops, &down_ops, x);
+
+                // Overlap Metal dispatch with pool write-back via thread::scope.
+                // SAFETY: write-back reads pread_region (shared) and writes to pool_bufs (exclusive).
+                // Metal reads staging_metal (same underlying buffer, shared read via GPU DMA).
+                // No write conflict: different destination buffers, same read source.
+                let wb_enabled = pool_writeback_enabled();
+                let pread_ref: &[u8] = &*pread_region;
+                // SAFETY: single-threaded decode. Dereference UnsafeCell before scope
+                // so spawned closure captures Send references, not raw pointers.
+                let pool_opt = unsafe { &*model.expert_pool.get() };
+                let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
+                let expert_ids_ref = &expert_ids;
+                let need_pread_ref = &need_pread;
+
+                let down_results = std::thread::scope(|s| {
+                    // Pool write-back on background thread (~0.3-0.5ms, hidden behind Metal ~3ms)
+                    // Returns slots that need Metal buf invalidation (done after scope,
+                    // since MTLBuffer is !Send).
+                    let wb_handle = if wb_enabled {
+                        Some(s.spawn(move || {
+                            let mut invalidate_slots = Vec::new();
+                            if let Some(pool) = pool_opt.as_ref() {
+                                for &(i, eid, _) in expert_ids_ref {
+                                    if need_pread_ref[i] {
+                                        if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                            if pool_bufs[slot].is_empty() {
+                                                pool_bufs[slot] = vec![0u8; expert_stride];
+                                                invalidate_slots.push(slot);
+                                            }
+                                            let staging_offset = i * expert_stride;
+                                            pool_bufs[slot][..expert_stride]
+                                                .copy_from_slice(&pread_ref[staging_offset..staging_offset + expert_stride]);
+                                        }
+                                    }
+                                }
+                            }
+                            invalidate_slots
+                        }))
+                    } else {
+                        None
+                    };
+
+                    // Metal dispatch on main thread
+                    let dr = m.fused_and_down_single_cmdbuf(staging_metal, &fused_ops, &down_ops, x);
+
+                    // Join write-back and invalidate Metal bufs (MTLBuffer is !Send)
+                    if let Some(handle) = wb_handle {
+                        let invalidate = handle.join().unwrap();
+                        if !invalidate.is_empty() {
+                            let pool_metal_wb = unsafe { &mut *model.pool_metal_bufs.get() };
+                            for slot in invalidate {
+                                pool_metal_wb[slot] = None;
+                            }
+                        }
+                    }
+
+                    dr
+                });
                 let metal_elapsed = t_metal.elapsed();
 
                 let t_accum = std::time::Instant::now();

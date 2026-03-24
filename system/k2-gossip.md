@@ -1,8 +1,17 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | AUTO POOL (cap=3000 on 128GB): 1.13 (+31% over old default) | POOL+top_k=4: 1.41 (+176%) | wins: 10 | experiments: 31
+tok/s: 1.68 (default top_k=8) | AUTO POOL (cap=3000 on 128GB): 1.13 (+31% over old default) | POOL+top_k=4: 1.41 (+176%) | wins: 10 | experiments: 32
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
+
+## BENCHMARK PROTOCOL (CRITICAL — READ THIS)
+Benchmarks are now run by the bash loop AFTER you exit. Do NOT run bench_k2_tok_per_sec yourself.
+Just pass Tier 1 gates (build + correctness), commit, write experiment marker, and exit.
+The loop does: 2 warmup runs (SSD controller cache) + 3 measured runs (median).
+This eliminates page cache pollution from Claude (~1 GB RAM) and ensures consistent results.
+Three-layer cache: OS page cache (RAM) → SSD controller DRAM (1-4 GB) → NAND flash.
+Cold baseline: 0.51 tok/s. Warm baseline: 1.68 tok/s. Difference = SSD controller cache state.
+Apple SSD uses "Apple Fabric" protocol, not standard NVMe.
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -261,6 +270,12 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Scaling**: 128 GB → 3000 slots (70.2 GB), 64 GB → 1404 slots (32.9 GB), 36 GB → 313 slots (7.3 GB), <30 GB → disabled.
 - **Implementation**: `auto_pool_cap()` + `system_memory_bytes()` in generate_v2.rs. 30 lines. `RUSTANE_POOL_CAP` env var still overrides. 8 unit tests verify formula for all RAM sizes.
 - **Key insight**: On 128 GB, the old fixed default of 1000 slots was leaving 47 GB of usable DRAM on the table. Auto-adaptive uses the full memory budget safely.
+
+### Iteration 30: Overlap pool write-back with Metal dispatch — PENDING BENCHMARK
+- **Experiment**: Overlap pool write-back (~0.3-0.5ms/layer) with Metal dispatch (~3ms/layer) via thread::scope. Write-back reads staging (shared), Metal reads staging_metal (same underlying buffer). No write conflict.
+- **Implementation**: Moved Metal ops build before write-back block. New thread::scope: spawned thread does pool write-back, main thread does Metal dispatch. MTLBuffer invalidation deferred to after scope (MTLBuffer is !Send). ~30 lines changed.
+- **Expected**: ~0.3-0.5ms/layer × 60 = 18-30ms savings (~2-3%). Likely NO EFFECT in benchmark — write-back is already short and Metal dominates the scope.
+- **Key insight**: This is a structural improvement — write-back no longer blocks Metal dispatch. Even if unmeasurable now, it removes a serial dependency that could matter with larger pool sizes or slower memcpy.
 
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
