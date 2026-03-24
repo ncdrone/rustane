@@ -33,7 +33,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --- Config ---
-MAX_ITERS=100
+MAX_ITERS=99999
 COOLDOWN=15
 MODEL="claude-opus-4-6"
 AGENT_ID="alpha"
