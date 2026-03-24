@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | wins: 5 | experiments: 26
+tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | POOL_CAP=500+WRITEBACK: +45% | wins: 6 | experiments: 27
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -214,6 +214,17 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Quality**: Degraded — "more more" repetition, garbled syntax ("circuits through.") vs top_k=8 clean output ("a static electrical device which works on the principle of electromagnetic induction"). Still generating related content but noticeably worse.
 - **Comparison with top_k=6**: top_k=6 gave +25% with good quality. top_k=4 gives +79% but with quality trade-off. Diminishing returns on quality vs speed.
 - **Opt-in**: RUSTANE_TOP_K=4 (default unchanged).
+
+### Iteration 25: Pool staging-copy + LRU eviction — WIN (+45%, 0.51 → 0.74 tok/s)
+- **Experiment**: Re-enable expert DRAM pool with two fixes: (1) copy pool→staging on hits (DRAM memcpy replaces SSD pread), (2) LRU eviction (monotonic clock) replaces Least-Stale (layer-based).
+- **Result**: 0.74 tok/s (median warm: 0.73, 0.74, 0.74) vs 0.51 baseline. Cold: 0.86.
+- **Verdict**: WIN — +45% improvement. Opt-in via RUSTANE_POOL_CAP=500 RUSTANE_POOL_WRITEBACK=1.
+- **Two bugs fixed**:
+  1. **Stale staging on pool hit**: Pool hits skipped pread but left staging data stale. Metal would process wrong expert weights. Never triggered because write-back was disabled (iter 3). Fixed: copy pool→staging on hit.
+  2. **Least-Stale eviction bias**: `last_used_layer = layer` meant L01 entries always had lowest priority. During sequential layer processing, L01 entries from previous tokens got evicted first — exactly the entries needed soonest. Fixed: monotonic clock gives true LRU ordering.
+- **Why write-back is safe now**: iter 3 disabled write-back because 23 MB memcpy per miss evicted OS page cache entries, making pread slower. F_NOCACHE (iter 13) bypasses page cache entirely — memcpy no longer causes page cache eviction.
+- **Pool mechanics**: 500 slots × 23.4 MB = 11.7 GB DRAM. Hit rate builds over tokens: 0% (token 0), ~25% (token 1), ~50%+ (token 2+). Per-layer: L02 with 4/8 hits → pread drops from 28ms to 14ms. DRAM memcpy: 23 MB at ~200 GB/s = 0.12ms vs pread ~28ms = 233× faster.
+- **Memory impact**: 11.7 GB pool + 23.4 GB backbone + 0.6 GB KV + 4.7 GB lm_head = ~40 GB. 128 GB system has ~88 GB headroom. No page cache eviction observed.
 
 ### Iteration 24: Fuse MLA scores (sgemm_nt_add + in-place softmax) — NO EFFECT (committed for code quality)
 - **Experiment**: Replace two-buffer MLA score computation (sgemm_nt + sgemm_nt + element-wise add + separate softmax) with sgemm_nt_add (beta=1.0 accumulate rope scores in-place) + in-place softmax. Eliminates scores_rope_buf and attn_weights allocations (~13KB/layer at seq_len=26).

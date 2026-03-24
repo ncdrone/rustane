@@ -927,9 +927,11 @@ fn moe_ffn_v2(
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
             let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
-            // Expert pool: check cache before pread. Track misses for pread, skip staging copy for hits.
-            // Pool hits dispatch directly from pool Metal buffers (zero-copy) — staging copy is dead work.
+            // Expert pool: check cache before pread. Track hits/misses and slot assignments.
+            // Hits: copy pool→staging (DRAM memcpy ~0.12ms vs pread ~28ms from SSD).
+            // Misses: pread from SSD, then write-back to pool for future hits.
             let mut need_pread: Vec<bool> = vec![true; expert_ids.len()];
+            let mut hit_slots: Vec<Option<usize>> = vec![None; expert_ids.len()];
             let mut pool_hits = 0usize;
             {
                 // SAFETY: single-threaded access during decode. Pool is not accessed from thread::scope.
@@ -939,10 +941,8 @@ fn moe_ffn_v2(
                     for &(i, eid, _) in &expert_ids {
                         let (slot, is_hit) = pool.request(layer as u32, eid as u32);
                         if is_hit && !pool_bufs[slot].is_empty() {
-                            // Cache hit: skip staging copy — Metal dispatches directly
-                            // from pool buffer via per-expert dispatch path (zero-copy).
-                            // Staging slot left stale; never read for hits.
                             need_pread[i] = false;
+                            hit_slots[i] = Some(slot);
                             pool_hits += 1;
                         }
                         // If hit but buffer empty: treat as miss (lazy alloc on write-back)
@@ -955,9 +955,15 @@ fn moe_ffn_v2(
             // join causes work-stealing contention, ~1.53 vs 1.57 baseline.
             // NOTE: split-pread pipeline tested (iter 16) — NO EFFECT: pread_dn ≈ Metal_fused,
             // extra cmd buffer overhead negates overlap. See experiments-k2.tsv.
+            // Get pool buffer pointers for rayon access (read-only for hits).
+            // SAFETY: pool_bufs are pre-allocated, only read during rayon (no mutation).
+            // Write-back happens AFTER rayon completes (sequential, no race).
+            let pool_bufs_slice: &[Vec<u8>] = unsafe { &*model.pool_buffers.get() };
+
             let t_before_scope = std::time::Instant::now();
             let shared_result = std::thread::scope(|s| {
                 let need_pread_ref = &need_pread;
+                let hit_slots_ref = &hit_slots;
                 let pread_handle = s.spawn(|| {
                     let t_pread = std::time::Instant::now();
                     pread_region
@@ -968,6 +974,10 @@ fn moe_ffn_v2(
                         .for_each(|(chunk, &(i, eid, _))| {
                             if need_pread_ref[i] {
                                 loader.load_expert(eid as u32, chunk).unwrap();
+                            } else if let Some(slot) = hit_slots_ref[i] {
+                                // Pool hit: DRAM memcpy (~0.12ms) replaces SSD pread (~28ms).
+                                chunk[..expert_stride]
+                                    .copy_from_slice(&pool_bufs_slice[slot][..expert_stride]);
                             }
                         });
                     t_pread.elapsed()
