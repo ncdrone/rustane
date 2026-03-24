@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | POOL_CAP=500+WRITEBACK: +45% | wins: 6 | experiments: 27
+tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | POOL_CAP=1000+WRITEBACK: +69% | wins: 7 | experiments: 28
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -225,6 +225,14 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Why write-back is safe now**: iter 3 disabled write-back because 23 MB memcpy per miss evicted OS page cache entries, making pread slower. F_NOCACHE (iter 13) bypasses page cache entirely — memcpy no longer causes page cache eviction.
 - **Pool mechanics**: 500 slots × 23.4 MB = 11.7 GB DRAM. Hit rate builds over tokens: 0% (token 0), ~25% (token 1), ~50%+ (token 2+). Per-layer: L02 with 4/8 hits → pread drops from 28ms to 14ms. DRAM memcpy: 23 MB at ~200 GB/s = 0.12ms vs pread ~28ms = 233× faster.
 - **Memory impact**: 11.7 GB pool + 23.4 GB backbone + 0.6 GB KV + 4.7 GB lm_head = ~40 GB. 128 GB system has ~88 GB headroom. No page cache eviction observed.
+
+### Iteration 26: Pool capacity sweep (500 vs 1000) — WIN (+69% at cap=1000)
+- **Experiment**: Sweep RUSTANE_POOL_CAP from 500 to 1000 with write-back enabled.
+- **Result**: cap=1000 gives 0.86 tok/s median warm (0.86, 0.86, 0.86) vs 0.51 baseline.
+- **Verdict**: WIN — +69% improvement. cap=1000 is +16% over cap=500 (0.74).
+- **Pool scaling**: cap=1000 (23.4 GB) holds ~2 tokens' expert sets (480/token). Reduces eviction pressure from 4% miss-per-token (cap=500) to <1%. First warm token: 1032ms (0.97 tok/s instantaneous).
+- **Memory**: 23.4 GB pool + 23.4 GB backbone + 4.7 GB lm_head + 0.6 GB KV = ~52 GB of 128 GB.
+- **No code change** — config only. Recommended config: RUSTANE_POOL_CAP=1000 RUSTANE_POOL_WRITEBACK=1.
 
 ### Iteration 24: Fuse MLA scores (sgemm_nt_add + in-place softmax) — NO EFFECT (committed for code quality)
 - **Experiment**: Replace two-buffer MLA score computation (sgemm_nt + sgemm_nt + element-wise add + separate softmax) with sgemm_nt_add (beta=1.0 accumulate rope scores in-place) + in-place softmax. Eliminates scores_rope_buf and attn_weights allocations (~13KB/layer at seq_len=26).
