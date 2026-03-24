@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 13
+tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 14
 NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → same experts → warm cache)
 
 ## Model Facts
@@ -104,6 +104,14 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: pread_dn time (1/3 of total pread) roughly equals Metal_fused time. When pread_dn ≥ Metal_fused, savings = 0. Additionally, 2 command buffers add ~0.1ms overhead × 60 layers = 6ms/token. The split trades one large pread for two smaller ones without reducing total serial time.
 - **Correctness**: split dispatch is bit-identical to single-cmdbuf (test verified). Output unchanged.
 
+### Iteration 12: f16 o_proj via sgemv_f16_par from mmap — REVERTED (regression)
+- **Experiment**: Read o_proj weights as f16 directly from backbone mmap via sgemv_f16_par (parallel chunked f16→f32 convert+sgemv), bypassing the pre-converted f32 in the double-buffer. Halves DRAM traffic for o_proj (118 MB f16 vs 235 MB f32 for [7168, 8192]).
+- **Result**: 0.91 tok/s (median warm: 0.90, 0.95, 0.91) vs 1.15 baseline
+- **Verdict**: REVERTED — -21% regression.
+- **Implementation**: Added `o_proj_f16: Option<&[half::f16]>` to MlaLayerWeights, conditional dispatch in mla_forward_decode. Plumbed f16 backbone weights through make_attn_weights in generate_v2.rs. ~15 lines of changes. Correctness perfect (max_diff=4.84e-8).
+- **Root cause**: The double-buffer pipeline already converts o_proj f16→f32 during the PREVIOUS layer's FFN phase. When MLA runs, the f32 o_proj is warm in DRAM/L3 cache. The f16_par path bypasses this warm data and reads from backbone mmap, which may not be page-cached (competing with expert pread I/O for OS page cache). Reading cold mmap pages during MLA adds latency rather than saving it.
+- **Insight**: This is the same lesson as iteration 1 (f16 inline decode): ANY path that reads from mmap during the MLA critical path will be slower than reading pre-staged f32 from the double-buffer, because the double-buffer conversion is already fully hidden behind FFN compute (convert_wait ≈ 0). The only way to benefit from f16 o_proj would be to ALSO remove it from the double-buffer pre-conversion, saving conversion time — but conversion is free (hidden behind FFN), so there's nothing to save.
+
 ### Iteration 11: TG=512, ROWS_PER_TG=16 for fused+V2 shaders — NO EFFECT (regression)
 - **Experiment**: Changed both fused_gate_up_silu and dequant_4bit_gemv_v2 shaders from TG=256/ROWS_PER_TG=8 to TG=512/ROWS_PER_TG=16. THREADS_PER_ROW=32 preserved (one SIMD group per row). Updated all 5 Rust dispatch sites. Hypothesis: halving TG count amortizes x_cache load over 2× more rows.
 - **Result**: 1.05 tok/s (median decode of 1.05, 1.05, 1.12) vs 1.15 baseline
@@ -124,6 +132,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **fcntl(F_RDADVISE) prefetch before pread**: pread itself triggers DMA immediately. The hint-to-read window is microseconds — kernel can't start DMA before pread does it.
 - **Split-pread pipeline (2 cmd bufs, pread_dn overlaps Metal fused)**: Tested with correct shader (iter 10). pread_dn (1-2ms) ≈ Metal_fused (1.75ms), overlap window ≈ 0. 2 cmd buf overhead (6ms/token) cancels any micro-gain. Confirmed with profiling: total layer time unchanged.
 - **TG=512/ROWS_PER_TG=16 for fused+V2 shaders**: -8.7% regression (1.05 vs 1.15). Larger TGs reduce occupancy on M4 Max (40 EUs). TG=256 is optimal for bandwidth-bound INT4 GEMV.
+- **f16 o_proj via sgemv_f16_par from mmap**: -21% regression (0.91 vs 1.15). Double-buffer already pre-converts o_proj f16→f32 overlapped with FFN. f16_par bypasses warm DRAM, reads cold mmap during MLA, competes with expert pread for page cache. Same lesson as f16 inline decode: anything on MLA critical path that touches mmap loses to pre-staged f32.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
