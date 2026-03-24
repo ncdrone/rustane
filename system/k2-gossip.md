@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 4
+tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 6
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -57,14 +57,30 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Verdict**: NO EFFECT — -1.3%, within noise. Committed as code cleanup.
 - **Insight**: Pool HashMap tracking overhead (~0.3ms/layer = ~18ms/token) is real but too small to reliably measure against 650ms/token total. The 1.37 outlier shows page cache state dominates run-to-run variance. RUSTANE_POOL_CAP env var preserved for future pool experiments.
 
+### Iteration 5: Split pread + pipelined Metal fused/down — NO EFFECT (REVERTED)
+- **Experiment**: Split expert pread into gate+up (phase 1, overlaps shared_ffn) then down (phase 2, overlaps GPU fused dispatch). Two Metal command buffers instead of one.
+- **Result**: 1.56 tok/s (warm) vs 1.57 baseline
+- **Verdict**: NO EFFECT — pread_dn (1.5-2.5ms) > GPU fused (~1.75ms), so GPU finishes before pread. No overlap benefit.
+- **Detailed profiling** (warm, layers 1-3): pread_gu=2-3ms, shared_ffn=2.3-4ms, pread_dn=1.5-2.5ms, Metal_total=3.7-4ms
+- **Insight**: The GPU expert dispatch (fused gate+up+SiLU) completes faster than a single pread of 62 MB down data. Splitting the Metal dispatch into two command buffers adds overhead (~0.3ms/layer) without pipeline benefit. The fundamental bottleneck is pread_total + Metal_total = serial, and neither can be hidden behind the other because pread feeds Metal.
+- **Infrastructure kept**: const u32 buffer caching in MetalDequantGemv (eliminates 360 Metal buffer allocs/token).
+
+### Iteration 6: Cached constant u32 Metal buffers — NO EFFECT
+- **Experiment**: Pre-cache u32 constant Metal buffers (hidden=7168, moe_inter=2048, group_size=128) in MetalDequantGemv struct, eliminating all per-dispatch HashMap creation and newBufferWithBytes_length_options calls.
+- **Result**: 1.56 tok/s (median warm: 1.50, 1.56, 1.56) vs 1.57 baseline
+- **Verdict**: NO EFFECT — eliminated ~360 Metal buffer allocs/token but each was only ~1μs (4-byte buffer). Total savings ~0.18ms/token, unmeasurable against 650ms total.
+- **Insight**: Metal constant buffer CPU-side overhead is negligible. The 3.5ms/layer Metal dispatch time is GPU kernel execution, not buffer setup. Committed as code cleanup — removes 3 HashMap allocations per dispatch call.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
 - **Pool write-back on critical path**: 23 MB alloc+copy per miss causes page cache eviction. Must be async or deferred.
+- **Split pread + pipeline Metal fused/down**: pread_dn (1.5-2.5ms) > GPU fused (~1.75ms). No overlap benefit, extra cmd buffer overhead cancels.
+- **Metal constant buffer caching**: 4-byte u32 buffers are ~1μs each via newBufferWithBytes. ~360/token = 0.18ms, unmeasurable.
 
 ## Suggested Next Experiments
-1. **Reduce MLA 2.2ms → ~1.0ms** — o_proj is 1.2ms (235 MB sgemv). Cache o_proj f32 for all layers (14.3 GB) to eliminate from double-buffer, freeing bandwidth. Or overlap o_proj with FFN start.
+1. **Reduce MLA 2.2ms → ~1.0ms** — o_proj is 1.2ms (235 MB sgemv). GPU f32_gemv shader already compiled (F32_GEMV_SHADER in dequant.rs). Dispatch o_proj on Metal during CPU-idle MLA phase or cache o_proj f32 for all layers (14.3 GB).
 2. **Reduce FFN pread time** — when page cache warm, pread is fast (~3ms). When cold, 10ms+. Pre-populate pool buffers during prefill (not decode). Or use madvise(MADV_WILLNEED) to prefault expert pages.
 3. **Async pool write-back** — overlap pool buffer copy with next layer's MLA (CPU idle while Metal runs). Recovers pool benefit without decode-path overhead.
-4. **Reduce Metal dispatch overhead** — 3.5ms for 8 experts. Cache constant u32 buffers, reuse command encoders.
+4. **Reduce Metal GPU kernel time** — 3.5ms for 8 experts. Constant buffers now cached. Try: larger threadgroups, coalesced reads, or batching all 8 experts in single kernel dispatch.
 5. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.

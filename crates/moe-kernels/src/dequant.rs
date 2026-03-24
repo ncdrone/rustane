@@ -308,6 +308,55 @@ kernel void fused_gate_up_silu(
 }
 "#;
 
+/// Simple f32 GEMV shader: y = W @ x where W is f32 row-major.
+/// Uses ROWS_PER_TG=8 pattern with threadgroup x_cache for bandwidth efficiency.
+/// For MLA o_proj dispatch on GPU (replacing CPU sgemv during GPU-idle MLA phase).
+const F32_GEMV_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void f32_gemv(
+    device const float* W              [[buffer(0)]],
+    device const float* x              [[buffer(1)]],
+    device float* y                    [[buffer(2)]],
+    constant uint& in_features         [[buffer(3)]],
+    constant uint& out_features        [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]
+) {
+    const uint ROWS_PER_TG = 8;
+    const uint TG = 256;
+    const uint THREADS_PER_ROW = TG / ROWS_PER_TG; // 32
+
+    // Cache x in shared memory
+    threadgroup float x_cache[8192]; // max in_features = 8192 for o_proj
+    for (uint i = tid; i < in_features; i += TG) {
+        x_cache[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint local_row = tid / THREADS_PER_ROW;
+    uint lane = tid % THREADS_PER_ROW;
+    uint row = tgid * ROWS_PER_TG + local_row;
+
+    if (row >= out_features) return;
+
+    device const float* row_w = W + row * in_features;
+    float sum = 0.0;
+
+    for (uint col = lane; col < in_features; col += THREADS_PER_ROW) {
+        sum = fma(row_w[col], x_cache[col], sum);
+    }
+
+    // SIMD reduction (THREADS_PER_ROW=32 = one SIMD group)
+    sum = simd_sum(sum);
+
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}
+"#;
+
 /// Expert gate+up+SiLU fused operation layout.
 #[derive(Clone)]
 pub struct FusedGateUpSiluOp {
@@ -346,12 +395,17 @@ pub struct MetalDequantGemv {
     pipeline_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Fused gate+up+SiLU shader.
     pipeline_fused: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// f32 GEMV shader (for MLA o_proj on GPU).
+    pipeline_f32_gemv: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Pre-allocated scratch: x input buffer (max of hidden, moe_inter).
     scratch_x: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Pre-allocated scratch: fused output / down input (one per top-k expert).
     scratch_activated: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Pre-allocated scratch: down output (one per top-k expert).
     scratch_down_y: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Cached constant u32 Metal buffers (key = value, e.g. 7168, 2048, 128).
+    /// Pre-populated in init_scratch to avoid per-dispatch Metal buffer allocation.
+    const_u32_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 impl MetalDequantGemv {
@@ -387,17 +441,27 @@ impl MetalDequantGemv {
             .newComputePipelineStateWithFunction_error(&function_fused)
             .ok()?;
 
+        // f32 GEMV pipeline (MLA o_proj)
+        let source_f32 = objc2_foundation::NSString::from_str(F32_GEMV_SHADER);
+        let library_f32 = device.newLibraryWithSource_options_error(&source_f32, None).ok()?;
+        let fn_name_f32 = objc2_foundation::NSString::from_str("f32_gemv");
+        let function_f32 = library_f32.newFunctionWithName(&fn_name_f32)?;
+        let pipeline_f32_gemv = device
+            .newComputePipelineStateWithFunction_error(&function_f32)
+            .ok()?;
+
         Some(Self {
-            device, queue, pipeline, pipeline_v2, pipeline_fused,
+            device, queue, pipeline, pipeline_v2, pipeline_fused, pipeline_f32_gemv,
             scratch_x: None,
             scratch_activated: Vec::new(),
             scratch_down_y: Vec::new(),
+            const_u32_bufs: std::collections::HashMap::new(),
         })
     }
 
     /// Pre-allocate scratch buffers for zero-allocation inference hot path.
     /// Call once at model load after knowing hidden/moe_inter/top_k.
-    pub fn init_scratch(&mut self, hidden: usize, moe_inter: usize, top_k: usize) {
+    pub fn init_scratch(&mut self, hidden: usize, moe_inter: usize, top_k: usize, group_size: usize) {
         let x_size = hidden.max(moe_inter) * 4; // f32
         self.scratch_x = Some(
             self.device.newBufferWithLength_options(x_size, MTLResourceOptions::StorageModeShared)
@@ -411,6 +475,23 @@ impl MetalDequantGemv {
             self.device.newBufferWithLength_options(hidden * 4, MTLResourceOptions::StorageModeShared)
                 .expect("scratch_down_y")
         }).collect();
+
+        // Pre-cache constant u32 Metal buffers for dispatch.
+        // Eliminates ~360 Metal buffer allocations per token (6 per layer × 60 layers).
+        self.const_u32_bufs.clear();
+        for val in [hidden as u32, moe_inter as u32, group_size as u32] {
+            if !self.const_u32_bufs.contains_key(&val) {
+                let buf = self.u32_buffer(val);
+                self.const_u32_bufs.insert(val, buf);
+            }
+        }
+    }
+
+    /// Look up a cached constant u32 buffer. Panics if not pre-cached in init_scratch.
+    fn get_const_buf(&self, val: u32) -> &ProtocolObject<dyn MTLBuffer> {
+        self.const_u32_bufs.get(&val)
+            .map(|b| &**b)
+            .unwrap_or_else(|| panic!("uncached u32 constant {val} — call init_scratch with correct params"))
     }
 
     /// Combined fused+down dispatch using scratch buffers, single command buffer.
@@ -435,31 +516,6 @@ impl MetalDequantGemv {
             std::ptr::copy_nonoverlapping(x.as_ptr(), dst, x.len());
         }
 
-        // Constant buffers (deduplicated)
-        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-
-        for op in fused_ops {
-            in_feat_bufs.entry(op.in_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
-            group_bufs.entry(op.group_size as u32)
-                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
-            out_feat_bufs.entry(op.out_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
-        }
-        for op in down_ops {
-            in_feat_bufs.entry(op.in_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
-            group_bufs.entry(op.group_size as u32)
-                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
-            out_feat_bufs.entry(op.out_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
-        }
-
         const ROWS_PER_TG: usize = 8;
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let enc = cmd.computeCommandEncoder().expect("compute encoder");
@@ -467,9 +523,9 @@ impl MetalDequantGemv {
         // Phase 1: Fused gate+up+SiLU → scratch_activated[i]
         enc.setComputePipelineState(&self.pipeline_fused);
         for (i, op) in fused_ops.iter().enumerate() {
-            let ifb = &in_feat_bufs[&(op.in_features as u32)];
-            let gb = &group_bufs[&(op.group_size as u32)];
-            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
 
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_packed_offset, 0);
@@ -494,9 +550,9 @@ impl MetalDequantGemv {
         // Phase 2: Down GEMV — reads from scratch_activated[i], writes to scratch_down_y[i]
         enc.setComputePipelineState(&self.pipeline_v2);
         for (i, op) in down_ops.iter().enumerate() {
-            let ifb = &in_feat_bufs[&(op.in_features as u32)];
-            let gb = &group_bufs[&(op.group_size as u32)];
-            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
 
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(mmap_buf), op.packed_offset, 0);
@@ -607,6 +663,67 @@ impl MetalDequantGemv {
         (y, elapsed)
     }
 
+    /// GPU f32 GEMV: y = W @ x where W is f32 [out_features, in_features].
+    /// Uses Metal GPU bandwidth (~400 GB/s) instead of CPU (~200 GB/s).
+    /// `w_buf` is a pre-populated Metal shared buffer containing the f32 weights.
+    pub fn gemv_f32_gpu(
+        &self,
+        w_buf: &ProtocolObject<dyn MTLBuffer>,
+        x: &[f32],
+        out_features: usize,
+        in_features: usize,
+    ) -> Vec<f32> {
+        let scratch_x = self.scratch_x.as_ref().expect("call init_scratch first");
+
+        // Copy x into scratch_x (reuse existing scratch buffer)
+        unsafe {
+            let dst = scratch_x.contents().as_ptr() as *mut f32;
+            std::ptr::copy_nonoverlapping(x.as_ptr(), dst, x.len());
+        }
+
+        // Output buffer (reuse scratch_down_y[0] if big enough, else allocate)
+        let y_buf = if !self.scratch_down_y.is_empty()
+            && self.scratch_down_y[0].length() >= out_features * 4
+        {
+            &self.scratch_down_y[0]
+        } else {
+            // Fallback: this shouldn't happen in normal inference
+            panic!("scratch_down_y not large enough for f32 GEMV output");
+        };
+
+        let in_buf = self.get_const_buf(in_features as u32);
+        let out_buf = self.get_const_buf(out_features as u32);
+
+        const ROWS_PER_TG: usize = 8;
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        enc.setComputePipelineState(&self.pipeline_f32_gemv);
+
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(w_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(scratch_x), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(y_buf), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(in_buf), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(out_buf), 0, 4);
+
+            let num_tgs = (out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+            let threadgroups = MTLSize { width: num_tgs, height: 1, depth: 1 };
+            let threads_per_tg = MTLSize { width: TG_SIZE, height: 1, depth: 1 };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+        }
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let mut result = vec![0.0f32; out_features];
+        unsafe {
+            let src = y_buf.contents().as_ptr() as *const f32;
+            std::ptr::copy_nonoverlapping(src, result.as_mut_ptr(), out_features);
+        }
+        result
+    }
+
     /// Encode a GEMV dispatch into an existing command encoder (no commit).
     /// Caller manages command buffer lifecycle for batching.
     /// Returns the output buffer for reading results after commit.
@@ -685,22 +802,6 @@ impl MetalDequantGemv {
             std::ptr::copy_nonoverlapping(x.as_ptr(), dst, x.len());
         }
 
-        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-
-        for op in fused_ops {
-            in_feat_bufs.entry(op.in_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
-            group_bufs.entry(op.group_size as u32)
-                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
-            out_feat_bufs.entry(op.out_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
-        }
-
         const ROWS_PER_TG: usize = 8;
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let enc = cmd.computeCommandEncoder().expect("compute encoder");
@@ -708,9 +809,9 @@ impl MetalDequantGemv {
         // Phase 1: Fused gate+up+SiLU — each expert from its own buffer
         enc.setComputePipelineState(&self.pipeline_fused);
         for (i, (op, buf)) in fused_ops.iter().zip(expert_bufs.iter()).enumerate() {
-            let ifb = &in_feat_bufs[&(op.in_features as u32)];
-            let gb = &group_bufs[&(op.group_size as u32)];
-            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
 
             unsafe {
                 // Offsets are relative to THIS expert's buffer (start at 0 for pool slots)
@@ -736,9 +837,9 @@ impl MetalDequantGemv {
         // Phase 2: Down GEMV
         enc.setComputePipelineState(&self.pipeline_v2);
         for (i, (op, buf)) in down_ops.iter().zip(expert_bufs.iter()).enumerate() {
-            let ifb = &in_feat_bufs[&(op.in_features as u32)];
-            let gb = &group_bufs[&(op.group_size as u32)];
-            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
 
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(*buf), op.packed_offset, 0);
@@ -810,23 +911,6 @@ impl MetalDequantGemv {
                 .expect("y_buf")
         }).collect();
 
-        // Pre-create constant buffers (deduplicated by value)
-        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-
-        for op in ops {
-            in_feat_bufs.entry(op.in_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
-            group_bufs.entry(op.group_size as u32)
-                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
-            out_feat_bufs.entry(op.out_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
-        }
-
         // Encode all dispatches using V2 shader (ROWS_PER_TG=8)
         const ROWS_PER_TG: usize = 8;
         let cmd = self.queue.commandBuffer().expect("command buffer");
@@ -835,9 +919,9 @@ impl MetalDequantGemv {
         enc.setComputePipelineState(&self.pipeline_v2);
 
         for (i, op) in ops.iter().enumerate() {
-            let ifb = &in_feat_bufs[&(op.in_features as u32)];
-            let gb = &group_bufs[&(op.group_size as u32)];
-            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
 
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(mmap_buf), op.packed_offset, 0);
@@ -910,23 +994,6 @@ impl MetalDequantGemv {
                 .expect("y_buf")
         }).collect();
 
-        // Constant buffers
-        let mut in_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut group_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-        let mut out_feat_bufs: std::collections::HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>> =
-            std::collections::HashMap::new();
-
-        for op in ops {
-            in_feat_bufs.entry(op.in_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.in_features as u32));
-            group_bufs.entry(op.group_size as u32)
-                .or_insert_with(|| self.u32_buffer(op.group_size as u32));
-            out_feat_bufs.entry(op.out_features as u32)
-                .or_insert_with(|| self.u32_buffer(op.out_features as u32));
-        }
-
         const ROWS_PER_TG: usize = 8;
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let enc = cmd.computeCommandEncoder().expect("compute encoder");
@@ -934,9 +1001,9 @@ impl MetalDequantGemv {
         enc.setComputePipelineState(&self.pipeline_fused);
 
         for (i, op) in ops.iter().enumerate() {
-            let ifb = &in_feat_bufs[&(op.in_features as u32)];
-            let gb = &group_bufs[&(op.group_size as u32)];
-            let ofb = &out_feat_bufs[&(op.out_features as u32)];
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
 
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_packed_offset, 0);

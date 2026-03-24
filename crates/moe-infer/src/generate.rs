@@ -162,6 +162,7 @@ impl Model {
                 config.hidden_size(),
                 config.moe_inter_size(),
                 config.num_experts_per_tok(),
+                config.quantization.group_size,
             );
             for layer in 0..num_layers {
                 if let Some(mmap) = weights.expert_mmap(layer) {

@@ -209,6 +209,7 @@ impl ModelV2 {
                 config.hidden_size(),
                 config.moe_inter_size(),
                 config.num_experts_per_tok(),
+                config.quantization.group_size,
             );
             if !lazy_mode {
                 // Small models: wrap all expert mmaps (fits in memory)
@@ -434,8 +435,12 @@ struct LayerTiming {
     ffn_ms: f64,
 }
 
-/// Construct MLA attention weight borrows from pre-converted f32 layer.
-fn make_attn_weights(lf: &MlaLayerF32) -> MlaAttnWeights<'_> {
+/// Construct MLA attention weight borrows from pre-converted f32 layer,
+/// with optional f16 backbone refs for half-bandwidth Q/KV projections.
+fn make_attn_weights<'a>(
+    lf: &'a MlaLayerF32,
+    f16w: Option<&'a crate::weights::MlaLayerWeights<'a>>,
+) -> MlaAttnWeights<'a> {
     MlaAttnWeights {
         q_proj: &lf.q_proj,
         q_a_proj: lf.q_a_proj.as_deref(),
@@ -448,6 +453,9 @@ fn make_attn_weights(lf: &MlaLayerF32) -> MlaAttnWeights<'_> {
         o_proj: &lf.o_proj,
         input_norm: &lf.input_norm,
         post_attn_norm: &lf.post_attn_norm,
+        q_a_proj_f16: f16w.and_then(|w| w.q_a_proj),
+        q_b_proj_f16: f16w.and_then(|w| w.q_b_proj),
+        kv_a_proj_f16: f16w.map(|w| w.kv_a_proj),
     }
 }
 
@@ -467,7 +475,9 @@ fn run_layer_compute(
 
     // 1. RMSNorm → MLA Attention → Residual
     let normed = rmsnorm(x, &lf.input_norm, eps);
-    let attn_weights = make_attn_weights(lf);
+    let is_moe = model.config.is_moe_layer(layer);
+    let f16_lw = model.weights.mla_layer_weights(layer, is_moe)?;
+    let attn_weights = make_attn_weights(lf, Some(&f16_lw));
 
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
@@ -510,7 +520,9 @@ fn run_mla_only(
     let eps = model.config.rms_norm_eps();
 
     let normed = rmsnorm(x, &lf.input_norm, eps);
-    let attn_weights = make_attn_weights(lf);
+    let is_moe = model.config.is_moe_layer(layer);
+    let f16_lw = model.weights.mla_layer_weights(layer, is_moe)?;
+    let attn_weights = make_attn_weights(lf, Some(&f16_lw));
 
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
