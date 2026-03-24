@@ -1,8 +1,8 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 14
-NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → same experts → warm cache)
+tok/s: 1.68 | ms/layer: ~9.8 | wins: 3 | experiments: 15
+F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -19,12 +19,13 @@ NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → 
 - ANE: 17.8 TFLOPS — currently UNUSED (ane-bridge crate exists)
 - NVMe SSD: 17.5 GB/s pread
 
-## Per-Layer Breakdown (MEASURED, warm)
-- **MLA: 2.2ms/layer** (18%) — Q LoRA (1.3ms) + o_proj (1.2ms) dominate. NOT 0.4ms as previously estimated.
-- **FFN: 9.0ms/layer** (75%) — max(pread ~5ms, shared_ffn ~4ms) + Metal ~3.5ms
+## Per-Layer Breakdown (MEASURED, warm, with F_NOCACHE)
+- **MLA: ~2.2ms/layer** (22%) — Q LoRA (1.3ms) + o_proj (1.2ms) dominate
+- **FFN: ~7ms/layer** (72%) — max(pread ~3-5ms, shared_ffn ~1.5-2.7ms) + Metal ~3ms
 - **convert_wait: ~0ms** — f16→f32 conversion fully hidden behind FFN in double-buffer pipeline
-- **lm_head: 24ms** (3.3%) — single-threaded cblas_sgemv, already bandwidth-saturated
-- **other: 1.6ms total** (<0.3%) — thread::scope overhead + residual adds
+- **lm_head: 24ms** (4%) — single-threaded cblas_sgemv, already bandwidth-saturated
+- **other: ~1ms total** (<1%) — thread::scope overhead + residual adds
+- **Previous (no F_NOCACHE)**: FFN was 9ms/layer due to page cache pollution + bandwidth contention
 
 ## The Goal
 Get tok/s as high as possible. Theoretical max ~5 tok/s.
@@ -103,6 +104,17 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Profiling** (warm): pread_gu: 2-5ms, pread_dn: ~1-2ms (inferred), Metal_fused: ~1.75ms, Metal_down: ~1.75ms. Overlap window ≈ 0 because pread_dn ≈ Metal_fused.
 - **Root cause**: pread_dn time (1/3 of total pread) roughly equals Metal_fused time. When pread_dn ≥ Metal_fused, savings = 0. Additionally, 2 command buffers add ~0.1ms overhead × 60 layers = 6ms/token. The split trades one large pread for two smaller ones without reducing total serial time.
 - **Correctness**: split dispatch is bit-identical to single-cmdbuf (test verified). Output unchanged.
+
+### Iteration 13: F_NOCACHE on expert file fds — WIN (+46%, 1.15 → 1.68 tok/s)
+- **Experiment**: `fcntl(fd, F_NOCACHE, 1)` on expert file fds in ExpertLoader::open(). Bypasses OS page cache for expert pread, using direct SSD-to-user-buffer DMA.
+- **Result**: 1.68 tok/s (median warm: 1.71, 1.68, 1.68) vs 1.15 baseline
+- **Verdict**: WIN — +46% improvement. 1 line of code.
+- **Root cause of improvement**: Expert pread without F_NOCACHE pollutes the OS page cache with 176 MB/layer × 61 layers = ~10 GB per token of rarely-reused expert weight data. This evicts shared FFN weights (176 MB) and other working set data from DRAM, forcing shared_ffn sgemv to compete for memory bandwidth with page cache management. F_NOCACHE eliminates this:
+  1. **Reduced bandwidth contention**: shared_ffn sgemv runs at full DRAM bandwidth (drops from 2.4-4.4ms to 1.5-2.7ms)
+  2. **No memcpy overhead**: pread goes SSD→user buffer directly, skipping page cache→user buffer memcpy
+  3. **NVMe SSD controller DRAM** (1-4 GB) handles frequently-accessed experts natively
+- **Trade-off**: Cold decode slightly slower (0.67 vs 0.93 tok/s) — no OS page cache warming between cold and warm runs. Warm decode benefits enormously.
+- **Key insight**: For working sets >> physical memory (524 GB experts vs 128 GB RAM), OS page cache is net negative: it wastes bandwidth tracking pages that will be evicted before reuse. Direct DMA + SSD controller cache is a better caching strategy.
 
 ### Iteration 12: f16 o_proj via sgemv_f16_par from mmap — REVERTED (regression)
 - **Experiment**: Read o_proj weights as f16 directly from backbone mmap via sgemv_f16_par (parallel chunked f16→f32 convert+sgemv), bypassing the pre-converted f32 in the double-buffer. Halves DRAM traffic for o_proj (118 MB f16 vs 235 MB f32 for [7168, 8192]).

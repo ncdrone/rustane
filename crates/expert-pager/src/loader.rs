@@ -35,8 +35,11 @@ unsafe impl Sync for ExpertLoader {}
 
 impl ExpertLoader {
     /// Open an expert weight file.
+    /// F_NOCACHE: bypass page cache for direct SSD→user DMA, reducing cache
+    /// eviction of shared FFN weights and DRAM bandwidth contention.
     pub fn open(path: &str, layout: ExpertFileLayout) -> io::Result<Self> {
         let fd = File::open(path)?;
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1); }
         Ok(Self { fd, layout })
     }
 
