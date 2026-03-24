@@ -938,6 +938,8 @@ fn moe_ffn_v2(
             // Overlap pread (misses only) with shared FFN via thread::scope.
             // NOTE: rayon::join tested (iter 8) — NO EFFECT: nested par_iter inside
             // join causes work-stealing contention, ~1.53 vs 1.57 baseline.
+            // NOTE: split-pread pipeline tested (iter 16) — NO EFFECT: pread_dn ≈ Metal_fused,
+            // extra cmd buffer overhead negates overlap. See experiments-k2.tsv.
             let t_before_scope = std::time::Instant::now();
             let shared_result = std::thread::scope(|s| {
                 let need_pread_ref = &need_pread;
@@ -1034,11 +1036,6 @@ fn moe_ffn_v2(
             if !routing_weights.is_empty() {
                 let t_metal = std::time::Instant::now();
 
-                // All experts dispatched from staging buffer.
-                // Pool hits were already copied to staging above (skipping pread).
-                // NOTE: per-expert zero-copy dispatch disabled — has a bug where
-                // in_feat_bufs is only populated from fused_ops (in_features=hidden)
-                // but down_ops needs in_features=moe_inter, causing "no entry for key" panic.
                 let staging_metal = model.expert_staging_metal.as_ref().unwrap();
                 let down_results = m.fused_and_down_single_cmdbuf(staging_metal, &fused_ops, &down_ops, x);
                 let metal_elapsed = t_metal.elapsed();

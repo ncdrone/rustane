@@ -581,6 +581,96 @@ impl MetalDequantGemv {
         }).collect()
     }
 
+    /// Dispatch fused phase only — commits to GPU, returns immediately.
+    /// Call dispatch_down_phase_and_wait() after to complete the pipeline.
+    pub fn dispatch_fused_phase(
+        &self,
+        mmap_buf: &ProtocolObject<dyn MTLBuffer>,
+        fused_ops: &[FusedGateUpSiluOp],
+        x: &[f32],
+    ) {
+        if fused_ops.is_empty() { return; }
+        let scratch_x = self.scratch_x.as_ref().expect("call init_scratch first");
+        unsafe {
+            let dst = scratch_x.contents().as_ptr() as *mut f32;
+            std::ptr::copy_nonoverlapping(x.as_ptr(), dst, x.len());
+        }
+        const ROWS_PER_TG: usize = 8;
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        enc.setComputePipelineState(&self.pipeline_fused);
+        for (i, op) in fused_ops.iter().enumerate() {
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.gate_zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_packed_offset, 3);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_scales_offset, 4);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.up_zeros_offset, 5);
+                enc.setBuffer_offset_atIndex(Some(scratch_x), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_activated[i]), 0, 7);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 8);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 9);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 10);
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                enc.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize { width: num_tgs, height: 1, depth: 1 },
+                    MTLSize { width: TG_SIZE, height: 1, depth: 1 },
+                );
+            }
+        }
+        enc.endEncoding();
+        cmd.commit(); // non-blocking — GPU starts immediately
+    }
+
+    /// Dispatch down phase and wait for completion. Returns down outputs.
+    /// Must be called after dispatch_fused_phase on the same queue (ordering guaranteed).
+    pub fn dispatch_down_phase_and_wait(
+        &self,
+        mmap_buf: &ProtocolObject<dyn MTLBuffer>,
+        down_ops: &[ExpertGemvOp],
+    ) -> Vec<Vec<f32>> {
+        if down_ops.is_empty() { return vec![]; }
+        const ROWS_PER_TG: usize = 8;
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        enc.setComputePipelineState(&self.pipeline_v2);
+        for (i, op) in down_ops.iter().enumerate() {
+            let ifb = self.get_const_buf(op.in_features as u32);
+            let gb = self.get_const_buf(op.group_size as u32);
+            let ofb = self.get_const_buf(op.out_features as u32);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.packed_offset, 0);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.scales_offset, 1);
+                enc.setBuffer_offset_atIndex(Some(mmap_buf), op.zeros_offset, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_activated[i]), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&self.scratch_down_y[i]), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(ifb), 0, 5);
+                enc.setBuffer_offset_atIndex(Some(gb), 0, 6);
+                enc.setBuffer_offset_atIndex(Some(ofb), 0, 7);
+                let num_tgs = (op.out_features + ROWS_PER_TG - 1) / ROWS_PER_TG;
+                enc.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize { width: num_tgs, height: 1, depth: 1 },
+                    MTLSize { width: TG_SIZE, height: 1, depth: 1 },
+                );
+            }
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        down_ops.iter().enumerate().map(|(i, op)| {
+            let mut out = vec![0.0f32; op.out_features];
+            unsafe {
+                let src = self.scratch_down_y[i].contents().as_ptr() as *const f32;
+                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), op.out_features);
+            }
+            out
+        }).collect()
+    }
+
     /// Compute y = packed_weights @ x on the GPU.
     pub fn gemv(&self, weights: &PackedWeights4Bit, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), weights.in_features);

@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 17
+tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 18
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -149,17 +149,24 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: Larger threadgroups (512 threads) reduce GPU occupancy. M4 Max has 40 execution units; with TG=256, each EU can run more concurrent TGs to hide memory latency. With TG=512, fewer TGs fit per EU, reducing latency hiding. The x_cache load cost saved by larger TGs (~0.5ms/token) is overwhelmed by occupancy loss (~5ms/token).
 - **Insight**: For bandwidth-bound INT4 GEMV on M4 Max, TG=256 (8 SIMD groups) is better than TG=512 (16 SIMD groups). Smaller TGs = more concurrent work = better latency hiding.
 
+### Iteration 16: Split-pread pipeline v3 (F_NOCACHE) — NO EFFECT (REVERTED)
+- **Experiment**: Re-test split-pread pipeline under F_NOCACHE conditions. Split pread into gate+up (overlaps shared_ffn in thread::scope) → dispatch_fused_phase (non-blocking GPU commit) → pread down (overlaps GPU fused) → dispatch_down_phase_and_wait. Added load_expert_partial to ExpertLoader, dispatch_fused_phase/dispatch_down_phase_and_wait to MetalDequantGemv.
+- **Result**: 1.37 tok/s (median warm: 1.35, 1.37, 1.38) vs 1.34* session baseline
+- **Verdict**: NO EFFECT — +2.2%, within noise. REVERTED hot path, kept infra (load_expert_partial, split dispatch methods).
+- **Root cause**: Same as iter 5 and 10. With F_NOCACHE, pread uses direct SSD→user DMA which is fast (~1.5ms for down portion). Metal_fused is ~1.5ms. The overlap window is ≈ 0 because they complete in roughly the same time. Extra command buffer overhead (~0.1ms × 60 layers = 6ms) further negates any micro-gain.
+- **Insight**: This is the 3rd attempt at split-pread (iters 5, 10, 16). Confirmed dead end across all conditions: pre-F_NOCACHE (iter 5), post-correctness-fix (iter 10), and post-F_NOCACHE (iter 16). The fundamental issue is that pread_dn ≈ Metal_fused, so there's nothing to overlap.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
 - **Pool write-back on critical path**: 23 MB alloc+copy per miss causes page cache eviction. Must be async or deferred.
-- **Split pread + pipeline Metal fused/down**: pread_dn (1.5-2.5ms) > GPU fused (~1.75ms). No overlap benefit, extra cmd buffer overhead cancels.
+- **Split pread + pipeline Metal fused/down (3 attempts)**: pread_dn ≈ GPU fused (~1.5ms each). No overlap benefit — they complete in the same time. Extra cmd buffer overhead cancels any micro-gain. Tested pre-F_NOCACHE (iter 5), post-correctness-fix (iter 10), and post-F_NOCACHE (iter 16). All NO EFFECT. Dead end confirmed.
 - **Metal constant buffer caching**: 4-byte u32 buffers are ~1μs each via newBufferWithBytes. ~360/token = 0.18ms, unmeasurable.
 - **Parallel per-head sgemv (W_UK/W_UV)**: 64×[128,512] sgemv = 320µs/layer total. Each call ~5µs, dominated by BLAS function-call overhead, not compute. Rayon parallelism saves <30µs/layer = 1.8ms/token.
 - **rayon::join for pread+shared_ffn**: Nested par_iter inside rayon::join causes work-stealing contention. thread::scope's independent OS thread avoids this. pthread overhead (~2-6ms) ≈ rayon contention cost.
 - **V2 down shader half x_cache**: Down pass with in_features=2048 is bandwidth-bound, not occupancy-limited. float[4096]=16KB already allows 2 concurrent TGs. half saves TG memory but no perf impact.
 - **fcntl(F_RDADVISE) prefetch before pread**: pread itself triggers DMA immediately. The hint-to-read window is microseconds — kernel can't start DMA before pread does it.
-- **Split-pread pipeline (2 cmd bufs, pread_dn overlaps Metal fused)**: Tested with correct shader (iter 10). pread_dn (1-2ms) ≈ Metal_fused (1.75ms), overlap window ≈ 0. 2 cmd buf overhead (6ms/token) cancels any micro-gain. Confirmed with profiling: total layer time unchanged.
+- **Split-pread pipeline (3 attempts: iters 5, 10, 16)**: Confirmed dead across all conditions. pread_dn ≈ Metal_fused, overlap window ≈ 0. Extra cmd buf overhead negates any gain. Do not retry.
 - **TG=512/ROWS_PER_TG=16 for fused+V2 shaders**: -8.7% regression (1.05 vs 1.15). Larger TGs reduce occupancy on M4 Max (40 EUs). TG=256 is optimal for bandwidth-bound INT4 GEMV.
 - **f16 o_proj via sgemv_f16_par from mmap**: -21% regression (0.91 vs 1.15). Double-buffer already pre-converts o_proj f16→f32 overlapped with FFN. f16_par bypasses warm DRAM, reads cold mmap during MLA, competes with expert pread for page cache. Same lesson as f16 inline decode: anything on MLA critical path that touches mmap loses to pre-staged f32.
 - **Dead MLA code removal (mla_layer_weights + final_norm.to_vec)**: ~0.2ms/token dead overhead. Unmeasurable. Committed as code cleanup.

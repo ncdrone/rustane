@@ -65,6 +65,23 @@ impl ExpertLoader {
         }
     }
 
+    /// Load a partial region of an expert's weights.
+    /// `offset_within`: byte offset from start of this expert's data.
+    /// `len`: number of bytes to read.
+    pub fn load_expert_partial(&self, expert_id: u32, buf: &mut [u8], offset_within: usize, len: usize) -> io::Result<usize> {
+        assert!(buf.len() >= len);
+        let base = self.layout.offset(expert_id);
+        let n = unsafe {
+            libc::pread(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                len,
+                base + offset_within as i64,
+            )
+        };
+        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+
     /// Load multiple experts in parallel using std::thread::scope.
     /// Returns the number of bytes loaded per expert.
     pub fn load_experts_parallel(
