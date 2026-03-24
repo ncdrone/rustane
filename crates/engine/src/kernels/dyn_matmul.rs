@@ -147,49 +147,6 @@ pub fn build_dual_conv(ic: usize, oc: usize, seq: usize) -> Graph {
     g
 }
 
-/// Build a DualDynMatmul graph with separate (concatenated) outputs.
-/// Shares activations between both matmuls — W1 and W3 use the same xnorm.
-/// Input: [1, IC, 1, SEQ + 2*OC]
-///   acts at [0..SEQ], wts1 at [SEQ..SEQ+OC], wts2 at [SEQ+OC..SEQ+2*OC]
-/// Output: [1, 2*OC, 1, SEQ]  (out1 in channels [0..OC], out2 in channels [OC..2*OC])
-///
-/// Used by: decomposed FFN W1+W3 forward (fuses 2 dispatches into 1)
-pub fn build_dual_separate(ic: usize, oc: usize, seq: usize) -> Graph {
-    let sp = seq + 2 * oc;
-    let mut g = Graph::new();
-
-    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: sp });
-
-    // Shared activations
-    let acts = g.slice(input, [0, 0, 0, 0], [1, ic, 1, seq]);
-    let acts_r = g.reshape(acts, Shape { batch: 1, channels: 1, height: ic, width: seq });
-    let acts_t = g.transpose(acts_r, [0, 1, 3, 2]); // [1,1,SEQ,IC]
-
-    // First matmul: acts @ wts1
-    let wts1 = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
-    let wts1_r = g.reshape(wts1, Shape { batch: 1, channels: 1, height: ic, width: oc });
-    let mm1 = g.matrix_multiplication(acts_t, wts1_r, false, false);
-    let mm1_t = g.transpose(mm1, [0, 1, 3, 2]);
-    let out1 = g.reshape(mm1_t, Shape { batch: 1, channels: oc, height: 1, width: seq });
-
-    // Second matmul: acts @ wts2
-    let wts2 = g.slice(input, [0, 0, 0, seq + oc], [1, ic, 1, oc]);
-    let wts2_r = g.reshape(wts2, Shape { batch: 1, channels: 1, height: ic, width: oc });
-    let mm2 = g.matrix_multiplication(acts_t, wts2_r, false, false);
-    let mm2_t = g.transpose(mm2, [0, 1, 3, 2]);
-    let out2 = g.reshape(mm2_t, Shape { batch: 1, channels: oc, height: 1, width: seq });
-
-    // Concatenate along channel axis: [1, 2*OC, 1, SEQ]
-    let _out = g.concat(&[out1, out2], 1);
-
-    g
-}
-
-/// IOSurface spatial width for build_dual_separate.
-pub fn dual_separate_spatial_width(seq: usize, oc: usize) -> usize {
-    seq + 2 * oc
-}
-
 /// IOSurface spatial width for a single DynMatmul kernel.
 pub fn spatial_width(seq: usize, oc: usize) -> usize {
     seq + oc

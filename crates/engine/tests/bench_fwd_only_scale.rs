@@ -12,10 +12,6 @@ use engine::model::ModelConfig;
 use engine::bench_result;
 use std::time::Instant;
 
-/// If true, use lean workspace (2 cache slots) to save ~462MB/layer at dim=5120.
-/// Critical for 50B+ models on 512GB RAM.
-const USE_LEAN_WORKSPACE: bool = true;
-
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
 fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
     ModelConfig {
@@ -46,12 +42,10 @@ struct FwdResult {
 /// Compile kernels, allocate weights, run 3 forward passes, report median timing.
 fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     let params_b = cfg.param_count() as f64 / 1e9;
-    // Estimate: weights (4B/param) + workspace.
-    // Lean mode: 2 cache slots instead of nlayers (saves ~462MB/layer at dim=5120).
+    // Estimate: weights (4B/param) + fwd workspace (caches + buffers)
     let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3
         + cfg.heads * cfg.seq * cfg.seq * 4) as f64 / 1e6;
-    let cache_layers = if USE_LEAN_WORKSPACE { 2 } else { cfg.nlayers };
-    let mem_est_gb = params_b * 4.0 + cache_layers as f64 * per_layer_cache_mb / 1000.0 + 0.5;
+    let mem_est_gb = params_b * 4.0 + cfg.nlayers as f64 * per_layer_cache_mb / 1000.0 + 0.5;
 
     println!("\n{}", "=".repeat(70));
     println!("  {name} — {d}d/{h}h/{nl}L/seq{s} — {p:.2}B params — est. {m:.1}GB",
@@ -69,28 +63,23 @@ fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     print!("  [2/3] Allocating {:.1}GB... ", mem_est_gb);
     let t0 = Instant::now();
     let weights = ModelWeights::random(cfg);
-    let mut fwd_ws = if USE_LEAN_WORKSPACE {
-        ModelForwardWorkspace::new_lean(cfg)
-    } else {
-        ModelForwardWorkspace::new(cfg)
-    };
+    let mut fwd_ws = ModelForwardWorkspace::new(cfg);
     let alloc_s = t0.elapsed().as_secs_f32();
-    println!("{alloc_s:.1}s (lean={})", USE_LEAN_WORKSPACE);
+    println!("{alloc_s:.1}s");
 
     let tc = TrainConfig::default();
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
 
     // 3. Forward passes (1 warmup + 3 timed)
-    let fwd_fn = if USE_LEAN_WORKSPACE { full_model::forward_only_ws } else { full_model::forward_ws };
     print!("  [3/3] Forward pass (1 warmup + 3 timed)... ");
-    let _warmup_loss = fwd_fn(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let _warmup_loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
 
     let mut times = Vec::with_capacity(3);
     let mut loss = 0.0f32;
     for _ in 0..3 {
         let t0 = Instant::now();
-        loss = fwd_fn(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
         times.push(t0.elapsed().as_secs_f32() * 1000.0);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -229,115 +218,14 @@ fn fwd_scale_ladder() {
     print_fwd_table(&results);
 }
 
-// ── 25B+ individual probes ────────────────────────────────────────────
-
-#[test]
-#[ignore]
-fn fwd_25b() {
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 80, 512), "25B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_30b() {
-    // dim=5120, hidden=13824, 40 heads, 96 layers → ~30.5B
-    // Keeps SDPA spatial width = 15872 < 16384 (ANE limit)
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 96, 512), "30B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_40b() {
-    // dim=5120, hidden=13824, 40 heads, 128 layers → ~40.6B
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 128, 512), "40B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_50b() {
-    // dim=5120, hidden=13824, 40 heads, 160 layers → ~50.8B
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 160, 512), "50B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_60b() {
-    // dim=5120, hidden=13824, 40 heads, 192 layers → ~60.9B
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 192, 512), "60B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_70b() {
-    // dim=5120, hidden=13824, 40 heads, 224 layers → ~71.1B
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 224, 512), "70B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_80b() {
-    // dim=5120, hidden=13824, 40 heads, 256 layers → ~81.2B
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 256, 512), "80B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_100b() {
-    // dim=5120, hidden=13824, 40 heads, 320 layers → ~101.5B
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 320, 512), "100B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_110b() {
-    // dim=5120, hidden=13824, 40 heads, 352 layers → ~111.7B (~447GB weights)
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 352, 512), "110B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_115b() {
-    // dim=5120, hidden=13824, 40 heads, 368 layers → ~116.7B (~467GB weights)
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 368, 512), "115B");
-    assert!(r.loss.is_finite());
-}
-
-#[test]
-#[ignore]
-fn fwd_122b() {
-    // dim=5120, hidden=13824, 40 heads, 390 layers → ~123.7B (~496GB)
-    // CEILING on 512GB M3 Ultra — 124B (503GB) OOM kills
-    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 390, 512), "122B");
-    assert!(r.loss.is_finite());
-}
-
-/// Push from 25B to 125B. Find the ceiling on 512GB M3 Ultra.
-/// All configs use dim=5120 to stay within ANE spatial width limit (16384).
+/// Push to the absolute limit: 25B and 30B.
+/// These will eat nearly all 128GB RAM. Close all other apps first.
 #[test]
 #[ignore]
 fn fwd_find_ceiling() {
     let configs: Vec<(ModelConfig, &str)> = vec![
-        (custom_config(5120, 13824, 40,  80, 512), "25B"),
-        (custom_config(5120, 13824, 40,  96, 512), "30B"),
-        (custom_config(5120, 13824, 40, 128, 512), "40B"),
-        (custom_config(5120, 13824, 40, 160, 512), "50B"),
-        (custom_config(5120, 13824, 40, 192, 512), "60B"),
-        (custom_config(5120, 13824, 40, 224, 512), "70B"),
-        (custom_config(5120, 13824, 40, 256, 512), "80B"),
-        (custom_config(5120, 13824, 40, 320, 512), "100B"),
-        (custom_config(5120, 13824, 40, 352, 512), "110B"),
-        (custom_config(5120, 13824, 40, 368, 512), "115B"),
-        (custom_config(5120, 13824, 40, 384, 512), "120B"),
-        (custom_config(5120, 13824, 40, 390, 512), "122B"),
+        (custom_config(5120, 13824, 40, 80, 512), "25B"),
+        (custom_config(6144, 16384, 48, 64, 512), "30B"),
     ];
 
     let mut results = Vec::new();

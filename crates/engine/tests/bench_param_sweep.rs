@@ -53,10 +53,6 @@ struct SweepResult {
 /// Run sweep on a config: 10 training steps (validate) + 5 timed steps (benchmark).
 /// Mirrors bench_scale_correctness which is proven stable at all scales with TrainConfig::default().
 fn run_sweep(cfg: &ModelConfig, name: &str) -> SweepResult {
-    run_sweep_with_tc(cfg, name, TrainConfig::default())
-}
-
-fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepResult {
     let params_m = cfg.param_count() as f64 / 1e6;
     let hd_ratio = cfg.hidden as f64 / cfg.dim as f64;
 
@@ -75,6 +71,7 @@ fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepRes
     // 2. Forward validation
     print!("  [2/4] Forward pass... ");
     let mut weights = ModelWeights::random(cfg);
+    let tc = TrainConfig::default();
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let mut fwd_ws = ModelForwardWorkspace::new(cfg);
@@ -458,9 +455,8 @@ fn sweep_5b_e() {
 #[ignore]
 fn sweep_7b() {
     // Llama-2-7B shape: dim=4096, hidden=11008, 32 heads, 32 layers
-    // ~6.5B params, ~112GB training RAM
-    let tc = TrainConfig { max_lr: 1e-4, ..TrainConfig::default() };
-    let r = run_sweep_with_tc(&custom_config(4096, 11008, 32, 32, 512), "7b", tc);
+    // ~6.5B params, ~112GB training RAM — tight on 128GB
+    let r = run_sweep(&custom_config(4096, 11008, 32, 32, 512), "7b");
     assert!(r.all_finite, "NaN/Inf detected");
     assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
 }
@@ -469,45 +465,8 @@ fn sweep_7b() {
 #[ignore]
 fn sweep_10b() {
     // 10B: dim=4096, hidden=11008, 48 layers
-    // ~9.8B params, ~168GB training RAM
-    let tc = TrainConfig { max_lr: 3e-5, ..TrainConfig::default() };
-    let r = run_sweep_with_tc(&custom_config(4096, 11008, 32, 48, 512), "10b", tc);
-    assert!(r.all_finite, "NaN/Inf detected");
-    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
-}
-
-
-// ── 13B+ (M3 Ultra 512GB exclusive) ──────────────────────────────────
-
-#[test]
-#[ignore]
-fn sweep_13b() {
-    // dim=5120, hidden=13824, 40 heads, 42 layers → ~13.4B
-    // ~237GB training RAM
-    let tc = TrainConfig { max_lr: 1e-5, embed_lr_scale: 1.0, ..TrainConfig::default() };
-    let r = run_sweep_with_tc(&custom_config(5120, 13824, 40, 42, 512), "13b", tc);
-    assert!(r.all_finite, "NaN/Inf detected");
-    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
-}
-
-#[test]
-#[ignore]
-fn sweep_20b() {
-    // dim=5120, hidden=13824, 40 heads, 64 layers → ~20.3B
-    // ~359GB training RAM
-    let tc = TrainConfig { max_lr: 1e-5, embed_lr_scale: 1.0, ..TrainConfig::default() };
-    let r = run_sweep_with_tc(&custom_config(5120, 13824, 40, 64, 512), "20b", tc);
-    assert!(r.all_finite, "NaN/Inf detected");
-    assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
-}
-
-#[test]
-#[ignore]
-fn sweep_25b() {
-    // dim=5120, hidden=13824, 40 heads, 80 layers → ~25.4B
-    // ~447GB training RAM — near limit on 512GB
-    let tc = TrainConfig { max_lr: 1e-5, embed_lr_scale: 1.0, ..TrainConfig::default() };
-    let r = run_sweep_with_tc(&custom_config(5120, 13824, 40, 80, 512), "25b", tc);
+    // ~9.8B params, ~168GB training RAM — will use swap on 128GB
+    let r = run_sweep(&custom_config(4096, 11008, 32, 48, 512), "10b");
     assert!(r.all_finite, "NaN/Inf detected");
     assert!(r.loss_delta < 0.0, "loss did not decrease: delta={}", r.loss_delta);
 }

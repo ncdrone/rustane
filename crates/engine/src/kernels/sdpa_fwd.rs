@@ -1,8 +1,5 @@
 //! SDPA Forward kernel: QKV projection + RoPE + attention + output.
 //!
-//! RoPE uses matmul-based permutation (M3/M4 Ultra compatible) instead of
-//! width-axis reshape/slice/concat (M4 Max only).
-//!
 //! Input IOSurface: [1, DIM, 1, SEQ + Q_DIM + KV_DIM + KV_DIM]
 //!   sp[0:SEQ]                     = xnorm [DIM, SEQ]
 //!   sp[SEQ:SEQ+Q_DIM]             = Wq [DIM, Q_DIM]
@@ -46,22 +43,6 @@ fn causal_mask(seq: usize) -> Vec<f32> {
         }
     }
     mask
-}
-
-/// Build rotate_half permutation matrix P (hd × hd).
-///
-/// Implements rotate_half([x0,x1,x2,x3,...]) = [-x1,x0,-x3,x2,...] via matmul.
-/// This avoids width-axis reshape/slice/concat ops that M3 Ultra's ANE rejects.
-///
-///   P[2i+1, 2i] = -1  (negate odd → even position)
-///   P[2i, 2i+1] = 1   (copy even → odd position)
-fn rope_permutation_matrix(hd: usize) -> Vec<f32> {
-    let mut perm = vec![0.0f32; hd * hd];
-    for i in 0..hd / 2 {
-        perm[(2 * i + 1) * hd + 2 * i] = -1.0;
-        perm[(2 * i) * hd + 2 * i + 1] = 1.0;
-    }
-    perm
 }
 
 /// Build the SDPA forward graph.
@@ -116,25 +97,32 @@ pub fn build(cfg: &ModelConfig) -> Graph {
     let v4 = g.reshape(vf, Shape { batch: 1, channels: heads, height: hd, width: seq });
     let v = g.transpose(v4, [0, 1, 3, 2]);
 
-    // ── RoPE via matmul permutation ──
-    // rotate_half(x) = x @ P where P is a constant hd×hd permutation matrix.
-    // This replaces the width-axis reshape/slice/concat pattern which fails on
-    // M3 Ultra's ANE. The 128×128 sparse matmul is negligible cost compared to
-    // the QKV projections. Works on all Apple Silicon generations.
+    // ── RoPE ──
     let (cos_data, sin_data) = rope_table(seq, hd);
     let rope_cos = g.constant(&cos_data, Shape { batch: 1, channels: 1, height: seq, width: hd });
     let rope_sin = g.constant(&sin_data, Shape { batch: 1, channels: 1, height: seq, width: hd });
-    let perm_data = rope_permutation_matrix(hd);
-    let perm = g.constant(&perm_data, Shape { batch: 1, channels: 1, height: hd, width: hd });
 
-    // q_rope = q * cos + (q @ P) * sin
-    let q_rot = g.matrix_multiplication(q, perm, false, false);
+    // rotate_half(q): split pairs, negate odd, concat reversed, reshape back
+    let pairs_q = seq * hd / 2;
+    let q_p = g.reshape(q, Shape { batch: 1, channels: heads, height: pairs_q, width: 2 });
+    let q_e = g.slice(q_p, [0, 0, 0, 0], [1, heads, pairs_q, 1]); // even
+    let q_o = g.slice(q_p, [0, 0, 0, 1], [1, heads, pairs_q, 1]); // odd
+    let neg1 = g.constant_with_scalar(-1.0, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let nq = g.multiplication(q_o, neg1);
+    let qrp = g.concat(&[nq, q_e], 3); // [-odd, even] → rotated
+    let q_rot = g.reshape(qrp, Shape { batch: 1, channels: heads, height: seq, width: hd });
     let qc = g.multiplication(q, rope_cos);
     let qrs = g.multiplication(q_rot, rope_sin);
     let q_rope = g.addition(qc, qrs);
 
-    // k_rope = k * cos + (k @ P) * sin
-    let k_rot = g.matrix_multiplication(k, perm, false, false);
+    // rotate_half(k): same pattern
+    let pairs_k = seq * hd / 2;
+    let k_p = g.reshape(k, Shape { batch: 1, channels: heads, height: pairs_k, width: 2 });
+    let k_e = g.slice(k_p, [0, 0, 0, 0], [1, heads, pairs_k, 1]);
+    let k_o = g.slice(k_p, [0, 0, 0, 1], [1, heads, pairs_k, 1]);
+    let nk = g.multiplication(k_o, neg1);
+    let krp = g.concat(&[nk, k_e], 3);
+    let k_rot = g.reshape(krp, Shape { batch: 1, channels: heads, height: seq, width: hd });
     let kc = g.multiplication(k, rope_cos);
     let krs = g.multiplication(k_rot, rope_sin);
     let k_rope = g.addition(kc, krs);

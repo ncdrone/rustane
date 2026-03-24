@@ -100,21 +100,6 @@ fn profile_config(cfg: &ModelConfig, name: &str) {
         }
     }
 
-    // Per-layer backward timing (single layer, run 2 is reported)
-    println!("\n--- Per-Layer Backward Breakdown (layer 0, run 2 of 3) ---");
-    // Need a forward cache first
-    let (_, fwd_cache, _) = layer::forward_timed(cfg, &kernels, &weights.layers[0], &x_dummy);
-    let mut lgrads = engine::layer::LayerGrads::zeros(cfg);
-    let mut bwd_ws = engine::layer::BackwardWorkspace::new(cfg);
-    let dy_dummy = vec![0.1f32; cfg.dim * cfg.seq];
-    for run in 0..3 {
-        lgrads.zero_out();
-        let (_, btimings) = layer::backward_timed(cfg, &kernels, &weights.layers[0], &fwd_cache, &dy_dummy, &mut lgrads, &mut bwd_ws);
-        if run == 1 {
-            btimings.print();
-        }
-    }
-
     println!("\n=== {} Done ===\n", name);
 }
 

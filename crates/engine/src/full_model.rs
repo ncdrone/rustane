@@ -180,90 +180,6 @@ impl ModelForwardWorkspace {
             dlogits: vec![0.0; seq * vocab],
         }
     }
-
-    /// Lean workspace for forward-only benchmarks.
-    /// Uses only 2 ForwardCache slots (ping-pong) instead of N layers.
-    /// Saves ~462MB per layer at dim=5120 — critical for 50B+ scales.
-    pub fn new_lean(cfg: &ModelConfig) -> Self {
-        let dim = cfg.dim;
-        let seq = cfg.seq;
-        let vocab = cfg.vocab;
-        Self {
-            caches: (0..2).map(|_| ForwardCache::new(cfg)).collect(),
-            x_row: vec![0.0; seq * dim],
-            x_buf: vec![0.0; dim * seq],
-            x_next_buf: vec![0.0; dim * seq],
-            x_final: vec![0.0; dim * seq],
-            x_prenorm: vec![0.0; dim * seq],
-            rms_inv_final: vec![0.0; seq],
-            x_final_row: vec![0.0; seq * dim],
-            logits: vec![0.0; seq * vocab],
-            logits_capped: vec![0.0; seq * vocab],
-            dlogits: vec![0.0; seq * vocab],
-        }
-    }
-}
-
-/// Forward-only pass using lean workspace (2 cache slots, no backward data retained).
-/// Identical computation to forward_ws but reuses 2 ForwardCache slots.
-/// Only valid for decomposed FFN configs (dim >= ~1536) where prev_cache readback is a no-op.
-pub fn forward_only_ws(
-    cfg: &ModelConfig,
-    kernels: &CompiledKernels,
-    weights: &ModelWeights,
-    tokens: &[u32],
-    targets: &[u32],
-    softcap: f32,
-    ws: &mut ModelForwardWorkspace,
-) -> f32 {
-    assert!(ws.caches.len() >= 2, "forward_only_ws requires at least 2 cache slots");
-    let dim = cfg.dim;
-    let seq = cfg.seq;
-    let vocab = cfg.vocab;
-
-    // 1. Embedding lookup → x_buf [DIM, SEQ]
-    embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
-    vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
-
-    // 2. Forward through NL layers, reusing 2 cache slots (ping-pong).
-    for l in 0..cfg.nlayers {
-        let cur = l % 2;
-        if l > 0 {
-            let (first, second) = ws.caches.split_at_mut(1);
-            let (prev_cache, cur_cache) = if cur == 0 {
-                (&mut first[0], &mut second[0])
-            } else {
-                (&mut second[0], &mut first[0])
-            };
-            layer::forward_into_pipelined(cfg, kernels, &weights.layers[l], &ws.x_buf, cur_cache, &mut ws.x_next_buf, Some(prev_cache));
-        } else {
-            layer::forward_into_pipelined(cfg, kernels, &weights.layers[0], &ws.x_buf, &mut ws.caches[0], &mut ws.x_next_buf, None);
-        }
-        std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
-    }
-    // Read last layer's deferred cache (no-op for decomposed FFN)
-    let last = (cfg.nlayers - 1) % 2;
-    layer::read_ffn_cache(cfg, kernels, &mut ws.caches[last]);
-
-    // 3-7. Final norm → logits → loss (same as forward_ws)
-    ws.x_prenorm.copy_from_slice(&ws.x_buf);
-    rmsnorm::forward_channel_first(&ws.x_prenorm, &weights.gamma_final, &mut ws.x_final, &mut ws.rms_inv_final, dim, seq);
-    vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
-    ws.logits.fill(0.0);
-    vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
-
-    let has_softcap = softcap > 0.0;
-    if has_softcap {
-        vdsp::sscal(&mut ws.logits, 1.0 / softcap);
-        vdsp::tanhf(&ws.logits, &mut ws.logits_capped);
-        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits);
-    }
-
-    let total_loss = cross_entropy::forward_backward_batch(
-        &ws.logits, targets, vocab, &mut ws.dlogits, 1.0 / seq as f32,
-    );
-
-    total_loss / seq as f32
 }
 
 /// Forward pass using pre-allocated workspace (zero heap allocations in steady state).
@@ -331,7 +247,6 @@ pub fn forward_ws(
 }
 
 /// Backward pass using pre-allocated workspaces (reads from fwd_ws, writes grads).
-/// Returns raw gradient L2 norm (computed inline during backward, saves ~20ms standalone).
 pub fn backward_ws(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
@@ -342,7 +257,7 @@ pub fn backward_ws(
     loss_scale: f32,
     grads: &mut ModelGrads,
     bwd_ws: &mut ModelBackwardWorkspace,
-) -> f32 {
+) {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
@@ -413,7 +328,6 @@ pub fn backward_ws(
 
     // 6. Embedding backward (after dembed sgemm completes)
     embedding::backward_channel_first(&bwd_ws.dy, dim, tokens, &mut grads.dembed);
-    0.0 // caller should use grad_norm() if needed
 }
 
 /// Cosine LR schedule with linear warmup.
@@ -497,7 +411,6 @@ pub fn forward(
 
 /// Full backward pass: logits grad → softcap → final norm → NL layers (reverse) → embedding.
 /// Takes a pre-allocated workspace to avoid per-call allocations (~1.2 GB churn).
-/// Returns raw gradient L2 norm (computed inline during backward, saves ~20ms standalone).
 pub fn backward(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
@@ -508,7 +421,7 @@ pub fn backward(
     loss_scale: f32,
     grads: &mut ModelGrads,
     ws: &mut ModelBackwardWorkspace,
-) -> f32 {
+) {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
@@ -558,26 +471,15 @@ pub fn backward(
         &mut ws.dy, &mut grads.dgamma_final, dim, seq, &mut ws.rms_dot_buf,
     );
 
-    // 5. Backward through NL layers (reverse order, zero-alloc via backward_into)
-    //    Inline grad_norm: accumulate per-layer norm during backward (saves ~20ms standalone).
-    let mut norm_sum = 0.0f32;
+    // 5. Backward through NL layers (reverse order, pre-allocated workspace)
     for l in (0..cfg.nlayers).rev() {
-        layer::backward_into(cfg, kernels, &weights.layers[l], &fwd.caches[l], &ws.dy, &mut grads.layers[l], &mut ws.layer_ws, &mut ws.dy_buf);
-        std::mem::swap(&mut ws.dy, &mut ws.dy_buf);
-        // Accumulate grad norm for this layer (svesq is O(n) vectorized, ~1ms/layer)
-        let lg = &grads.layers[l];
-        for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
-            norm_sum += vdsp::svesq(g);
-        }
+        // layer::backward returns dx into a new Vec; copy into ws.dy for next layer
+        let dx = layer::backward(cfg, kernels, &weights.layers[l], &fwd.caches[l], &ws.dy, &mut grads.layers[l], &mut ws.layer_ws);
+        ws.dy = dx;
     }
 
     // 6. Input embedding backward: channel-first scatter-add, no mtrans
     embedding::backward_channel_first(&ws.dy, dim, tokens, &mut grads.dembed);
-
-    // Include embedding + gamma_final norms
-    norm_sum += vdsp::svesq(&grads.dembed);
-    norm_sum += vdsp::svesq(&grads.dgamma_final);
-    norm_sum.sqrt()
 }
 
 /// Apply Adam to all model weights with split learning rates.
