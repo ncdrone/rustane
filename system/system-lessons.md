@@ -116,6 +116,22 @@ Read this before modifying any system/ scripts. Updated after every incident.
 
 ---
 
+## L9: ALWAYS profile before optimizing — measure, don't guess
+
+**Date:** 2026-03-23
+**Severity:** CRITICAL
+**Incident:** Let K2 optimizer run ~10 iterations targeting CPU-side MLA tricks. Real profiling revealed MLA is only 12.5% of layer time — the bottleneck is FFN+Metal+pread (87.5%) which we hadn't instrumented. Also assumed V3's 90% expert cache hit rate would transfer to K2 — actual K2 hit rate is 54.1% (384 experts are much more sparse than V3's 256).
+
+**Fix:** Before launching any optimizer on a new model:
+1. Run RUSTANE_MLA_PROFILE=1 + RUSTANE_POOL_SIM=1 first
+2. Instrument every code path (MLA, FFN, Metal dispatch, pread)
+3. Get real per-component numbers, THEN optimize the biggest one
+4. Never assume one model's profile transfers to another
+
+**Rule:** The first experiment is always DIAGNOSTIC. Profile first, optimize second.
+
+---
+
 ## General Principles
 
 1. **Stateless agents need filesystem memory.** Gossip files, experiment logs, and state files bridge the gap between invocations.

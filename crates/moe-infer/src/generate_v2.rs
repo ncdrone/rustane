@@ -110,6 +110,11 @@ pub struct ModelV2 {
     pub expert_staging: Vec<u8>,
     /// Pre-wrapped Metal buffer for expert_staging (created once, reused).
     pub expert_staging_metal: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Expert pool: Least-Stale cache for hot experts (avoids pread on hit).
+    /// UnsafeCell because pool state mutates during &self decode (single-threaded access).
+    pub expert_pool: std::cell::UnsafeCell<Option<expert_pager::ExpertPool>>,
+    /// Pool backing buffers: one Vec<u8> per pool slot, size = expert_stride.
+    pub pool_buffers: std::cell::UnsafeCell<Vec<Vec<u8>>>,
 }
 
 /// Sampling configuration.
@@ -264,10 +269,35 @@ impl ModelV2 {
             None
         };
 
+        // Expert pool: cache hot experts in RAM to avoid pread on repeated access.
+        // K2 profiling shows pread is 71-84% of layer time. Pool eliminates hits entirely.
+        let (expert_pool, pool_buffers) = if lazy_mode && expert_stride > 0 {
+            // Pool capacity: fit as many experts as RAM allows.
+            // Each slot = expert_stride bytes (~23 MB for K2).
+            // Budget: available RAM after backbone + staging + KV cache.
+            // Conservative: use ~60% of available memory for pool.
+            // Pool capacity: use most of available RAM but LAZY allocate.
+            // Pre-allocating 91 GB at once evicts OS page cache — disaster.
+            // Lazy: start with empty Vecs, allocate on first miss per slot.
+            let pool_cap_env = std::env::var("RUSTANE_POOL_CAP")
+                .ok().and_then(|v| v.parse::<usize>().ok());
+            let pool_cap = pool_cap_env.unwrap_or(3000); // default 3000 (~70 GB max, lazy)
+            // Lazy: allocate empty Vecs (0 bytes each). Grow on first use.
+            let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| Vec::new()).collect();
+            eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB",
+                pool_cap, expert_stride as f64 / 1e6,
+                pool_cap as f64 * expert_stride as f64 / 1e9);
+            (Some(expert_pager::ExpertPool::new(pool_cap)), bufs)
+        } else {
+            (None, Vec::new())
+        };
+
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
             expert_loaders, expert_stride, expert_staging, expert_staging_metal,
+            expert_pool: std::cell::UnsafeCell::new(expert_pool),
+            pool_buffers: std::cell::UnsafeCell::new(pool_buffers),
         })
     }
 }
@@ -775,11 +805,16 @@ fn moe_ffn_v2(
 ) -> Result<Vec<f32>> {
     let hidden = model.config.hidden_size();
 
+    // FFN profiling (env-gated: RUSTANE_FFN_PROFILE=1)
+    let ffn_profile = std::env::var("RUSTANE_FFN_PROFILE").is_ok();
+    let t_ffn_start = std::time::Instant::now();
+
     // 1. Router
     let router_w = lf.router.as_ref().expect("MoE layer needs router");
     let num_experts = model.config.num_experts();
     let mut gate_logits = vec![0.0f32; num_experts];
     crate::blas::sgemv_f32(router_w, x, &mut gate_logits, num_experts, hidden);
+    let t_after_router = std::time::Instant::now();
 
     let route = if model.config.ffn.scoring_func == "sigmoid" {
         if let Some(ref bias) = lf.e_score_correction_bias {
@@ -854,33 +889,91 @@ fn moe_ffn_v2(
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
             let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
-            // Overlap pread with shared FFN via thread::scope.
-            // IMPORTANT: assign shared FFN result back to outer `combined`, don't shadow it.
+            // Expert pool: check cache before pread. Copy hits to staging, track misses.
+            let mut need_pread: Vec<bool> = vec![true; expert_ids.len()];
+            let mut pool_hits = 0usize;
+            {
+                // SAFETY: single-threaded access during decode. Pool is not accessed from thread::scope.
+                let pool_opt = unsafe { &mut *model.expert_pool.get() };
+                let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
+                if let Some(pool) = pool_opt.as_mut() {
+                    for &(i, eid, _) in &expert_ids {
+                        let (slot, is_hit) = pool.request(layer as u32, eid as u32);
+                        if is_hit && !pool_bufs[slot].is_empty() {
+                            // Cache hit AND buffer allocated: copy from pool to staging
+                            let staging_offset = i * expert_stride;
+                            pread_region[staging_offset..staging_offset + expert_stride]
+                                .copy_from_slice(&pool_bufs[slot][..expert_stride]);
+                            need_pread[i] = false;
+                            pool_hits += 1;
+                        }
+                        // If hit but buffer empty: treat as miss (lazy alloc on write-back)
+                    }
+                }
+            }
+
+            // Overlap pread (misses only) with shared FFN via thread::scope.
+            let t_before_scope = std::time::Instant::now();
+            let need_pread_ref = &need_pread;
             let shared_result = std::thread::scope(|s| {
-                // Spawn pread on background thread (uses rayon internally for QD>1)
                 let pread_handle = s.spawn(|| {
+                    let t_pread = std::time::Instant::now();
                     pread_region
                         .chunks_mut(expert_stride)
                         .zip(expert_ids.iter())
                         .collect::<Vec<_>>()
                         .into_par_iter()
-                        .for_each(|(chunk, &(_, eid, _))| {
-                            loader.load_expert(eid as u32, chunk).unwrap();
+                        .for_each(|(chunk, &(i, eid, _))| {
+                            if need_pread_ref[i] {
+                                loader.load_expert(eid as u32, chunk).unwrap();
+                            }
                         });
+                    t_pread.elapsed()
                 });
 
-                // Shared FFN on current thread (overlaps with pread I/O)
+                let t_shared = std::time::Instant::now();
                 let result = if lf.shared_gate.is_some() {
                     shared_expert_ffn(x, lf)
                 } else {
                     vec![0.0f32; hidden]
                 };
+                let shared_elapsed = t_shared.elapsed();
 
-                pread_handle.join().unwrap();
+                let pread_elapsed = pread_handle.join().unwrap();
+                if ffn_profile && layer <= 3 {
+                    eprintln!("  FFN L{layer:02} pread: {:.0}µs  shared_ffn: {:.0}µs  (overlapped)",
+                        pread_elapsed.as_micros(), shared_elapsed.as_micros());
+                }
                 result
             });
-            // Write shared FFN result into outer combined (was being lost due to shadowing)
+            let t_after_scope = std::time::Instant::now();
             combined = shared_result;
+
+            // Update pool: copy pread misses into pool buffers (so future tokens hit)
+            {
+                let pool_opt = unsafe { &*model.expert_pool.get() };
+                let pool_bufs = unsafe { &mut *model.pool_buffers.get() };
+                if let Some(pool) = pool_opt.as_ref() {
+                    for &(i, eid, _) in &expert_ids {
+                        if need_pread[i] {
+                            if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                // Lazy allocate pool buffer on first miss
+                                if pool_bufs[slot].is_empty() {
+                                    pool_bufs[slot] = vec![0u8; expert_stride];
+                                }
+                                let staging_offset = i * expert_stride;
+                                pool_bufs[slot][..expert_stride]
+                                    .copy_from_slice(&pread_region[staging_offset..staging_offset + expert_stride]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ffn_profile && layer <= 3 {
+                eprintln!("  FFN L{layer:02} pool: {pool_hits} hits / {} total",
+                    expert_ids.len());
+            }
 
             // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();
@@ -911,14 +1004,25 @@ fn moe_ffn_v2(
             }
 
             if !routing_weights.is_empty() {
-                // Use pre-wrapped Metal buffer (staging content updated in-place via pread)
+                let t_metal = std::time::Instant::now();
                 let metal_buf = model.expert_staging_metal.as_ref().unwrap();
                 let down_results = m.fused_and_down_single_cmdbuf(metal_buf, &fused_ops, &down_ops, x);
+                let metal_elapsed = t_metal.elapsed();
+
+                let t_accum = std::time::Instant::now();
                 for (i, weight) in routing_weights.iter().enumerate() {
                     let scaled_weight = weight * routed_scale;
                     for d in 0..hidden {
                         combined[d] += scaled_weight * down_results[i][d];
                     }
+                }
+                let accum_elapsed = t_accum.elapsed();
+
+                if ffn_profile && layer <= 3 {
+                    let scope_ms = t_after_scope.duration_since(t_before_scope).as_micros();
+                    eprintln!("  FFN L{layer:02} metal: {:.0}µs  accum: {:.0}µs  scope_total: {:.0}µs  LAYER_TOTAL: {:.0}µs",
+                        metal_elapsed.as_micros(), accum_elapsed.as_micros(), scope_ms,
+                        t_ffn_start.elapsed().as_micros());
                 }
             }
         } else {

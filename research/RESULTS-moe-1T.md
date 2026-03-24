@@ -321,6 +321,86 @@ Replaced sequential token-by-token attention with a fused ANE graph that process
 
 ---
 
+## Stage 5 Post-Mortem: DeepSeek-V2-Lite MLA Dry Run — COMPLETE (2026-03-21)
+
+> Date: 2026-03-21. Branch: `rustane-infer`.
+> Goal: Validate full MLA pipeline on V2-Lite (15.7B) before scaling to V3 (671B).
+> Result: **4-level validation: embedding PASS, layer output PASS (cos=0.938), logit top-5 PASS, 39 tests, 0 Qwen3 regressions.**
+
+### Key deliverables:
+- bf16→f16 weight converter (`convert_deepseek.rs`) with W_UK/W_UV split from kv_b_proj
+- Full MLA absorbed attention (`mla_attention.rs`): Q projection → split nope/rope → RoPE → KV compression → cache → absorbed scoring → softmax → value combination → O projection
+- YaRN RoPE with 3-band frequency scaling (`yarn_rope.rs`)
+- Generation loop (`generate_v2.rs`): MLA + dense FFN (layer 0) + MoE + shared experts + Metal 4-bit
+- Q LoRA path + sigmoid grouped routing pre-built for V3
+- 4-level validation test suite (`test_model_validation.rs`)
+
+---
+
+## Stage 6: DeepSeek-V3 (671B) Execution — IN PROGRESS (2026-03-22)
+
+> Date: 2026-03-22. Branch: `rustane-infer`.
+> Goal: Get V3 generating tokens on M4 Max 128GB at 3-5 tok/s.
+> Status: **Infrastructure complete. Weight conversion running.**
+
+### 8 tasks completed:
+
+| # | Task | Gate | Status |
+|---|------|------|--------|
+| T1 | V3 Config + TOML | All 3 TOMLs parse, `is_moe_layer(2)=false` | DONE |
+| T2 | FP8 Dequant Module | LUT validated vs ml_dtypes (all 256 bytes) | DONE |
+| T3 | FP8→INT4 Converter | 1-layer test: 4.9 GB backbone in 11.3s | DONE |
+| T4 | Expert Pager (Least-Stale) | Evicts lowest-layer expert, 7 tests pass | DONE |
+| T5 | V3 Wiring + Bug Fixes | 37 lib tests, 0 regressions, compiles | DONE |
+| T6 | Python Reference Gen | Partial-load + API scripts written | DONE |
+| T7 | V3 Validation Suite | 4-level framework, compiles | DONE |
+| T8 | E2E Benchmark | Benchmark test ready | DONE |
+
+### FP8 end-to-end validation (real V3 weights):
+
+| Test | Cosine | Max Diff |
+|------|--------|----------|
+| Embedding (bf16→f16) | 1.000000 | 0.000000 |
+| Input LayerNorm | 1.000000 | 0.000000 |
+| Normed Embedding | 1.000000 | 0.000000 |
+| q_a_proj row 0 (FP8→f16) | 1.000000 | 0.000014 |
+| q_a_proj row 500 (FP8→f16) | 1.000000 | 0.000009 |
+| Q Latent (full matmul) | 1.000000 | 0.000052 |
+
+**Rust FP8→f16 converter is bit-accurate vs Python ml_dtypes ground truth.**
+
+### Critical corrections applied (from Stage 2 research):
+1. `routed_scaling_factor` bug FIXED — was scaling combined output, now scales per-expert weight
+2. LRU → Least-Stale eviction (by minimum `last_used_layer`)
+3. L-2 prefetcher disabled (-18% perf, 25% hit rate in research)
+4. `first_k_dense_replace = 3` (THREE dense layers, not 1)
+5. `shared_expert_count = 1` (not 2), `norm_topk_prob = true`
+6. `e_score_correction_bias` loaded per MoE layer for V3 sigmoid routing
+7. `route_sigmoid_v3` with grouped top-k wired into generate_v2
+
+### Known blocker:
+**Memory pressure** — current code pre-converts all layers to f32 Vec (~54 GB for V3). Need lazy f16→f32 conversion strategy. Research dispatched (Stage 3 research prompt: `research/mla-1t/03-stage3-v3-runtime-research.md`).
+
+### New files:
+| File | Lines | Function |
+|------|-------|----------|
+| `fp8.rs` | 140 | FP8 e4m3fn LUT + block-wise dequant |
+| `bin/convert_v3.rs` | 320 | FP8→INT4 converter with Rayon |
+| `configs/deepseek-v3.toml` | 48 | V3 inference config |
+| `tests/test_v3_validation.rs` | 230 | 4-level validation suite |
+| `tests/bench_v3_tok_per_sec.rs` | 70 | Throughput benchmark |
+| `scripts/generate_v3_ref.py` | 130 | Partial-load HF reference |
+| `scripts/v3_api_reference.py` | 90 | DeepSeek API reference |
+
+### Test summary: 49 tests passing, 0 failures
+| Crate | Tests | Status |
+|-------|-------|--------|
+| moe-infer (lib) | 37 | All pass |
+| moe-router | 5 | All pass |
+| expert-pager | 7 | All pass |
+
+---
+
 ## What's NOT Done (Gaps → Production)
 
 ### Critical path to 25-30 tok/s:

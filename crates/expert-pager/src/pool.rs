@@ -108,6 +108,11 @@ impl ExpertPool {
         self.entries.len()
     }
 
+    /// Get the slot index for a resident expert (None if not resident).
+    pub fn entries_slot(&self, layer: u32, expert_id: u32) -> Option<usize> {
+        self.entries.get(&(layer, expert_id)).map(|e| e.slot)
+    }
+
     /// Reset statistics.
     pub fn reset_stats(&mut self) {
         self.stats = PoolStats::default();

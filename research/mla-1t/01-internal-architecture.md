@@ -5,7 +5,7 @@
 
 ## The Core Finding
 
-MLA replaces 4 simple matmuls (Q/K/V/O projections) with a 2-stage LoRA pipeline + absorbed attention. The payoff: KV cache drops 71x (from 9.57 MB/token with full MHA to 137 KB/token with MLA). The cost: more complex attention math, but fewer total FLOPs.
+MLA replaces 4 simple matmuls (Q/K/V/O projections) with a 2-stage LoRA pipeline + absorbed attention. The payoff: KV cache drops 57x (from 9.57 MB/token with full MHA to 137 KB/token with MLA). The cost: more complex attention math, but fewer total FLOPs.
 
 ## MLA Decode Path (Single Token)
 
@@ -24,7 +24,7 @@ STEP 2: KV compression
   kv_latent, k_pe = split(kv_out) → [512] + [64]
   kv_latent = RMSNorm(kv_latent)  [512] → [512]
   k_pe = apply_rope(k_pe, pos)
-  CACHE: store kv_latent [512] + k_pe [64]  ← this is the 71x saving
+  CACHE: store kv_latent [512] + k_pe [64]  ← this is the 57x saving
 
 STEP 3: Absorbed attention (no K/V reconstruction)
   W_UK = W_kvb[:, :128, :]        [128 heads, 128 nope, 512 lora]
@@ -94,7 +94,7 @@ STEP 5: Output projection
 
 | Context | f32 | f16 | vs GQA MHA (f32) |
 |---------|-----|-----|-------------------|
-| 8K | 1.09 GB | 0.55 GB | 71x smaller than MHA |
+| 8K | 1.09 GB | 0.55 GB | 57x smaller than MHA |
 | 32K | 4.38 GB | 2.19 GB | |
 | 128K | 17.5 GB | 8.76 GB | fits in target-1t.toml 8GB budget at f16 |
 
