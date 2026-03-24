@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | wins: 5 | experiments: 25
+tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | wins: 5 | experiments: 26
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -215,6 +215,13 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Comparison with top_k=6**: top_k=6 gave +25% with good quality. top_k=4 gives +79% but with quality trade-off. Diminishing returns on quality vs speed.
 - **Opt-in**: RUSTANE_TOP_K=4 (default unchanged).
 
+### Iteration 24: Fuse MLA scores (sgemm_nt_add + in-place softmax) — NO EFFECT (committed for code quality)
+- **Experiment**: Replace two-buffer MLA score computation (sgemm_nt + sgemm_nt + element-wise add + separate softmax) with sgemm_nt_add (beta=1.0 accumulate rope scores in-place) + in-place softmax. Eliminates scores_rope_buf and attn_weights allocations (~13KB/layer at seq_len=26).
+- **Result**: 0.51 tok/s (median warm: 0.51, 0.51, 0.51) vs 0.47* session baseline
+- **Verdict**: NO EFFECT — MLA dropped from ~134ms to ~126ms (~6% of MLA phase), but MLA is only 6% of total token time. Net savings ~0.4% of decode, within noise.
+- **Implementation**: Added sgemm_nt_add to blas.rs (sgemm_nt with beta=1.0). Modified mla_decode_v_concat in mla_attention.rs. ~20 lines changed. 4 correctness tests pass (max_diff < 3.3e-7).
+- **Insight**: At current SSD-dominated decode times (~2000ms/token), MLA micro-optimizations (saving <10ms) are unmeasurable. Code is cleaner: fewer allocs, one fewer BLAS call, one fewer intermediate buffer.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -234,6 +241,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Expert speculation (speculative pread for next layer)**: -41% regression (0.30 vs 0.51*). Three variants tried (scope, sequential spawn, parallel spawn). Incompatible with F_NOCACHE: direct DMA is already fast, no cache layer to pre-warm. 184 MB/layer spec I/O doubles SSD bandwidth usage. Thread spawn overhead (9600 spawns/decode) compounds. Dead end with F_NOCACHE.
 - **Batch W_UK/W_UV as single sgemm**: NOT FEASIBLE. Each of 64 MLA heads has a different weight matrix — sgemm uses one shared matrix. Block-diagonal trick requires 64× more FLOPs. Total time (640µs/layer) is only 2.5% of decode. Not a bottleneck.
 - **GPU o_proj (Metal f32 GEMV for o_proj)**: -4% regression (0.48 vs 0.50*). Three approaches: per-layer wrap_mmap (12ms page table), persistent memcpy (3.7x MLA), zero-copy pre-cached (still +40-100% MLA). On UMA, f32 GEMV is bandwidth-bound — GPU shares same 273 GB/s memory bus as CPU AMX. GPU dispatch overhead (~1.5ms/layer encode+sync) exceeds any bandwidth gain. GPU offload only viable for ALU-bound kernels (INT4 dequant).
+- **Fuse MLA scores (sgemm_nt_add + in-place softmax)**: NO EFFECT. Saves ~8ms total MLA (134→126ms), but MLA is only 6% of token time. Net savings ~0.4%, unmeasurable. Committed for code quality (fewer allocs, cleaner code).
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
