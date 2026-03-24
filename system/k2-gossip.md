@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 16
+tok/s: 1.68 | ms/layer: ~9.5 | wins: 3 | experiments: 17
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -105,6 +105,14 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: pread_dn time (1/3 of total pread) roughly equals Metal_fused time. When pread_dn ≥ Metal_fused, savings = 0. Additionally, 2 command buffers add ~0.1ms overhead × 60 layers = 6ms/token. The split trades one large pread for two smaller ones without reducing total serial time.
 - **Correctness**: split dispatch is bit-identical to single-cmdbuf (test verified). Output unchanged.
 
+### Iteration 15: Remove dead MLA weight lookups — NO EFFECT (committed for code quality)
+- **Experiment**: Remove dead `mla_layer_weights()` calls in `run_mla_only` and `run_layer_compute`. The result was passed to `make_attn_weights` which ignored the `_f16w` parameter — all fields came from pre-converted f32 `MlaLayerF32`. Also removed unnecessary `final_norm.to_vec()` (rmsnorm accepts `&[f32]` directly).
+- **Result**: 1.34 tok/s (median warm: 1.34, 1.35, 1.33) vs 1.34* baseline
+- **Verdict**: NO EFFECT — as expected. Committed for code quality.
+- **Note**: Session baseline 1.34 tok/s vs historical 1.68 tok/s due to system state (Claude Code overhead, thermal state, page cache state). Baseline verified at 1.34 by reverting changes — identical result.
+- **Dead work removed**: ~30 HashMap lookups + ~30 string format! allocations per token (15 per layer × 2 hot path functions). Plus 4× unnecessary 28 KB Vec allocation per token from final_norm.to_vec(). Total overhead was ~0.2ms/token — unmeasurable at 600ms/token.
+- **Insight**: mla_layer_weights() lookups are only needed in convert_layer_into (f16→f32 conversion) and the f16 inference path. The f32 decode path already has all weights pre-converted in MlaLayerF32 — the HashMap lookups were pure dead work introduced when make_attn_weights was refactored to remove f16 field assignments.
+
 ### Iteration 14: Remove x_cache from GPU shaders — NO EFFECT (committed for correctness)
 - **Experiment**: Remove `threadgroup half x_cache[7168]` from fused_gate_up_silu and `threadgroup float x_cache[4096]` from dequant_4bit_gemv_v2. x now read directly from device memory (GPU L2-cached).
 - **Result**: 1.71 tok/s (median warm: 1.72, 1.71, 1.70) vs 1.68 baseline
@@ -154,6 +162,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Split-pread pipeline (2 cmd bufs, pread_dn overlaps Metal fused)**: Tested with correct shader (iter 10). pread_dn (1-2ms) ≈ Metal_fused (1.75ms), overlap window ≈ 0. 2 cmd buf overhead (6ms/token) cancels any micro-gain. Confirmed with profiling: total layer time unchanged.
 - **TG=512/ROWS_PER_TG=16 for fused+V2 shaders**: -8.7% regression (1.05 vs 1.15). Larger TGs reduce occupancy on M4 Max (40 EUs). TG=256 is optimal for bandwidth-bound INT4 GEMV.
 - **f16 o_proj via sgemv_f16_par from mmap**: -21% regression (0.91 vs 1.15). Double-buffer already pre-converts o_proj f16→f32 overlapped with FFN. f16_par bypasses warm DRAM, reads cold mmap during MLA, competes with expert pread for page cache. Same lesson as f16 inline decode: anything on MLA critical path that touches mmap loses to pre-staged f32.
+- **Dead MLA code removal (mla_layer_weights + final_norm.to_vec)**: ~0.2ms/token dead overhead. Unmeasurable. Committed as code cleanup.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):

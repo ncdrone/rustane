@@ -439,7 +439,6 @@ struct LayerTiming {
 /// with optional f16 backbone refs for half-bandwidth Q/KV projections.
 fn make_attn_weights<'a>(
     lf: &'a MlaLayerF32,
-    _f16w: Option<&'a crate::weights::MlaLayerWeights<'a>>,
 ) -> MlaAttnWeights<'a> {
     MlaAttnWeights {
         q_proj: &lf.q_proj,
@@ -472,9 +471,7 @@ fn run_layer_compute(
 
     // 1. RMSNorm → MLA Attention → Residual
     let normed = rmsnorm(x, &lf.input_norm, eps);
-    let is_moe = model.config.is_moe_layer(layer);
-    let f16_lw = model.weights.mla_layer_weights(layer, is_moe)?;
-    let attn_weights = make_attn_weights(lf, Some(&f16_lw));
+    let attn_weights = make_attn_weights(lf);
 
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
@@ -517,9 +514,7 @@ fn run_mla_only(
     let eps = model.config.rms_norm_eps();
 
     let normed = rmsnorm(x, &lf.input_norm, eps);
-    let is_moe = model.config.is_moe_layer(layer);
-    let f16_lw = model.weights.mla_layer_weights(layer, is_moe)?;
-    let attn_weights = make_attn_weights(lf, Some(&f16_lw));
+    let attn_weights = make_attn_weights(lf);
 
     let attn_out = mla_forward_decode(
         &normed, &attn_weights, cache, layer, pos,
@@ -1238,7 +1233,7 @@ pub fn generate_v2(
             }
             cache.advance();
             if i == input_ids.len() - 1 {
-                let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+                let normed = rmsnorm(&x, final_norm, model.config.rms_norm_eps());
                 let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
                 let next_token = sample(&logits, sampling, i as u64);
                 all_ids.push(next_token);
@@ -1328,7 +1323,7 @@ pub fn generate_v2(
             cache.advance();
 
             let t_lm = std::time::Instant::now();
-            let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+            let normed = rmsnorm(&x, final_norm, model.config.rms_norm_eps());
             let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
             let lm_us = t_lm.elapsed().as_micros() as u64;
             let next_token = sample(&logits, sampling, (pos + step) as u64);
@@ -1376,7 +1371,7 @@ pub fn generate_v2(
             }
             cache.advance();
             if i == input_ids.len() - 1 {
-                let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+                let normed = rmsnorm(&x, final_norm, model.config.rms_norm_eps());
                 let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
                 let next_token = sample(&logits, sampling, i as u64);
                 all_ids.push(next_token);
@@ -1408,7 +1403,7 @@ pub fn generate_v2(
             }
             cache.advance();
 
-            let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
+            let normed = rmsnorm(&x, final_norm, model.config.rms_norm_eps());
             let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
             let next_token = sample(&logits, sampling, (pos + step) as u64);
             all_ids.push(next_token);
