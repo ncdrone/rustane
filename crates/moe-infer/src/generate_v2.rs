@@ -854,7 +854,9 @@ fn moe_ffn_v2(
             let staging_mut = unsafe { std::slice::from_raw_parts_mut(staging_ptr, staging.len()) };
             let pread_region = &mut staging_mut[..expert_ids.len() * expert_stride];
 
-            let mut combined = std::thread::scope(|s| {
+            // Overlap pread with shared FFN via thread::scope.
+            // IMPORTANT: assign shared FFN result back to outer `combined`, don't shadow it.
+            let shared_result = std::thread::scope(|s| {
                 // Spawn pread on background thread (uses rayon internally for QD>1)
                 let pread_handle = s.spawn(|| {
                     pread_region
@@ -877,6 +879,8 @@ fn moe_ffn_v2(
                 pread_handle.join().unwrap();
                 result
             });
+            // Write shared FFN result into outer combined (was being lost due to shadowing)
+            combined = shared_result;
 
             // Build Metal ops with packed offsets
             let mut fused_ops = Vec::new();
