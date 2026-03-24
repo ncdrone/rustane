@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 11
+tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 12
 NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → same experts → warm cache)
 
 ## Model Facts
@@ -96,6 +96,14 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Precision**: max_diff between CPU ref and GPU fused at K2 dims: 0.088 (half) vs 0.0005 (float). Both well within INT4 quantization noise.
 - **New correct baseline: 1.15 tok/s**. All previous experiments measured against inflated baseline need re-evaluation.
 
+### Iteration 10: Split-pread pipeline v2 (2-cmd-buf overlap) — NO EFFECT
+- **Experiment**: Split pread into gate+up (phase 1, overlaps shared_ffn) + down (phase 3, overlaps Metal fused). Two Metal command buffers: dispatch_fused_phase (commit, don't wait) then dispatch_down_phase (wait). PendingGpuWork wrapper for opaque cmd buffer handle. load_expert_partial for sub-expert pread.
+- **Result**: 1.16 tok/s (median warm: 1.13, 1.16, 1.20) vs 1.15 baseline
+- **Verdict**: NO EFFECT — +0.4%, within noise. REVERTED.
+- **Profiling** (warm): pread_gu: 2-5ms, pread_dn: ~1-2ms (inferred), Metal_fused: ~1.75ms, Metal_down: ~1.75ms. Overlap window ≈ 0 because pread_dn ≈ Metal_fused.
+- **Root cause**: pread_dn time (1/3 of total pread) roughly equals Metal_fused time. When pread_dn ≥ Metal_fused, savings = 0. Additionally, 2 command buffers add ~0.1ms overhead × 60 layers = 6ms/token. The split trades one large pread for two smaller ones without reducing total serial time.
+- **Correctness**: split dispatch is bit-identical to single-cmdbuf (test verified). Output unchanged.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -106,12 +114,18 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **rayon::join for pread+shared_ffn**: Nested par_iter inside rayon::join causes work-stealing contention. thread::scope's independent OS thread avoids this. pthread overhead (~2-6ms) ≈ rayon contention cost.
 - **V2 down shader half x_cache**: Down pass with in_features=2048 is bandwidth-bound, not occupancy-limited. float[4096]=16KB already allows 2 concurrent TGs. half saves TG memory but no perf impact.
 - **fcntl(F_RDADVISE) prefetch before pread**: pread itself triggers DMA immediately. The hint-to-read window is microseconds — kernel can't start DMA before pread does it.
+- **Split-pread pipeline (2 cmd bufs, pread_dn overlaps Metal fused)**: Tested with correct shader (iter 10). pread_dn (1-2ms) ≈ Metal_fused (1.75ms), overlap window ≈ 0. 2 cmd buf overhead (6ms/token) cancels any micro-gain. Confirmed with profiling: total layer time unchanged.
 
 ## Suggested Next Experiments
-NOTE: All timing estimates below are from the OLD (buggy) profiling. Need fresh per-layer breakdown with correct shader.
-1. **Fresh per-layer profiling** — Re-measure MLA, FFN, pread, Metal times with correct shader. The breakdown has fundamentally changed: diverse experts mean different pread/Metal characteristics.
-2. **Async Metal dispatch overlap with MLA** — Metal dispatch and MLA use different hardware (GPU vs CPU/AMX). Currently serial. Requires: split fused_and_down into launch+wait, double-buffer staging for Metal, restructure decode loop. ~150 lines.
-3. **Reduce FFN pread time** — diverse expert routing now causes more cache misses. Pre-populate with madvise(MADV_WILLNEED)/fcntl(F_RDADVISE) to prefault expert pages. Higher priority now that correct routing hits more unique experts.
-4. **Reduce Metal GPU kernel time** — try TG_SIZE=512 (ROWS_PER_TG=16), batching experts, or compute-aware scheduling.
-5. **V2 down shader x_cache to half** — V2 down shader still uses float x_cache[4096]. in_features=2048 fits, but half[2048]=4KB would improve occupancy there too.
-6. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
+NOTE: Fresh profiling from iter 10 (warm, correct shader):
+- pread_gu: 2-5ms/layer, pread_dn: ~1-2ms (inferred from timing gaps)
+- Metal (fused+down): 3.5-4.5ms/layer total
+- shared_ffn: 2.4-4.4ms/layer
+- LAYER_TOTAL (FFN): 7-10ms warm, 14-25ms cold
+- Bottleneck: pread is still dominant (56%+ of FFN time), but highly variable due to OS page cache state.
+
+1. **Async Metal dispatch overlap with MLA** — Metal dispatch and MLA use different hardware (GPU vs CPU/AMX). Currently serial. Overlap layer N's Metal with layer N+1's MLA. Requires: double-buffer staging, restructure decode loop to pipeline across layers. ~150 lines. Potential: save ~2ms/layer of MLA time that currently runs while GPU idles.
+2. **Reduce Metal GPU kernel time** — try TG_SIZE=512 (ROWS_PER_TG=16), batching experts, or compute-aware scheduling. Metal fused+down = 3.5-4.5ms/layer is 30-40% of warm FFN time.
+3. **madvise(MADV_SEQUENTIAL) on expert files** — hint kernel that expert file reads are sequential within each file. May improve readahead for pread.
+4. **Larger pread I/O size** — instead of 8 separate pread calls (one per expert, ~23MB each), single contiguous pread if experts are contiguous in file. Reduces syscall overhead.
+5. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
