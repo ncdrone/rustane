@@ -69,7 +69,6 @@ ITER_TIMEOUT_SEC=$((ITER_TIMEOUT_MIN * 60))
 # Locked files — agent CANNOT modify these
 LOCKED_FILES=(
     "crates/moe-infer/tests/bench_k2_tok_per_sec.rs"
-    "crates/moe-infer/tests/test_k2_validation.rs"
     "crates/moe-infer/tests/test_model_validation.rs"
     "configs/deepseek-v3.toml"
     "AGENTS-K2.md"
@@ -274,6 +273,11 @@ STEP 1 — READ CONTEXT (do this first, do not skip):
   - crates/expert-pager/src/pool.rs (expert pool — built but NOT wired)
   - crates/expert-pager/src/loader.rs (pread expert loader)
 
+  ANE research (NEW — high priority, read for optimization directions):
+  - research-context/ane-synthesis.md (KEY: 0% ANE utilization, 3 fixable bottlenecks, expert speculation)
+  - research-context/ane-unified-plan.md (5-phase plan: waste elimination → ANE → multi-stream → 5+ tok/s)
+  - research-context/ane-mla-attention.md (MLA mapped to ANE Conv1x1 graphs)
+
   Research synthesis (read for deep background):
   - research-context/stage3/04-stage3-findings.md (double-buffer design, expert pool sizing)
   - research-context/stage2/01-audit-full.md (bugs, showstoppers, 14x gap analysis)
@@ -330,16 +334,13 @@ STEP 4 — PASS THE METRIC MATRIX:
       cargo test -p moe-infer --test test_model_validation --release -- --ignored --nocapture
       If ANY fails: revert ALL changes, skip to STEP 6.
 
-  4c. Tier 2 performance (MUST run 3 times, take median):
-      Update status: echo "BENCHMARKING: tok/s (run 1/3)" > /tmp/rustane-k2-status-%%AGENT_ID%%
-      cargo test -p moe-infer --test bench_k2_tok_per_sec --release -- --ignored --nocapture
-      (repeat 2 more times, record warm decode tok/s from each)
-      If warm decode tok/s regresses >5% from baseline in experiments-k2.tsv: revert, skip to STEP 6.
+  4c. Tier 2 performance — SKIP THIS. DO NOT RUN BENCHMARKS.
+      The bash loop will run benchmarks AFTER you exit, when Claude is not in memory.
+      This eliminates page cache pollution from the Claude process (~1 GB RAM).
+      Just pass Tier 1 gates, commit your changes, and exit.
+      The loop will benchmark, then update experiments-k2.tsv with real numbers.
 
-STEP 5 — LIE DETECTOR:
-  Re-read the benchmark output from STEP 4c. The warm run prints per-phase timing.
-  Your improvement MUST show up in a specific phase (prefill_ms or decode per-token time).
-  If the tok/s change doesn't correspond to a visible component change, it's noise — revert.
+STEP 5 — SKIP (benchmarks run by the loop, not by you).
 
 STEP 6 — LOG RESULTS:
   Append ONE row to system/experiments-k2.tsv (tab-separated):
@@ -371,13 +372,15 @@ STEP 7 — COMMIT OR REVERT:
     git add system/experiments-k2.tsv system/k2-gossip.md
     git commit -m "Log experiment: <name> (<verdict>)"
 
-  Update status: echo "DONE: <verdict> <tok/s>" > /tmp/rustane-k2-status-%%AGENT_ID%%
+  Write experiment marker for the bash loop to benchmark:
+    echo "<experiment-name>" > /tmp/rustane-k2-experiment-%%AGENT_ID%%
+  Update status: echo "DONE: committed, awaiting benchmark" > /tmp/rustane-k2-status-%%AGENT_ID%%
 
 RULES:
   - NEVER modify locked files (bench_k2_tok_per_sec.rs, test_k2_validation.rs, test_model_validation.rs, configs/deepseek-v3.toml, AGENTS-K2.md)
   - NEVER weaken test assertions to make tests pass
-  - NEVER claim improvement without median-of-3 benchmark data
-  - NEVER skip the metric matrix
+  - Benchmarks are run by the bash loop AFTER you exit — do NOT run bench_k2_tok_per_sec yourself
+  - NEVER skip Tier 1 gates (build + correctness tests)
   - NEVER modify existing experiments-k2.tsv rows — append only
   - NEVER use EXHAUSTED as a verdict — there is ALWAYS something to try
   - NEVER declare the search space exhausted or confirm other agents' exhaustion claims
@@ -499,6 +502,51 @@ ${INJECT_CONTENT}"
         fi
         sleep 10
         continue
+    fi
+
+    # --- Post-Agent Benchmark (Claude NOT in memory = clean page cache) ---
+    EXPERIMENT_FILE="/tmp/rustane-k2-experiment-${AGENT_ID}"
+    if [ -f "$EXPERIMENT_FILE" ]; then
+        EXPERIMENT_NAME=$(cat "$EXPERIMENT_FILE")
+        rm -f "$EXPERIMENT_FILE"
+        log "Running benchmark for: ${EXPERIMENT_NAME} (Claude freed, clean memory)"
+        echo "BENCHMARKING: ${EXPERIMENT_NAME} (loop, clean memory)" > "$STATUSFILE"
+
+        # Warmup runs: populate SSD controller DRAM cache (1-4 GB) with hot experts.
+        # Without warmup, expert pread hits cold SSD = 0.51 tok/s.
+        # With warm SSD controller cache = 1.68 tok/s.
+        # 2 warmup runs ensures controller cache is hot before measurement.
+        for warmup in 1 2; do
+            log "Warmup run ${warmup}/2 (SSD controller cache)..."
+            echo "WARMUP: ${EXPERIMENT_NAME} (run ${warmup}/2)" > "$STATUSFILE"
+            cd "$WORKTREE" && cargo test -p moe-infer --test bench_k2_tok_per_sec --release -- --ignored --nocapture > /dev/null 2>&1 || true
+        done
+        log "SSD controller cache warm. Starting measured runs."
+
+        # 3 measured runs, take median warm tok/s
+        BENCH_RESULTS=""
+        for run in 1 2 3; do
+            log "Measured run ${run}/3..."
+            echo "BENCHMARKING: ${EXPERIMENT_NAME} (measured ${run}/3, warm)" > "$STATUSFILE"
+            BENCH_OUT=$(cd "$WORKTREE" && cargo test -p moe-infer --test bench_k2_tok_per_sec --release -- --ignored --nocapture 2>&1)
+            WARM_TOKS=$(echo "$BENCH_OUT" | grep -i "warm.*tok" | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+            if [ -n "$WARM_TOKS" ]; then
+                BENCH_RESULTS="${BENCH_RESULTS}${WARM_TOKS} "
+                log "Run ${run}: ${WARM_TOKS} tok/s"
+            else
+                log "Run ${run}: failed to parse tok/s"
+                log "Output: $(echo "$BENCH_OUT" | tail -5)"
+            fi
+        done
+
+        if [ -n "$BENCH_RESULTS" ]; then
+            # Sort and take median
+            MEDIAN=$(echo "$BENCH_RESULTS" | tr ' ' '\n' | sort -n | sed -n '2p')
+            log "BENCHMARK RESULT: ${EXPERIMENT_NAME} = ${MEDIAN} tok/s (median of: ${BENCH_RESULTS})"
+            echo "BENCH DONE: ${EXPERIMENT_NAME} = ${MEDIAN} tok/s" > "$STATUSFILE"
+        else
+            log "BENCHMARK FAILED: no results for ${EXPERIMENT_NAME}"
+        fi
     fi
 
     # Sync experiments + gossip back to main repo

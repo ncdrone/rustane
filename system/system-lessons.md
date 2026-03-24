@@ -141,3 +141,19 @@ Read this before modifying any system/ scripts. Updated after every incident.
 5. **Budget timeouts for the full cycle.** Include model load time, benchmark runs, and margin.
 6. **Test with `--dry-run` before real launches.** Catches setup issues without burning iteration time.
 7. **Plan for branch divergence.** Two actors = merge, not fast-forward.
+
+## Lesson 10: Three-Layer Caching on Apple Silicon (K2)
+**Problem:** K2 benchmark results varied wildly (0.30 to 1.68 tok/s) across sessions.
+**Root cause:** Three cache layers, all sharing 128 GB unified memory:
+1. OS page cache (RAM) — evicted by Claude agent processes (~1-2 GB)
+2. SSD controller DRAM cache (1-4 GB on Apple Fabric) — needs warmup runs to populate
+3. NAND flash (cold reads at 7.4 GB/s)
+
+Cold SSD controller = 0.51 tok/s. Warm = 1.68 tok/s. 3.5x difference.
+F_NOCACHE bypasses OS page cache (layer 1) but experts still benefit from SSD controller cache (layer 2).
+
+**Fix:** Benchmark protocol:
+- Kill Claude agent before benchmarking (bash loop handles bench after agent exits)
+- 2 warmup runs to populate SSD controller cache
+- 3 measured runs, take median
+- Apple's internal SSD uses "Apple Fabric" protocol, not standard NVMe
