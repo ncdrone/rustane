@@ -1,6 +1,7 @@
 /target
 dev/
 viz/
+threads/
 models/
 *.gguf
 *.metallib
