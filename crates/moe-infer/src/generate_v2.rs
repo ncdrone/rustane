@@ -182,7 +182,15 @@ impl ModelV2 {
         } else {
             eprintln!("Lazy weight mode: f16→f32 per layer on the fly (~2 GB vs ~54 GB)");
         }
-        let lm_head_f32: Vec<f32> = weights.lm_head()?.iter().map(|v| v.to_f32()).collect();
+        let lm_head_f32: Vec<f32> = if lazy_mode {
+            // Skip 4.69 GB f32 pre-conversion for K2/V3 — use sgemv_f16_par at decode time.
+            // Frees RAM for expert page cache, halves DRAM traffic for logit computation.
+            eprintln!("lm_head: f16 direct path (saves {:.1} GB RAM)",
+                weights.lm_head()?.len() as f64 * 4.0 / 1e9);
+            Vec::new()
+        } else {
+            weights.lm_head()?.iter().map(|v| v.to_f32()).collect()
+        };
 
         // Metal setup
         let mut metal = MetalDequantGemv::new();
@@ -993,6 +1001,20 @@ fn matvec_f32(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     y
 }
 
+/// Compute logits using f16 lm_head weights directly (parallel, half DRAM traffic).
+/// Falls back to f32 pre-converted path if lm_head_f32 is populated.
+fn compute_logits(model: &ModelV2, normed: &[f32], vocab: usize, hidden: usize) -> Vec<f32> {
+    if model.lm_head_f32.is_empty() {
+        // F16 path: read from mmap, parallel chunked convert+sgemv
+        let lm_head = model.weights.lm_head().expect("lm_head tensor");
+        let mut logits = vec![0.0f32; vocab];
+        crate::blas::sgemv_f16_par(lm_head, normed, &mut logits, vocab, hidden);
+        logits
+    } else {
+        matvec_f32(&model.lm_head_f32, normed, vocab, hidden)
+    }
+}
+
 /// Generate tokens from a prompt using DeepSeek-V2 model.
 pub fn generate_v2(
     model: &ModelV2,
@@ -1052,65 +1074,39 @@ pub fn generate_v2(
     // Simple and eliminates the ~1.8 GB alloc/dealloc per layer that was the bottleneck.
 
     let (prefill_secs, decode_secs) = if lazy_mode {
-        // TWO reusable buffers for pipeline: convert layer N+1 while computing layer N
-        let mut buf_a = MlaLayerF32::empty();
-        let mut buf_b = MlaLayerF32::empty();
-
-        // Cache dense layers (0..first_k_dense_replace) permanently in f32.
-        // Dense layers have large FFN weights ([18432,7168] × 3), making their
-        // f16→f32 conversion ~10ms — longer than FFN compute (~7ms). This causes
-        // the pipeline to stall waiting for conversion. Caching eliminates:
-        // 1. Serial convert(0) at start of each token (~10ms)
-        // 2. Convert stalls for dense-to-dense transitions (~3ms × 2)
-        let num_dense = model.config.ffn.first_k_dense_replace;
-        let mut cached_dense: Vec<MlaLayerF32> = (0..num_dense)
-            .map(|_| MlaLayerF32::empty())
-            .collect();
+        // F16 direct path: read f16 weights from mmap via sgemv_f16 (chunked L2 convert).
+        // Eliminates f32 conversion pass and halves backbone DRAM traffic per layer.
+        // No double-buffer, no thread::scope for conversion — simpler and faster.
 
         // Warmup: pre-fault all backbone pages into page cache
         let t_warmup = std::time::Instant::now();
+        let mut warmup_buf = MlaLayerF32::empty();
         for layer in 0..num_layers {
-            if layer < num_dense {
-                convert_layer_into(&mut cached_dense[layer], &model.weights, &model.config, layer)?;
-            } else {
-                convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-            }
+            convert_layer_into(&mut warmup_buf, &model.weights, &model.config, layer)?;
         }
-        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers, cached {} dense)",
-            t_warmup.elapsed().as_secs_f64(), num_layers, num_dense);
+        drop(warmup_buf);
+        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers)",
+            t_warmup.elapsed().as_secs_f64(), num_layers);
 
-        // --- Prefill ---
+        // --- Prefill (f16 path) ---
         let t_prefill = std::time::Instant::now();
         for (i, &token_id) in input_ids.iter().enumerate() {
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
             for layer in 0..num_layers {
-                let lf = if layer < num_dense {
-                    &cached_dense[layer]
-                } else {
-                    convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
-                    &buf_a
-                };
-                x = run_layer_compute(model, &mut cache, &mut router, layer, &x, i, lf)?;
+                x = run_layer_f16(model, &mut cache, &mut router, layer, &x, i)?;
             }
             cache.advance();
             if i == input_ids.len() - 1 {
                 let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-                let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+                let logits = compute_logits(model, &normed, vocab, hidden);
                 let next_token = sample(&logits, sampling, i as u64);
                 all_ids.push(next_token);
             }
         }
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // --- Decode (deferred-convert pipeline, double-buffered) ---
-        // Key insight: MLA attention is memory-bandwidth-bound (sgemv reads ~750 MB f32).
-        // Running f16→f32 conversion concurrently steals ~50% of bandwidth from sgemv.
-        // Fix: run MLA attention FIRST with no background thread (full bandwidth),
-        // then overlap convert(N+1) with FFN (which uses Metal GPU + SSD pread,
-        // not competing for memory bandwidth).
-
-        // Initialize ExpertPool simulation (RUSTANE_POOL_SIM=1 to enable).
+        // --- Decode (f16 direct — no conversion pass, half DRAM traffic) ---
         if pool_sim_enabled() {
             POOL_SIM.with(|p| *p.borrow_mut() = Some(ExpertPool::new(2000)));
         }
@@ -1127,52 +1123,13 @@ pub fn generate_v2(
             let emb = embed_f16_to_f32(embed_table, token_id as usize, hidden);
             let mut x = emb;
 
-            // Extract field refs so spawn closure doesn't capture &ModelV2
-            let weights_ref = &model.weights;
-            let config_ref = &model.config;
-            // No serial convert(0) — dense layers use cached_dense
             for layer in 0..num_layers {
-                // Use cached weights for dense layers, dynamic buffer for MoE
-                let lf: &MlaLayerF32 = if layer < num_dense {
-                    &cached_dense[layer]
-                } else {
-                    &buf_a
-                };
-
-                // Phase 1: MLA attention — no background thread, full memory bandwidth
-                let (mut residual, normed2) = run_mla_only(
-                    model, &mut cache, layer, &x, pos, lf,
-                )?;
-
-                // Phase 2: FFN, with optional convert(N+1) overlap
-                if layer + 1 < num_layers {
-                    let next = layer + 1;
-                    if next < num_dense {
-                        // Next layer is cached — run FFN without background convert.
-                        // Avoids stalling on dense layer conversion (~10ms > FFN ~7ms).
-                        run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
-                    } else {
-                        // Next layer needs conversion — pipeline overlap
-                        std::thread::scope(|s| -> Result<()> {
-                            let h = s.spawn(|| {
-                                convert_layer_into(&mut buf_b, weights_ref, config_ref, next)
-                            });
-                            run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
-                            h.join().unwrap()?;
-                            Ok(())
-                        })?;
-                        std::mem::swap(&mut buf_a, &mut buf_b);
-                    }
-                } else {
-                    run_ffn_only(model, &mut router, layer, &normed2, &mut residual, lf)?;
-                }
-
-                x = residual;
+                x = run_layer_f16(model, &mut cache, &mut router, layer, &x, pos)?;
             }
             cache.advance();
 
             let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-            let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+            let logits = compute_logits(model, &normed, vocab, hidden);
             let next_token = sample(&logits, sampling, (pos + step) as u64);
             all_ids.push(next_token);
 
@@ -1187,7 +1144,6 @@ pub fn generate_v2(
         }
         let decode_secs = t_decode.elapsed().as_secs_f64();
 
-        // Log ExpertPool simulation results (if enabled)
         if pool_sim_enabled() {
             POOL_SIM.with(|p| {
                 if let Some(pool) = p.borrow().as_ref() {
@@ -1212,7 +1168,7 @@ pub fn generate_v2(
             cache.advance();
             if i == input_ids.len() - 1 {
                 let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-                let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+                let logits = compute_logits(model, &normed, vocab, hidden);
                 let next_token = sample(&logits, sampling, i as u64);
                 all_ids.push(next_token);
             }
@@ -1244,7 +1200,7 @@ pub fn generate_v2(
             cache.advance();
 
             let normed = rmsnorm(&x, &final_norm.to_vec(), model.config.rms_norm_eps());
-            let logits = matvec_f32(&model.lm_head_f32, &normed, vocab, hidden);
+            let logits = compute_logits(model, &normed, vocab, hidden);
             let next_token = sample(&logits, sampling, (pos + step) as u64);
             all_ids.push(next_token);
 
