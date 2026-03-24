@@ -276,13 +276,14 @@ impl ModelV2 {
             // Each slot = expert_stride bytes (~23 MB for K2).
             // Budget: available RAM after backbone + staging + KV cache.
             // Conservative: use ~60% of available memory for pool.
-            let available_gb = 91; // from memory budget analysis (128 - 37 GB used)
-            let pool_cap = std::cmp::min(
-                (available_gb as usize * 1_000_000_000) / expert_stride,
-                8000, // hard cap to avoid HashMap overhead
-            );
-            let pool_cap = std::cmp::max(pool_cap, 100); // minimum useful size
-            let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| vec![0u8; expert_stride]).collect();
+            // Pool capacity: use most of available RAM but LAZY allocate.
+            // Pre-allocating 91 GB at once evicts OS page cache — disaster.
+            // Lazy: start with empty Vecs, allocate on first miss per slot.
+            let pool_cap_env = std::env::var("RUSTANE_POOL_CAP")
+                .ok().and_then(|v| v.parse::<usize>().ok());
+            let pool_cap = pool_cap_env.unwrap_or(3000); // default 3000 (~70 GB max, lazy)
+            // Lazy: allocate empty Vecs (0 bytes each). Grow on first use.
+            let bufs: Vec<Vec<u8>> = (0..pool_cap).map(|_| Vec::new()).collect();
             eprintln!("ExpertPool: {} slots × {:.1} MB = {:.1} GB",
                 pool_cap, expert_stride as f64 / 1e6,
                 pool_cap as f64 * expert_stride as f64 / 1e9);
@@ -898,13 +899,15 @@ fn moe_ffn_v2(
                 if let Some(pool) = pool_opt.as_mut() {
                     for &(i, eid, _) in &expert_ids {
                         let (slot, is_hit) = pool.request(layer as u32, eid as u32);
-                        if is_hit {
+                        if is_hit && !pool_bufs[slot].is_empty() {
+                            // Cache hit AND buffer allocated: copy from pool to staging
                             let staging_offset = i * expert_stride;
                             pread_region[staging_offset..staging_offset + expert_stride]
                                 .copy_from_slice(&pool_bufs[slot][..expert_stride]);
                             need_pread[i] = false;
                             pool_hits += 1;
                         }
+                        // If hit but buffer empty: treat as miss (lazy alloc on write-back)
                     }
                 }
             }
@@ -954,6 +957,10 @@ fn moe_ffn_v2(
                     for &(i, eid, _) in &expert_ids {
                         if need_pread[i] {
                             if let Some(slot) = pool.entries_slot(layer as u32, eid as u32) {
+                                // Lazy allocate pool buffer on first miss
+                                if pool_bufs[slot].is_empty() {
+                                    pool_bufs[slot] = vec![0u8; expert_stride];
+                                }
                                 let staging_offset = i * expert_stride;
                                 pool_bufs[slot][..expert_stride]
                                     .copy_from_slice(&pread_region[staging_offset..staging_offset + expert_stride]);
