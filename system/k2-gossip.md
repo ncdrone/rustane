@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 6
+tok/s: 1.57 | ms/layer: 12.0 | wins: 1 | experiments: 7
 
 ## Model Facts
 - Kimi-K2: 1 trillion parameters, 61 layers
@@ -71,16 +71,25 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Verdict**: NO EFFECT — eliminated ~360 Metal buffer allocs/token but each was only ~1μs (4-byte buffer). Total savings ~0.18ms/token, unmeasurable against 650ms total.
 - **Insight**: Metal constant buffer CPU-side overhead is negligible. The 3.5ms/layer Metal dispatch time is GPU kernel execution, not buffer setup. Committed as code cleanup — removes 3 HashMap allocations per dispatch call.
 
+### Iteration 7: Parallel per-head W_UK/W_UV sgemv — NO EFFECT
+- **Experiment**: Parallelized 64 per-head W_UK absorption and W_UV projection sgemv calls using rayon par_chunks_mut. Each head's sgemv is independent ([128,512] matrix, 256 KB), GPU idle during MLA.
+- **Result**: 1.51 tok/s (median warm: 1.48, 1.51, 1.53) vs 1.57 baseline
+- **Verdict**: NO EFFECT — synthetic timing shows only 315µs→286µs (1.10x) for both loops combined. Over 61 layers: ~1.8ms savings, unmeasurable against 650ms total.
+- **Insight**: Per-head sgemv on [128,512] is ~5µs/call (compute-bound, data fits L2). 64 sequential calls = 320µs/layer. Rayon parallel dispatch overhead (~15µs) nearly cancels the parallelism benefit. AMX sgemv on tiny matrices has per-call overhead that dominates; parallelism doesn't help because the BLAS function-call overhead is already the bottleneck, not the sequential execution time.
+- **Infrastructure**: Fixed pre-existing build error in make_attn_weights (removed dead f16 field assignments that referenced non-existent struct fields).
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
 - **Pool write-back on critical path**: 23 MB alloc+copy per miss causes page cache eviction. Must be async or deferred.
 - **Split pread + pipeline Metal fused/down**: pread_dn (1.5-2.5ms) > GPU fused (~1.75ms). No overlap benefit, extra cmd buffer overhead cancels.
 - **Metal constant buffer caching**: 4-byte u32 buffers are ~1μs each via newBufferWithBytes. ~360/token = 0.18ms, unmeasurable.
+- **Parallel per-head sgemv (W_UK/W_UV)**: 64×[128,512] sgemv = 320µs/layer total. Each call ~5µs, dominated by BLAS function-call overhead, not compute. Rayon parallelism saves <30µs/layer = 1.8ms/token.
 
 ## Suggested Next Experiments
-1. **Reduce MLA 2.2ms → ~1.0ms** — o_proj is 1.2ms (235 MB sgemv). GPU f32_gemv shader already compiled (F32_GEMV_SHADER in dequant.rs). Dispatch o_proj on Metal during CPU-idle MLA phase or cache o_proj f32 for all layers (14.3 GB).
-2. **Reduce FFN pread time** — when page cache warm, pread is fast (~3ms). When cold, 10ms+. Pre-populate pool buffers during prefill (not decode). Or use madvise(MADV_WILLNEED) to prefault expert pages.
-3. **Async pool write-back** — overlap pool buffer copy with next layer's MLA (CPU idle while Metal runs). Recovers pool benefit without decode-path overhead.
-4. **Reduce Metal GPU kernel time** — 3.5ms for 8 experts. Constant buffers now cached. Try: larger threadgroups, coalesced reads, or batching all 8 experts in single kernel dispatch.
-5. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
+1. **Async Metal dispatch overlap with MLA** — Metal dispatch (3.5ms/layer) and MLA (2.2ms/layer) use different hardware (GPU vs CPU/AMX). Currently serial. If Metal were launched async and MLA(N+1) ran concurrently, saves 2.2ms/layer × 61 = 134ms (20%). Requires: split fused_and_down into launch+wait, double-buffer staging for Metal, restructure decode loop. ~150 lines.
+2. **Reduce MLA 2.2ms → ~1.0ms** — o_proj is 1.2ms (235 MB sgemv). Dispatch o_proj on Metal GPU using F32_GEMV_SHADER already compiled in dequant.rs, overlapped with next layer's convert.
+3. **Reduce FFN pread time** — when page cache warm, pread is fast (~3ms). When cold, 10ms+. Pre-populate pool buffers during prefill (not decode). Or use madvise(MADV_WILLNEED) to prefault expert pages.
+4. **Async pool write-back** — overlap pool buffer copy with next layer's MLA (CPU idle while Metal runs). Recovers pool benefit without decode-path overhead.
+5. **Reduce Metal GPU kernel time** — 3.5ms for 8 experts. Try: larger threadgroups (TG_SIZE=512, ROWS_PER_TG=16), batching all 8 experts in single kernel dispatch, or compute-aware scheduling.
+6. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.

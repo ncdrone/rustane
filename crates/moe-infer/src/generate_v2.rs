@@ -439,7 +439,7 @@ struct LayerTiming {
 /// with optional f16 backbone refs for half-bandwidth Q/KV projections.
 fn make_attn_weights<'a>(
     lf: &'a MlaLayerF32,
-    f16w: Option<&'a crate::weights::MlaLayerWeights<'a>>,
+    _f16w: Option<&'a crate::weights::MlaLayerWeights<'a>>,
 ) -> MlaAttnWeights<'a> {
     MlaAttnWeights {
         q_proj: &lf.q_proj,
@@ -453,9 +453,6 @@ fn make_attn_weights<'a>(
         o_proj: &lf.o_proj,
         input_norm: &lf.input_norm,
         post_attn_norm: &lf.post_attn_norm,
-        q_a_proj_f16: f16w.and_then(|w| w.q_a_proj),
-        q_b_proj_f16: f16w.and_then(|w| w.q_b_proj),
-        kv_a_proj_f16: f16w.map(|w| w.kv_a_proj),
     }
 }
 
