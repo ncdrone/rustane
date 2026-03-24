@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 12
+tok/s: 1.15 (corrected) | ms/layer: ~14.2 | wins: 2 | experiments: 13
 NOTE: Previous 1.57 was inflated by fused shader OOB bug (repetitive output → same experts → warm cache)
 
 ## Model Facts
@@ -104,6 +104,14 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Root cause**: pread_dn time (1/3 of total pread) roughly equals Metal_fused time. When pread_dn ≥ Metal_fused, savings = 0. Additionally, 2 command buffers add ~0.1ms overhead × 60 layers = 6ms/token. The split trades one large pread for two smaller ones without reducing total serial time.
 - **Correctness**: split dispatch is bit-identical to single-cmdbuf (test verified). Output unchanged.
 
+### Iteration 11: TG=512, ROWS_PER_TG=16 for fused+V2 shaders — NO EFFECT (regression)
+- **Experiment**: Changed both fused_gate_up_silu and dequant_4bit_gemv_v2 shaders from TG=256/ROWS_PER_TG=8 to TG=512/ROWS_PER_TG=16. THREADS_PER_ROW=32 preserved (one SIMD group per row). Updated all 5 Rust dispatch sites. Hypothesis: halving TG count amortizes x_cache load over 2× more rows.
+- **Result**: 1.05 tok/s (median decode of 1.05, 1.05, 1.12) vs 1.15 baseline
+- **Verdict**: NO EFFECT — -8.7% regression. REVERTED.
+- **Correctness**: TG=512 is numerically correct (max_diff=0.004 for fused+down at K2 dims).
+- **Root cause**: Larger threadgroups (512 threads) reduce GPU occupancy. M4 Max has 40 execution units; with TG=256, each EU can run more concurrent TGs to hide memory latency. With TG=512, fewer TGs fit per EU, reducing latency hiding. The x_cache load cost saved by larger TGs (~0.5ms/token) is overwhelmed by occupancy loss (~5ms/token).
+- **Insight**: For bandwidth-bound INT4 GEMV on M4 Max, TG=256 (8 SIMD groups) is better than TG=512 (16 SIMD groups). Smaller TGs = more concurrent work = better latency hiding.
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -115,6 +123,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **V2 down shader half x_cache**: Down pass with in_features=2048 is bandwidth-bound, not occupancy-limited. float[4096]=16KB already allows 2 concurrent TGs. half saves TG memory but no perf impact.
 - **fcntl(F_RDADVISE) prefetch before pread**: pread itself triggers DMA immediately. The hint-to-read window is microseconds — kernel can't start DMA before pread does it.
 - **Split-pread pipeline (2 cmd bufs, pread_dn overlaps Metal fused)**: Tested with correct shader (iter 10). pread_dn (1-2ms) ≈ Metal_fused (1.75ms), overlap window ≈ 0. 2 cmd buf overhead (6ms/token) cancels any micro-gain. Confirmed with profiling: total layer time unchanged.
+- **TG=512/ROWS_PER_TG=16 for fused+V2 shaders**: -8.7% regression (1.05 vs 1.15). Larger TGs reduce occupancy on M4 Max (40 EUs). TG=256 is optimal for bandwidth-bound INT4 GEMV.
 
 ## Suggested Next Experiments
 NOTE: Fresh profiling from iter 10 (warm, correct shader):
@@ -125,7 +134,7 @@ NOTE: Fresh profiling from iter 10 (warm, correct shader):
 - Bottleneck: pread is still dominant (56%+ of FFN time), but highly variable due to OS page cache state.
 
 1. **Async Metal dispatch overlap with MLA** — Metal dispatch and MLA use different hardware (GPU vs CPU/AMX). Currently serial. Overlap layer N's Metal with layer N+1's MLA. Requires: double-buffer staging, restructure decode loop to pipeline across layers. ~150 lines. Potential: save ~2ms/layer of MLA time that currently runs while GPU idles.
-2. **Reduce Metal GPU kernel time** — try TG_SIZE=512 (ROWS_PER_TG=16), batching experts, or compute-aware scheduling. Metal fused+down = 3.5-4.5ms/layer is 30-40% of warm FFN time.
+2. **Reduce Metal GPU kernel time** — TG=512 tried and regressed (-8.7%). Try batching multiple experts into single dispatch, or compute-aware scheduling. Metal fused+down = 3.5-4.5ms/layer is 30-40% of warm FFN time.
 3. **madvise(MADV_SEQUENTIAL) on expert files** — hint kernel that expert file reads are sequential within each file. May improve readahead for pread.
 4. **Larger pread I/O size** — instead of 8 separate pread calls (one per expert, ~23MB each), single contiguous pread if experts are contiguous in file. Reduces syscall overhead.
 5. **ANE for norms/activations** — 17.8 TFLOPS sitting idle. Could offload RMSNorm + SiLU.
