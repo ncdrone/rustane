@@ -509,20 +509,9 @@ ${INJECT_CONTENT}"
         cp "${WORKTREE}/system/k2-gossip.md" "${REPO_ROOT}/system/k2-gossip.md" 2>/dev/null || true
     fi
 
-    # Check for consecutive reverts — auto-pause if thrashing
-    CONSECUTIVE_REVERTS=0
-    while IFS=$'\t' read -r _ _ _ _ _ verdict _ _; do
-        case "$verdict" in
-            reverted|REVERTED|BROKEN) CONSECUTIVE_REVERTS=$((CONSECUTIVE_REVERTS + 1)) ;;
-            IMPROVED|keep|current-best) CONSECUTIVE_REVERTS=0 ;;
-        esac
-    done < <(tail -5 "${WORKTREE}/system/experiments-k2.tsv" 2>/dev/null)
-
-    if [ "$CONSECUTIVE_REVERTS" -ge 3 ]; then
-        log "AUTO-PAUSED: $CONSECUTIVE_REVERTS consecutive reverts — small optimizations may be exhausted"
-        touch "$PAUSEFILE"
-        osascript -e 'display notification "3 consecutive reverts — review needed" with title "rustane v3-auto" sound name "Ping"' 2>/dev/null || true
-    fi
+    # NO auto-pause. The loop runs all 100 iterations.
+    # Less than 1 in 5 experiments will be winners — that's normal.
+    # autoresearch-ANE ran 400+ experiments with 19% hit rate.
 
     log "Cooling down ${COOLDOWN}s..."
     sleep "$COOLDOWN"
