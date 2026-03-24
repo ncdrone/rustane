@@ -1,7 +1,7 @@
 # K2 Optimization Gossip
 
 ## Current State
-tok/s: 1.68 (default top_k=8) | with RUSTANE_TOP_K=6: +25% | wins: 4 | experiments: 23
+tok/s: 1.68 (default top_k=8) | RUSTANE_TOP_K=6: +25% | RUSTANE_TOP_K=4: +79% (quality degrades) | wins: 5 | experiments: 25
 F_NOCACHE on expert fds: direct SSD DMA bypasses page cache, eliminates 10 GB/token cache pollution
 
 ## Model Facts
@@ -201,6 +201,20 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Key insight for UMA**: GPU offload only wins for compute-bound kernels (INT4 dequant+GEMV = ALU-bound). For pure f32 GEMV (bandwidth-bound), CPU AMX is faster due to zero dispatch overhead.
 - **Infrastructure kept**: oproj_gpu method, ensure_oproj_scratch(out_features, v_total), auto_oproj_metal.rs test (4 tests, max_diff<1e-3). Correctness confirmed: GPU produces identical results to CPU.
 
+### Iteration 22: Batch W_UK/W_UV as sgemm — NOT FEASIBLE
+- **Experiment**: Reshape W_UK [64,128,512] to [8192,512], dispatch as single cblas_sgemm instead of 64 sequential cblas_sgemv.
+- **Result**: NOT FEASIBLE — mathematically impossible. Each of 64 heads has a DIFFERENT weight matrix. sgemm(Q[64,128], W[8192,512]) sums across heads (wrong). Block-diagonal trick requires 64x more FLOPs. Per-head weights are inherent to MLA architecture.
+- **Time analysis**: 64 sgemv × 5µs × 2 loops = 640µs/layer = 39ms for 61 layers = 2.5% of total decode. Not worth pursuing even if feasible.
+
+### Iteration 23: top_k=4 sweep — WIN (+79%)
+- **Experiment**: RUSTANE_TOP_K=4 vs default top_k=8
+- **Result**: 0.84 tok/s median warm (of 0.88, 0.84, 0.84) vs 0.47* session baseline. +79%.
+- **FFN**: 960ms vs 1900ms at top_k=8 (-50%). 4 fewer expert pread (92 MB less I/O) + 4 fewer Metal dispatches per layer × 60 layers.
+- **MLA**: 148ms (unchanged, expected).
+- **Quality**: Degraded — "more more" repetition, garbled syntax ("circuits through.") vs top_k=8 clean output ("a static electrical device which works on the principle of electromagnetic induction"). Still generating related content but noticeably worse.
+- **Comparison with top_k=6**: top_k=6 gave +25% with good quality. top_k=4 gives +79% but with quality trade-off. Diminishing returns on quality vs speed.
+- **Opt-in**: RUSTANE_TOP_K=4 (default unchanged).
+
 ## Dead Ends (do not retry)
 - **lm_head optimization**: Only 3.3% of total time. cblas_sgemv saturates bandwidth single-threaded.
 - **f16 inline decode**: Puts conversion on critical path. f32 double-buffer hides it behind FFN compute.
@@ -218,6 +232,7 @@ Get tok/s as high as possible. Theoretical max ~5 tok/s.
 - **Overlap conversion with MLA**: -9.5% regression. MLA sgemv needs full 273 GB/s DRAM bandwidth. Concurrent conversion (f16 mmap read + f32 write) steals half, doubling MLA from 135ms to 270ms. The 24ms convert_wait savings is dwarfed. MLA must run alone.
 - **Pre-cache all layers as f32 (~54 GB)**: -64% regression (0.6 vs 1.68). 54 GB heap exhausts DRAM, evicting backbone mmap pages → shared_ffn faults from SSD every layer. FFN 7ms→27ms/layer. On 128 GB system with 524 GB model, DRAM is scarce — never pin >10 GB of converted weights.
 - **Expert speculation (speculative pread for next layer)**: -41% regression (0.30 vs 0.51*). Three variants tried (scope, sequential spawn, parallel spawn). Incompatible with F_NOCACHE: direct DMA is already fast, no cache layer to pre-warm. 184 MB/layer spec I/O doubles SSD bandwidth usage. Thread spawn overhead (9600 spawns/decode) compounds. Dead end with F_NOCACHE.
+- **Batch W_UK/W_UV as single sgemm**: NOT FEASIBLE. Each of 64 MLA heads has a different weight matrix — sgemm uses one shared matrix. Block-diagonal trick requires 64× more FLOPs. Total time (640µs/layer) is only 2.5% of decode. Not a bottleneck.
 - **GPU o_proj (Metal f32 GEMV for o_proj)**: -4% regression (0.48 vs 0.50*). Three approaches: per-layer wrap_mmap (12ms page table), persistent memcpy (3.7x MLA), zero-copy pre-cached (still +40-100% MLA). On UMA, f32 GEMV is bandwidth-bound — GPU shares same 273 GB/s memory bus as CPU AMX. GPU dispatch overhead (~1.5ms/layer encode+sync) exceeds any bandwidth gain. GPU offload only viable for ALU-bound kernels (INT4 dequant).
 
 ## Suggested Next Experiments
