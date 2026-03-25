@@ -3,6 +3,7 @@ dev/
 viz/
 threads/
 models/
+system/
 *.gguf
 *.metallib
 *.air
