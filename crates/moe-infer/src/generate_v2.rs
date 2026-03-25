@@ -24,6 +24,13 @@ use objc2_metal::MTLBuffer;
 
 use std::cell::RefCell;
 
+/// Whether to use ANE for MLA projections (set RUSTANE_ANE_MLA=1 to enable).
+/// Default: OFF (CPU path). Opt-in until validated end-to-end.
+fn ane_mla_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("RUSTANE_ANE_MLA").is_ok())
+}
+
 /// Whether to run ExpertPool simulation (set RUSTANE_POOL_SIM=1).
 fn pool_sim_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -166,6 +173,8 @@ pub struct ModelV2 {
     pub pool_buffers: std::cell::UnsafeCell<Vec<Vec<u8>>>,
     /// Metal buffers wrapping pool_buffers (zero-copy: GPU reads pool memory directly).
     pub pool_metal_bufs: std::cell::UnsafeCell<Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>>,
+    /// ANE MLA kernels (Conv1x1 projections). None if ANE unavailable or compilation failed.
+    pub ane_mla: Option<crate::ane_mla::AneMlaKernels>,
 }
 
 /// Sampling configuration.
@@ -360,6 +369,8 @@ impl ModelV2 {
             (None, Vec::new())
         };
 
+        let ane_mla = Self::try_compile_ane(&mla_config);
+
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
             metal, expert_metal_bufs, layers_f32, lm_head_f32,
@@ -367,7 +378,31 @@ impl ModelV2 {
             expert_pool: std::cell::UnsafeCell::new(expert_pool),
             pool_metal_bufs: std::cell::UnsafeCell::new(vec![None; pool_buffers.len()]),
             pool_buffers: std::cell::UnsafeCell::new(pool_buffers),
+            ane_mla,
         })
+    }
+
+    /// Attempt to compile ANE MLA kernels. Returns None on failure (graceful fallback to CPU).
+    fn try_compile_ane(cfg: &MlaDecodeConfig) -> Option<crate::ane_mla::AneMlaKernels> {
+        let q_lora_rank = 1536; // Both V3 and K2 use q_lora_rank=1536
+        match crate::ane_mla::compile_mla_kernels(
+            cfg.hidden_size,
+            q_lora_rank,
+            cfg.num_heads,
+            cfg.qk_nope_head_dim,
+            cfg.qk_rope_head_dim,
+            cfg.v_head_dim,
+            cfg.kv_lora_rank,
+        ) {
+            Ok(kernels) => {
+                eprintln!("[ANE] MLA kernels compiled: 4 Conv1x1 graphs (q_a, q_b, kv_a, o_proj)");
+                Some(kernels)
+            }
+            Err(e) => {
+                eprintln!("[ANE] MLA compile failed, falling back to CPU: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -550,10 +585,21 @@ fn run_layer_compute_inner(
     let normed = rmsnorm(x, &lf.input_norm, eps);
     let attn_weights = make_attn_weights(lf);
 
-    let attn_out = mla_forward_decode(
-        &normed, &attn_weights, cache, layer, pos,
-        &model.rope, &model.mla_config, model.attn_scale,
-    );
+    // ANE path: Q LoRA + KV compress + O proj on ANE, absorption + attention on CPU.
+    // Falls back to full CPU path if ANE unavailable or RUSTANE_ANE_MLA=0.
+    let use_ane = model.ane_mla.is_some() && ane_mla_enabled();
+    let attn_out = if use_ane {
+        let ane = model.ane_mla.as_ref().unwrap();
+        ane_mla_forward_decode(
+            &normed, &attn_weights, ane, cache, layer, pos,
+            &model.rope, &model.mla_config, model.attn_scale,
+        )
+    } else {
+        mla_forward_decode(
+            &normed, &attn_weights, cache, layer, pos,
+            &model.rope, &model.mla_config, model.attn_scale,
+        )
+    };
 
     let mut residual = vec![0.0f32; hidden];
     for d in 0..hidden {
@@ -583,6 +629,128 @@ fn run_layer_compute_inner(
     }
 
     Ok(residual)
+}
+
+/// ANE-accelerated MLA forward decode.
+///
+/// Replaces Q LoRA + KV compress + O proj with ANE Conv1x1 dispatches.
+/// Absorption (W_UK/W_UV) + attention scoring stays on CPU (small ops, variable seq_len).
+fn ane_mla_forward_decode(
+    x: &[f32],
+    weights: &MlaAttnWeights<'_>,
+    ane: &crate::ane_mla::AneMlaKernels,
+    cache: &mut MlaKvCache,
+    layer: usize,
+    pos: usize,
+    rope: &YarnRopeTables,
+    cfg: &MlaDecodeConfig,
+    attn_scale: f32,
+) -> Vec<f32> {
+    let h = cfg.num_heads;
+    let nope = cfg.qk_nope_head_dim;
+    let rope_dim = cfg.qk_rope_head_dim;
+    let v_dim = cfg.v_head_dim;
+    let kv_rank = cfg.kv_lora_rank;
+    let hidden = cfg.hidden_size;
+
+    // 1. Q projection on ANE (LoRA path)
+    let q = if let (Some(q_a), Some(q_a_norm), Some(q_b)) =
+        (&weights.q_a_proj, &weights.q_a_layernorm, &weights.q_b_proj)
+    {
+        crate::ane_mla::ane_q_lora(ane, x, q_a, q_a_norm, q_b, cfg.rms_eps)
+            .unwrap_or_else(|e| {
+                eprintln!("[ANE] Q LoRA dispatch failed, CPU fallback: {e}");
+                let q_lora_rank = q_a.len() / hidden;
+                let mut q_lat = vec![0.0f32; q_lora_rank];
+                crate::blas::sgemv_f32(q_a, x, &mut q_lat, q_lora_rank, hidden);
+                let q_lat_n = rmsnorm(&q_lat, q_a_norm, cfg.rms_eps);
+                let q_total = cfg.q_total_dim();
+                let mut q = vec![0.0f32; q_total];
+                crate::blas::sgemv_f32(q_b, &q_lat_n, &mut q, q_total, q_lora_rank);
+                q
+            })
+    } else {
+        let q_total = cfg.q_total_dim();
+        let mut q = vec![0.0f32; q_total];
+        crate::blas::sgemv_f32(&weights.q_proj, x, &mut q, q_total, hidden);
+        q
+    };
+
+    // Split q_nope + q_pe
+    let mut q_nope = vec![0.0f32; h * nope];
+    let mut q_pe = vec![0.0f32; h * rope_dim];
+    for head in 0..h {
+        let src = head * (nope + rope_dim);
+        q_nope[head * nope..(head + 1) * nope].copy_from_slice(&q[src..src + nope]);
+        q_pe[head * rope_dim..(head + 1) * rope_dim].copy_from_slice(&q[src + nope..src + nope + rope_dim]);
+    }
+    rope.apply_all_heads(&mut q_pe, h, pos);
+
+    // 2. KV compression on ANE
+    let kv_out_dim = kv_rank + rope_dim;
+    let kv_out = crate::ane_mla::ane_kv_compress(ane, x, &weights.kv_a_proj)
+        .unwrap_or_else(|e| {
+            eprintln!("[ANE] KV compress dispatch failed, CPU fallback: {e}");
+            let mut kv = vec![0.0f32; kv_out_dim];
+            crate::blas::sgemv_f32(&weights.kv_a_proj, x, &mut kv, kv_out_dim, hidden);
+            kv
+        });
+
+    let kv_latent_raw = &kv_out[..kv_rank];
+    let k_pe_raw = &kv_out[kv_rank..];
+    let kv_latent = rmsnorm(kv_latent_raw, &weights.kv_a_layernorm, cfg.rms_eps);
+    let mut k_pe = k_pe_raw.to_vec();
+    rope.apply(&mut k_pe, pos);
+    cache.write(layer, pos, &kv_latent, &k_pe);
+    let seq_len = pos + 1;
+
+    // 3-6. Absorption + attention (CPU — variable seq_len, small matrices)
+    let mut q_absorbed = vec![0.0f32; h * kv_rank];
+    for head in 0..h {
+        let q_head = &q_nope[head * nope..(head + 1) * nope];
+        let w_uk_head = &weights.w_uk[head * nope * kv_rank..(head + 1) * nope * kv_rank];
+        let out = &mut q_absorbed[head * kv_rank..(head + 1) * kv_rank];
+        crate::blas::sgemv_f32_trans(w_uk_head, q_head, out, kv_rank, nope);
+    }
+
+    let latent_cache = cache.get_latents(layer, seq_len);
+    let rope_cache = cache.get_rope_keys(layer, seq_len);
+
+    let mut scores = vec![0.0f32; h * seq_len];
+    crate::blas::sgemm_nt(&q_absorbed, latent_cache, &mut scores, h, seq_len, kv_rank);
+    crate::blas::sgemm_nt_add(&q_pe, rope_cache, &mut scores, h, seq_len, rope_dim);
+
+    for head in 0..h {
+        let s = &mut scores[head * seq_len..(head + 1) * seq_len];
+        for t_idx in 0..seq_len { s[t_idx] *= attn_scale; }
+        let max_s = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for t_idx in 0..seq_len { s[t_idx] = (s[t_idx] - max_s).exp(); sum += s[t_idx]; }
+        for t_idx in 0..seq_len { s[t_idx] /= sum; }
+    }
+
+    // 7-8. Value reconstruction + W_UV (CPU — per-head, small)
+    let mut v_latents = vec![0.0f32; h * kv_rank];
+    crate::blas::sgemm(&scores, latent_cache, &mut v_latents, h, kv_rank, seq_len);
+
+    let mut v_concat = vec![0.0f32; h * v_dim];
+    for head in 0..h {
+        let v_latent = &v_latents[head * kv_rank..(head + 1) * kv_rank];
+        let w_uv_head = &weights.w_uv[head * v_dim * kv_rank..(head + 1) * v_dim * kv_rank];
+        let v_out = &mut v_concat[head * v_dim..(head + 1) * v_dim];
+        crate::blas::sgemv_f32(w_uv_head, v_latent, v_out, v_dim, kv_rank);
+    }
+
+    // 9. O projection on ANE
+    let output = crate::ane_mla::ane_o_proj(ane, &v_concat, &weights.o_proj)
+        .unwrap_or_else(|e| {
+            eprintln!("[ANE] O proj dispatch failed, CPU fallback: {e}");
+            let mut out = vec![0.0f32; hidden];
+            crate::blas::sgemv_f32(&weights.o_proj, &v_concat, &mut out, hidden, h * v_dim);
+            out
+        });
+
+    output
 }
 
 /// MLA attention only — returns (residual_after_attn, normed2_for_ffn).
