@@ -14,11 +14,15 @@ use moe_kernels::mla::{
 
 #[test]
 fn pad16_correctness() {
-    assert_eq!(pad16(0), 0);
-    assert_eq!(pad16(1), 16);
-    assert_eq!(pad16(15), 16);
-    assert_eq!(pad16(16), 16);
-    assert_eq!(pad16(17), 32);
+    // Minimum 64 enforced (ANE requires spatial width ≥ 64)
+    assert_eq!(pad16(0), 64);
+    assert_eq!(pad16(1), 64);
+    assert_eq!(pad16(15), 64);
+    assert_eq!(pad16(16), 64);
+    assert_eq!(pad16(17), 64);
+    assert_eq!(pad16(63), 64);
+    assert_eq!(pad16(64), 64);
+    assert_eq!(pad16(65), 80);
     assert_eq!(pad16(512), 512);
     assert_eq!(pad16(513), 528);
 }

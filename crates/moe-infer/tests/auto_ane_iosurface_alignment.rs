@@ -13,18 +13,23 @@
 use moe_kernels::mla::{conv1x1_spatial_width, absorption_spatial_width, pad16, MlaConfig};
 
 /// Test pad16 at exact boundaries — off-by-one here means silent corruption.
+/// Minimum is 64 (ANE requires spatial width ≥ 64).
 #[test]
 fn pad16_boundaries() {
-    // Exact multiples must not over-pad
-    for m in [0, 16, 32, 48, 64, 128, 256, 512, 1024, 4096, 8192, 16384] {
+    // Below 64 → all clamp to 64
+    for v in [0, 1, 15, 16, 17, 32, 48, 63] {
+        assert_eq!(pad16(v), 64, "pad16({v}) should be 64 (minimum)");
+    }
+    // Exact 64 and above: standard mod-16 padding
+    for m in [64, 128, 256, 512, 1024, 4096, 8192, 16384] {
         assert_eq!(pad16(m), m, "pad16({m}) should be {m}");
     }
     // One over must round up
-    for m in [16, 32, 48, 64, 128, 256, 512, 1024, 4096] {
+    for m in [64, 128, 256, 512, 1024, 4096] {
         assert_eq!(pad16(m + 1), m + 16, "pad16({}) should be {}", m + 1, m + 16);
     }
-    // One under must round up to the multiple
-    for m in [16, 32, 48, 64, 128] {
+    // One under rounds up
+    for m in [80, 128, 256] {
         assert_eq!(pad16(m - 1), m, "pad16({}) should be {}", m - 1, m);
     }
 }

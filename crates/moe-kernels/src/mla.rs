@@ -225,9 +225,11 @@ fn matvec(x: &[f32], w: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 
 use ane_bridge::ane::{Graph, Shape};
 
-/// Pad spatial width to multiple of 16 (ANE requirement — silent corruption otherwise).
+/// Pad spatial width to multiple of 16, minimum 64.
+/// ANE requires spatial width ≥ 64 (silent failure below) and multiple of 16 (silent corruption).
 pub fn pad16(x: usize) -> usize {
-    (x + 15) & !15
+    let padded = (x + 15) & !15;
+    if padded < 64 { 64 } else { padded }
 }
 
 /// Build a Conv1x1 projection graph with dynamic weights (staged in spatial dim).
@@ -241,16 +243,19 @@ pub fn pad16(x: usize) -> usize {
 /// This is the maderix dynamic-weight pattern: weights packed alongside activations
 /// in the spatial dimension. Compile once, stage weights per-layer via memcpy.
 pub fn build_mla_conv1x1(ic: usize, oc: usize, seq: usize) -> Graph {
-    let sp = pad16(seq + oc);
+    // ANE requires all spatial dims ≥ 64. For decode (seq=1), pad to 64.
+    // Activation goes at spatial[0], weights at spatial[padded_seq..padded_seq+oc].
+    let padded_seq = pad16(seq);
+    let sp = pad16(padded_seq + oc);
     let mut g = Graph::new();
 
     let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: sp });
 
-    // Slice activations: [1, IC, 1, seq]
-    let acts = g.slice(input, [0, 0, 0, 0], [1, ic, 1, seq]);
+    // Slice activations: [1, IC, 1, padded_seq]
+    let acts = g.slice(input, [0, 0, 0, 0], [1, ic, 1, padded_seq]);
 
     // Slice weights: [1, IC, 1, OC]
-    let wts = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
+    let wts = g.slice(input, [0, 0, 0, padded_seq], [1, ic, 1, oc]);
 
     // Transpose weights: [1, IC, 1, OC] → [1, OC, 1, IC]
     let wts_t = g.transpose(wts, [0, 3, 2, 1]);
@@ -258,7 +263,8 @@ pub fn build_mla_conv1x1(ic: usize, oc: usize, seq: usize) -> Graph {
     // Reshape to conv filter: [1, OC, 1, IC] → [OC, IC, 1, 1]
     let wts_conv = g.reshape(wts_t, Shape { batch: oc, channels: ic, height: 1, width: 1 });
 
-    // Conv1x1: [1, IC, 1, seq] * [OC, IC, 1, 1] → [1, OC, 1, seq]
+    // Conv1x1: [1, IC, 1, padded_seq] * [OC, IC, 1, 1] → [1, OC, 1, padded_seq]
+    // For decode: position 0 has the result, positions 1..63 are zero-padded.
     let _out = g.convolution_2d_1x1_dynamic(acts, wts_conv);
 
     g
@@ -313,8 +319,15 @@ pub fn build_mla_grouped_absorption(
 }
 
 /// Spatial width needed for a Conv1x1 projection IOSurface.
+/// Accounts for ANE minimum spatial width ≥ 64.
 pub fn conv1x1_spatial_width(seq: usize, oc: usize) -> usize {
-    pad16(seq + oc)
+    let padded_seq = pad16(seq);
+    pad16(padded_seq + oc)
+}
+
+/// Padded sequence length (for output buffer sizing).
+pub fn padded_seq(seq: usize) -> usize {
+    pad16(seq)
 }
 
 /// Spatial width needed for grouped absorption IOSurface.
