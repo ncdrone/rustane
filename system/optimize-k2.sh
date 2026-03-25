@@ -41,7 +41,7 @@ DRY_RUN=false
 SHOW_STATUS=false
 ITER_TIMEOUT_MIN=120
 WORKTREE_BASE="/Users/dan/Dev/rustane-k2-auto"
-BASE_BRANCH="v3-optimize"
+BASE_BRANCH="1t-moe-infer"
 RESEARCH_REPO="/Users/dan/Dev/rustane-research"
 
 # --- Parse Args ---
