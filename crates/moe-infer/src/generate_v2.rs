@@ -674,17 +674,26 @@ fn ane_mla_forward_decode(
     let kv_rank = cfg.kv_lora_rank;
     let hidden = cfg.hidden_size;
 
-    // 1. Q projection on ANE (LoRA path)
-    let q = if let (Some(q_a), Some(q_a_norm), Some(q_b)) =
+    // Prestage all 4 projection weights for this layer (slow once, fast dispatch 4x)
+    if let (Some(q_a), Some(q_b)) = (&weights.q_a_proj, &weights.q_b_proj) {
+        crate::ane_mla::prestage_mla_layer(
+            ane, q_a, q_b, &weights.kv_a_proj, &weights.o_proj,
+        );
+    }
+
+    // 1. Q projection on ANE (LoRA path, fast — weights pre-staged)
+    let q = if let (Some(_q_a), Some(q_a_norm), Some(_q_b)) =
         (&weights.q_a_proj, &weights.q_a_layernorm, &weights.q_b_proj)
     {
-        crate::ane_mla::ane_q_lora(ane, x, q_a, q_a_norm, q_b, cfg.rms_eps)
+        crate::ane_mla::ane_q_lora_fast(ane, x, q_a_norm, cfg.rms_eps)
             .unwrap_or_else(|e| {
                 eprintln!("[ANE] Q LoRA dispatch failed, CPU fallback: {e}");
+                let q_a = weights.q_a_proj.unwrap();
+                let q_b = weights.q_b_proj.unwrap();
                 let q_lora_rank = q_a.len() / hidden;
                 let mut q_lat = vec![0.0f32; q_lora_rank];
                 crate::blas::sgemv_f32(q_a, x, &mut q_lat, q_lora_rank, hidden);
-                let q_lat_n = rmsnorm(&q_lat, q_a_norm, cfg.rms_eps);
+                let q_lat_n = rmsnorm(&q_lat, weights.q_a_layernorm.unwrap(), cfg.rms_eps);
                 let q_total = cfg.q_total_dim();
                 let mut q = vec![0.0f32; q_total];
                 crate::blas::sgemv_f32(q_b, &q_lat_n, &mut q, q_total, q_lora_rank);
@@ -707,9 +716,9 @@ fn ane_mla_forward_decode(
     }
     rope.apply_all_heads(&mut q_pe, h, pos);
 
-    // 2. KV compression on ANE
+    // 2. KV compression on ANE (fast — weights pre-staged)
     let kv_out_dim = kv_rank + rope_dim;
-    let kv_out = crate::ane_mla::ane_kv_compress(ane, x, &weights.kv_a_proj)
+    let kv_out = crate::ane_mla::ane_kv_compress_fast(ane, x)
         .unwrap_or_else(|e| {
             eprintln!("[ANE] KV compress dispatch failed, CPU fallback: {e}");
             let mut kv = vec![0.0f32; kv_out_dim];
@@ -763,7 +772,8 @@ fn ane_mla_forward_decode(
     }
 
     // 9. O projection on ANE
-    let output = crate::ane_mla::ane_o_proj(ane, &v_concat, &weights.o_proj)
+    // 9. O projection on ANE (fast — weights pre-staged)
+    let output = crate::ane_mla::ane_o_proj_fast(ane, &v_concat)
         .unwrap_or_else(|e| {
             eprintln!("[ANE] O proj dispatch failed, CPU fallback: {e}");
             let mut out = vec![0.0f32; hidden];

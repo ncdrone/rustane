@@ -122,8 +122,8 @@ pub fn prestage_weights(
     }
 }
 
-/// Fast dispatch: stage activation only, weights already pre-staged.
-/// Hot path: IC writes (7168 for K2), not IC*OC (11M).
+/// Fast dispatch: stage activation via direct fp16 writes, weights already pre-staged.
+/// Hot path: IC fp16 writes (7168 × 2 bytes = 14 KB for K2), not 46 MB f32 buffer conversion.
 pub fn ane_projection_fast(
     exec: &Executable,
     input_buf: &TensorData,
@@ -133,14 +133,15 @@ pub fn ane_projection_fast(
     oc: usize,
 ) -> Result<Vec<f32>, String> {
     let sp = input_buf.shape().width;
-    {
-        let mut buf = input_buf.as_f32_slice_mut();
-        for c in 0..ic {
-            buf[c * sp] = activation[c];
-        }
+
+    // Direct fp16 write: only IC values at stride SP (bypasses full buffer conversion)
+    unsafe {
+        ane_bridge::stage_activation_fp16(input_buf, activation, ic, sp);
     }
+
     exec.run_cached_direct(&[input_buf], &[output_buf])
         .map_err(|e| format!("ANE dispatch: {e}"))?;
+
     let out_sp = output_buf.shape().width;
     let out_buf = output_buf.as_f32_slice();
     let mut result = vec![0.0f32; oc];
@@ -220,30 +221,83 @@ fn ane_profile_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("RUSTANE_ANE_PROFILE").is_ok())
 }
 
+/// Pre-stage all 4 MLA projection weights for one layer.
+/// Call once when switching layers (not per token).
+/// Uses copy_from_f32 for bulk conversion (more efficient than element-wise).
+pub fn prestage_mla_layer(
+    kernels: &AneMlaKernels,
+    w_qa: &[f32],
+    w_qb: &[f32],
+    w_kv_a: &[f32],
+    w_o: &[f32],
+) {
+    prestage_weights(&kernels.q_a_in, w_qa, kernels.hidden, kernels.q_lora_rank);
+    prestage_weights(&kernels.q_b_in, w_qb, kernels.q_lora_rank, kernels.q_total);
+    prestage_weights(&kernels.kv_a_in, w_kv_a, kernels.hidden, kernels.kv_out_dim);
+    prestage_weights(&kernels.o_in, w_o, kernels.v_total, kernels.hidden);
+}
+
+/// Run Q LoRA projection on ANE (fast path — weights pre-staged).
+pub fn ane_q_lora_fast(
+    kernels: &AneMlaKernels,
+    x: &[f32],
+    qa_norm: &[f32],
+    rms_eps: f32,
+) -> Result<Vec<f32>, String> {
+    let q_latent = ane_projection_fast(
+        &kernels.q_a_exec, &kernels.q_a_in, &kernels.q_a_out,
+        x, kernels.hidden, kernels.q_lora_rank,
+    )?;
+    let q_latent_normed = crate::rmsnorm::rmsnorm(&q_latent, qa_norm, rms_eps);
+    // Prestage q_b activation (q_latent_normed) — q_b weights already staged
+    let q = ane_projection_fast(
+        &kernels.q_b_exec, &kernels.q_b_in, &kernels.q_b_out,
+        &q_latent_normed, kernels.q_lora_rank, kernels.q_total,
+    )?;
+    Ok(q)
+}
+
+/// Run KV compression on ANE (fast path — weights pre-staged).
+pub fn ane_kv_compress_fast(
+    kernels: &AneMlaKernels,
+    x: &[f32],
+) -> Result<Vec<f32>, String> {
+    ane_projection_fast(
+        &kernels.kv_a_exec, &kernels.kv_a_in, &kernels.kv_a_out,
+        x, kernels.hidden, kernels.kv_out_dim,
+    )
+}
+
+/// Run O projection on ANE (fast path — weights pre-staged).
+pub fn ane_o_proj_fast(
+    kernels: &AneMlaKernels,
+    v_concat: &[f32],
+) -> Result<Vec<f32>, String> {
+    ane_projection_fast(
+        &kernels.o_exec, &kernels.o_in, &kernels.o_out,
+        v_concat, kernels.v_total, kernels.hidden,
+    )
+}
+
 /// Run Q LoRA projection on ANE: x → q_a → layernorm → q_b → q[q_total]
+/// Slow path (stages weights per call). Use ane_q_lora_fast for decode.
 pub fn ane_q_lora(
     kernels: &AneMlaKernels,
     x: &[f32],
-    w_qa: &[f32],          // [q_lora_rank, hidden] row-major
-    qa_norm: &[f32],       // [q_lora_rank]
-    w_qb: &[f32],          // [q_total, q_lora_rank] row-major
+    w_qa: &[f32],
+    qa_norm: &[f32],
+    w_qb: &[f32],
     rms_eps: f32,
 ) -> Result<Vec<f32>, String> {
-    // Step 1: compress  x[hidden] → q_latent[q_lora_rank]
     let q_latent = ane_projection(
         &kernels.q_a_exec, &kernels.q_a_in, &kernels.q_a_out,
         x, w_qa, kernels.hidden, kernels.q_lora_rank,
     )?;
-
-    // Step 2: RMSNorm on CPU (small vector, not worth ANE dispatch)
     let q_latent_normed = crate::rmsnorm::rmsnorm(&q_latent, qa_norm, rms_eps);
-
-    // Step 3: expand  q_latent_normed[q_lora_rank] → q[q_total]
     let q = ane_projection(
         &kernels.q_b_exec, &kernels.q_b_in, &kernels.q_b_out,
         &q_latent_normed, w_qb, kernels.q_lora_rank, kernels.q_total,
     )?;
-
     Ok(q)
 }
 
