@@ -282,6 +282,58 @@ pub fn sgemm_nt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usiz
     }
 }
 
+/// sgemm with M=1: x[1,k] × W[k,n] → y[1,n]. Alternative to sgemv for large matrices.
+/// May use a different AMX codepath (sgemm vs sgemv internal dispatch).
+pub fn sgemm_custom_1xn(x: &[f32], w: &[f32], y: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(w.len(), k * n);
+    debug_assert_eq!(y.len(), n);
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            1,              // M = 1 (single vector)
+            n as i32,
+            k as i32,
+            1.0,
+            x.as_ptr(),
+            k as i32,       // lda
+            w.as_ptr(),
+            n as i32,       // ldb
+            0.0,
+            y.as_mut_ptr(),
+            n as i32,       // ldc
+        );
+    }
+}
+
+/// sgemm with M=1 and transB: x[1,k] × W^T[n,k]^T → y[1,n].
+pub fn sgemm_custom_1xn_transb(x: &[f32], wt: &[f32], y: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(wt.len(), n * k);
+    debug_assert_eq!(y.len(), n);
+    const CBLAS_TRANS: i32 = 112;
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            1,
+            n as i32,
+            k as i32,
+            1.0,
+            x.as_ptr(),
+            k as i32,
+            wt.as_ptr(),
+            k as i32,       // ldb for transB
+            0.0,
+            y.as_mut_ptr(),
+            n as i32,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
