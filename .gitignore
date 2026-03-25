@@ -4,6 +4,7 @@ viz/
 threads/
 models/
 system/
+.claude/
 *.gguf
 *.metallib
 *.air
