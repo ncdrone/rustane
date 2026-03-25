@@ -676,7 +676,8 @@ fn ane_mla_forward_decode(
 
     // Use per-layer pre-staged IOSurfaces if available (0ms staging).
     // Falls back to per-token staging if layer_inputs not populated.
-    let use_layered = layer < ane.layer_inputs.len();
+    let layer_inputs = unsafe { &*ane.layer_inputs.get() };
+    let use_layered = layer < layer_inputs.len();
 
     if !use_layered {
         // Fallback: prestage per-token (slow, ~90ms/layer)
@@ -700,7 +701,7 @@ fn ane_mla_forward_decode(
         (&weights.q_a_proj, &weights.q_a_layernorm, &weights.q_b_proj)
     {
         let q_result = if use_layered {
-            let layer_bufs = &ane.layer_inputs[layer];
+            let layer_bufs = &layer_inputs[layer];
             // Q LoRA compress via per-layer IOSurface
             let q_latent = crate::ane_mla::ane_projection_layered(
                 &ane.q_a_exec, &layer_bufs[0], &ane.q_a_out,
@@ -752,7 +753,7 @@ fn ane_mla_forward_decode(
     // 2. KV compression on ANE
     let kv_out_dim = kv_rank + rope_dim;
     let kv_out = if use_layered {
-        let layer_bufs = &ane.layer_inputs[layer];
+        let layer_bufs = &layer_inputs[layer];
         crate::ane_mla::ane_projection_layered(
             &ane.kv_a_exec, &layer_bufs[2], &ane.kv_a_out,
             x, hidden, kv_out_dim,
@@ -814,7 +815,7 @@ fn ane_mla_forward_decode(
     // 9. O projection on ANE
     // 9. O projection on ANE
     let output = if use_layered {
-        let layer_bufs = &ane.layer_inputs[layer];
+        let layer_bufs = &layer_inputs[layer];
         crate::ane_mla::ane_projection_layered(
             &ane.o_exec, &layer_bufs[3], &ane.o_out,
             &v_concat, h * v_dim, hidden,
@@ -1585,8 +1586,10 @@ pub fn generate_v2(
             .map(|_| MlaLayerF32::empty())
             .collect();
 
-        // Warmup: pre-fault all backbone pages into page cache
+        // Warmup: pre-fault all backbone pages into page cache.
+        // If ANE enabled: also prestage MLA weights into per-layer IOSurfaces.
         let t_warmup = std::time::Instant::now();
+        let ane_prestage = model.ane_mla.is_some() && ane_mla_enabled();
         for layer in 0..num_layers {
             if layer < num_dense {
                 convert_layer_into(&mut cached_dense[layer], &model.weights, &model.config, layer)?;
@@ -1594,8 +1597,36 @@ pub fn generate_v2(
                 convert_layer_into(&mut buf_a, &model.weights, &model.config, layer)?;
             }
         }
-        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers, cached {} dense)",
-            t_warmup.elapsed().as_secs_f64(), num_layers, num_dense);
+        // ANE prestaging: convert f16→f32, transpose, stage into per-layer IOSurfaces.
+        // Must happen AFTER warmup (backbone pages in page cache).
+        if ane_prestage {
+            if let Some(ref ane) = model.ane_mla {
+                let num_layers = model.config.num_layers();
+                let mla_cfg = &model.mla_config;
+                let weights_ref = &model.weights;
+                let config_ref = &model.config;
+
+                crate::ane_mla::prestage_all_layers(
+                    ane,
+                    |layer| {
+                        // Convert layer's MLA weights f16→f32 on the fly
+                        let mut lf = MlaLayerF32::empty();
+                        convert_layer_into(&mut lf, weights_ref, config_ref, layer)
+                            .expect("convert layer for ANE prestaging");
+                        (
+                            lf.q_a_proj.unwrap_or_default(),
+                            lf.q_b_proj.unwrap_or_default(),
+                            lf.kv_a_proj,
+                            lf.o_proj,
+                        )
+                    },
+                    num_layers,
+                );
+            }
+        }
+        eprintln!("Backbone warmup: {:.1}s (pre-faulted {} layers, cached {} dense{})",
+            t_warmup.elapsed().as_secs_f64(), num_layers, num_dense,
+            if ane_prestage { ", ANE pre-staged" } else { "" });
 
         // --- Prefill ---
         // Tested layer-by-layer reorder (2026-03-24): 7% cold prefill win, negligible warm.

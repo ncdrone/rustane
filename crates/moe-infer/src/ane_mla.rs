@@ -46,9 +46,9 @@ pub struct AneMlaKernels {
     pub staged_layer: std::cell::Cell<Option<usize>>,
 
     /// Per-layer pre-staged input IOSurfaces (weights baked at load time).
+    /// UnsafeCell because prestage_all_layers mutates during &self warmup.
     /// Indexed by layer. Each entry has [q_a_in, q_b_in, kv_a_in, o_in].
-    /// If populated, decode uses these instead of re-staging weights.
-    pub layer_inputs: Vec<[TensorData; 4]>,
+    pub layer_inputs: std::cell::UnsafeCell<Vec<[TensorData; 4]>>,
 }
 
 /// Compile all MLA Conv1x1 kernels for a given model configuration.
@@ -107,7 +107,7 @@ pub fn compile_mla_kernels(
         o_exec, o_in, o_out,
         hidden, q_lora_rank, q_total, kv_out_dim, v_total,
         staged_layer: std::cell::Cell::new(None),
-        layer_inputs: Vec::new(), // populated later by prestage_all_layers
+        layer_inputs: std::cell::UnsafeCell::new(Vec::new()),
     })
 }
 
@@ -301,8 +301,10 @@ pub fn prestage_mla_layer(
 /// Pre-stage all layers' weights into per-layer IOSurface buffers.
 /// Called once at model load. Memory: ~11 GB for 61 layers (K2).
 /// After this, decode only writes activation fp16 (14 KB per dispatch).
+/// # Safety
+/// Must not be called concurrently with decode (single-threaded access).
 pub fn prestage_all_layers(
-    kernels: &mut AneMlaKernels,
+    kernels: &AneMlaKernels,
     get_layer_weights: impl Fn(usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>),
     num_layers: usize,
 ) {
@@ -313,7 +315,8 @@ pub fn prestage_all_layers(
     let o_sp = conv1x1_spatial_width(seq, kernels.hidden);
 
     let t = std::time::Instant::now();
-    kernels.layer_inputs.clear();
+    let layer_inputs = unsafe { &mut *kernels.layer_inputs.get() };
+    layer_inputs.clear();
 
     for layer in 0..num_layers {
         let (w_qa, w_qb, w_kv_a, w_o) = get_layer_weights(layer);
@@ -335,7 +338,7 @@ pub fn prestage_all_layers(
         prestage_weights_transposed(&kv_a_in, &w_kv_a_t, kernels.hidden, kernels.kv_out_dim);
         prestage_weights_transposed(&o_in, &w_o_t, kernels.v_total, kernels.hidden);
 
-        kernels.layer_inputs.push([q_a_in, q_b_in, kv_a_in, o_in]);
+        layer_inputs.push([q_a_in, q_b_in, kv_a_in, o_in]);
     }
 
     let elapsed = t.elapsed().as_secs_f64();
