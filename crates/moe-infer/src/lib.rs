@@ -6,6 +6,7 @@
 //! 3. MoE routing + expert FFN dispatch
 //! 4. Output projection + sampling
 
+pub mod ane_mla;
 pub mod attention;
 pub mod blas;
 pub mod config;
