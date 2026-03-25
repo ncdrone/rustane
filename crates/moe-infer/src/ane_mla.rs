@@ -347,6 +347,7 @@ pub fn prestage_all_layers(
 }
 
 /// Dispatch using per-layer pre-staged IOSurface (0ms staging, only activation write).
+/// Uses direct fp16 I/O for both input and output — bypasses full buffer conversion.
 pub fn ane_projection_layered(
     exec: &Executable,
     layer_input: &TensorData,  // per-layer, weights pre-staged
@@ -356,17 +357,20 @@ pub fn ane_projection_layered(
     oc: usize,
 ) -> Result<Vec<f32>, String> {
     let sp = layer_input.shape().width;
-    // Direct fp16 activation write (14 KB, not 46 MB)
+    // Direct fp16 activation write: IC values at stride SP (~14 KB for K2)
     unsafe {
         ane_bridge::stage_activation_fp16(layer_input, activation, ic, sp);
     }
+    // ANE dispatch
     exec.run_cached_direct(&[layer_input], &[output_buf])
         .map_err(|e| format!("ANE dispatch: {e}"))?;
+    // Direct fp16 output read: OC values at position 0 per channel
+    // Reads OC fp16 values (~24 KB for K2 q_b) instead of converting
+    // entire padded buffer (786K elements = 3 MB for q_b)
     let out_sp = output_buf.shape().width;
-    let out_buf = output_buf.as_f32_slice();
     let mut result = vec![0.0f32; oc];
-    for c in 0..oc {
-        result[c] = out_buf[c * out_sp];
+    unsafe {
+        ane_bridge::read_output_fp16(output_buf, &mut result, oc, out_sp);
     }
     Ok(result)
 }

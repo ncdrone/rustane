@@ -60,3 +60,26 @@ pub unsafe fn stage_activation_fp16(
     }
     surf.unlockWithOptions_seed(objc2_io_surface::IOSurfaceLockOptions(0), std::ptr::null_mut());
 }
+
+/// Read output from IOSurface: reads OC fp16 values at position 0 per channel (stride SP).
+/// Avoids converting the entire padded output buffer (64x less data for seq=1 decode).
+///
+/// For K2 q_b output [12288, 64]: reads 12288 fp16 values instead of converting 786K.
+///
+/// # Safety
+/// IOSurface must contain valid fp16 data from ANE dispatch.
+pub unsafe fn read_output_fp16(
+    surface: &ane::TensorData,
+    output: &mut [f32],
+    channels: usize,
+    sp: usize,
+) {
+    let surf = surface.surface();
+    surf.lockWithOptions_seed(objc2_io_surface::IOSurfaceLockOptions::ReadOnly, std::ptr::null_mut());
+    let base = surf.baseAddress().as_ptr().cast::<u16>();
+    for c in 0..channels {
+        let bits = std::ptr::read(base.add(c * sp));
+        output[c] = half::f16::from_bits(bits).to_f32();
+    }
+    surf.unlockWithOptions_seed(objc2_io_surface::IOSurfaceLockOptions::ReadOnly, std::ptr::null_mut());
+}
