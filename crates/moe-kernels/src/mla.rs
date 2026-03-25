@@ -318,6 +318,37 @@ pub fn build_mla_grouped_absorption(
     g
 }
 
+/// Build a Conv1x1 projection with BAKED weights (compile-time constants).
+///
+/// Input IOSurface: [1, IC, 1, padded_seq] — activation only (no weight staging!)
+/// Output: [1, OC, 1, padded_seq]
+///
+/// Weights are embedded in the compiled program via g.constant().
+/// Zero per-token staging overhead. Compile once per layer, dispatch forever.
+pub fn build_mla_conv1x1_baked(ic: usize, oc: usize, seq: usize, weights: &[f32]) -> Graph {
+    assert_eq!(weights.len(), oc * ic, "weights must be [oc, ic] = [{oc}, {ic}]");
+    let padded_seq = pad16(seq);
+    let mut g = Graph::new();
+
+    // Input: activation only [1, IC, 1, padded_seq]
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: padded_seq });
+
+    // Baked weight constant: [OC, IC, 1, 1] (conv filter format)
+    // Transpose weights from [OC, IC] row-major to conv filter layout
+    let mut filter_data = vec![0.0f32; oc * ic];
+    for j in 0..oc {
+        for i in 0..ic {
+            filter_data[j * ic + i] = weights[j * ic + i];
+        }
+    }
+    let weight_const = g.constant(&filter_data, Shape { batch: oc, channels: ic, height: 1, width: 1 });
+
+    // Conv1x1 with baked weights: [1, IC, 1, padded_seq] * [OC, IC, 1, 1] → [1, OC, 1, padded_seq]
+    let _out = g.convolution_2d_1x1(input, weight_const, None);
+
+    g
+}
+
 /// Spatial width needed for a Conv1x1 projection IOSurface.
 /// Accounts for ANE minimum spatial width ≥ 64.
 pub fn conv1x1_spatial_width(seq: usize, oc: usize) -> usize {
