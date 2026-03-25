@@ -101,8 +101,9 @@ pub fn compile_mla_kernels(
     })
 }
 
-/// Pre-stage weights into an IOSurface buffer (called once per layer change).
-/// Avoids the O(ic*oc) transpose in the hot decode loop.
+/// Pre-stage weights into an IOSurface buffer using copy_from_f32.
+/// Prepares the full f32 buffer (activation zeros + transposed weights),
+/// then converts the entire buffer to fp16 in one bulk NEON pass.
 pub fn prestage_weights(
     input_buf: &TensorData,
     weights: &[f32],  // [oc, ic] row-major
@@ -111,15 +112,18 @@ pub fn prestage_weights(
 ) {
     let sp = input_buf.shape().width;
     let padded_seq = moe_kernels::mla::padded_seq(1);
-    let mut buf = input_buf.as_f32_slice_mut();
-    // Zero and write W^T
-    for v in buf.iter_mut() { *v = 0.0; }
+    let total = ic * sp;
+
+    // Build the full buffer in f32 (activation zeros + transposed weights)
+    let mut full_buf = vec![0.0f32; total];
     for c in 0..ic {
         let dst = c * sp + padded_seq;
         for j in 0..oc {
-            buf[dst + j] = weights[j * ic + c];
+            full_buf[dst + j] = weights[j * ic + c];
         }
     }
+    // Bulk f32→fp16 conversion via NEON (one pass, not per-lock)
+    input_buf.copy_from_f32(&full_buf);
 }
 
 /// Fast dispatch: stage activation via direct fp16 writes, weights already pre-staged.
