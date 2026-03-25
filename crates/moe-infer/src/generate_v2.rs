@@ -674,29 +674,52 @@ fn ane_mla_forward_decode(
     let kv_rank = cfg.kv_lora_rank;
     let hidden = cfg.hidden_size;
 
-    // Prestage weights only if layer changed (weights persist in IOSurface between tokens).
-    // First token for each layer: ~90ms transpose + staging.
-    // Subsequent tokens for same layer: skip (0ms).
-    if ane.staged_layer.get() != Some(layer) {
-        if let (Some(q_a), Some(q_b)) = (&weights.q_a_proj, &weights.q_b_proj) {
-            let q_lora_rank = q_a.len() / hidden;
-            let w_qa_t = crate::ane_mla::transpose_weights(q_a, hidden, q_lora_rank);
-            let w_qb_t = crate::ane_mla::transpose_weights(q_b, q_lora_rank, cfg.q_total_dim());
-            let w_kv_a_t = crate::ane_mla::transpose_weights(&weights.kv_a_proj, hidden, kv_rank + rope_dim);
-            let w_o_t = crate::ane_mla::transpose_weights(&weights.o_proj, h * v_dim, hidden);
-            crate::ane_mla::prestage_mla_layer_transposed(
-                ane, &w_qa_t, &w_qb_t, &w_kv_a_t, &w_o_t,
-            );
+    // Use per-layer pre-staged IOSurfaces if available (0ms staging).
+    // Falls back to per-token staging if layer_inputs not populated.
+    let use_layered = layer < ane.layer_inputs.len();
+
+    if !use_layered {
+        // Fallback: prestage per-token (slow, ~90ms/layer)
+        if ane.staged_layer.get() != Some(layer) {
+            if let (Some(q_a), Some(q_b)) = (&weights.q_a_proj, &weights.q_b_proj) {
+                let q_lora_rank = q_a.len() / hidden;
+                let w_qa_t = crate::ane_mla::transpose_weights(q_a, hidden, q_lora_rank);
+                let w_qb_t = crate::ane_mla::transpose_weights(q_b, q_lora_rank, cfg.q_total_dim());
+                let w_kv_a_t = crate::ane_mla::transpose_weights(&weights.kv_a_proj, hidden, kv_rank + rope_dim);
+                let w_o_t = crate::ane_mla::transpose_weights(&weights.o_proj, h * v_dim, hidden);
+                crate::ane_mla::prestage_mla_layer_transposed(
+                    ane, &w_qa_t, &w_qb_t, &w_kv_a_t, &w_o_t,
+                );
+            }
+            ane.staged_layer.set(Some(layer));
         }
-        ane.staged_layer.set(Some(layer));
     }
 
-    // 1. Q projection on ANE (LoRA path, fast — weights pre-staged)
+    // 1. Q projection on ANE (LoRA path)
     let q = if let (Some(_q_a), Some(q_a_norm), Some(_q_b)) =
         (&weights.q_a_proj, &weights.q_a_layernorm, &weights.q_b_proj)
     {
-        crate::ane_mla::ane_q_lora_fast(ane, x, q_a_norm, cfg.rms_eps)
-            .unwrap_or_else(|e| {
+        let q_result = if use_layered {
+            let layer_bufs = &ane.layer_inputs[layer];
+            // Q LoRA compress via per-layer IOSurface
+            let q_latent = crate::ane_mla::ane_projection_layered(
+                &ane.q_a_exec, &layer_bufs[0], &ane.q_a_out,
+                x, hidden, ane.q_lora_rank,
+            );
+            match q_latent {
+                Ok(ql) => {
+                    let q_latent_normed = rmsnorm(&ql, q_a_norm, cfg.rms_eps);
+                    crate::ane_mla::ane_projection_layered(
+                        &ane.q_b_exec, &layer_bufs[1], &ane.q_b_out,
+                        &q_latent_normed, ane.q_lora_rank, ane.q_total,
+                    )
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            crate::ane_mla::ane_q_lora_fast(ane, x, q_a_norm, cfg.rms_eps)
+        };
+        q_result.unwrap_or_else(|e| {
                 eprintln!("[ANE] Q LoRA dispatch failed, CPU fallback: {e}");
                 let q_a = weights.q_a_proj.unwrap();
                 let q_b = weights.q_b_proj.unwrap();
@@ -726,10 +749,17 @@ fn ane_mla_forward_decode(
     }
     rope.apply_all_heads(&mut q_pe, h, pos);
 
-    // 2. KV compression on ANE (fast — weights pre-staged)
+    // 2. KV compression on ANE
     let kv_out_dim = kv_rank + rope_dim;
-    let kv_out = crate::ane_mla::ane_kv_compress_fast(ane, x)
-        .unwrap_or_else(|e| {
+    let kv_out = if use_layered {
+        let layer_bufs = &ane.layer_inputs[layer];
+        crate::ane_mla::ane_projection_layered(
+            &ane.kv_a_exec, &layer_bufs[2], &ane.kv_a_out,
+            x, hidden, kv_out_dim,
+        )
+    } else {
+        crate::ane_mla::ane_kv_compress_fast(ane, x)
+    }.unwrap_or_else(|e| {
             eprintln!("[ANE] KV compress dispatch failed, CPU fallback: {e}");
             let mut kv = vec![0.0f32; kv_out_dim];
             crate::blas::sgemv_f32(&weights.kv_a_proj, x, &mut kv, kv_out_dim, hidden);
@@ -782,8 +812,16 @@ fn ane_mla_forward_decode(
     }
 
     // 9. O projection on ANE
-    // 9. O projection on ANE (fast — weights pre-staged)
-    let output = crate::ane_mla::ane_o_proj_fast(ane, &v_concat)
+    // 9. O projection on ANE
+    let output = if use_layered {
+        let layer_bufs = &ane.layer_inputs[layer];
+        crate::ane_mla::ane_projection_layered(
+            &ane.o_exec, &layer_bufs[3], &ane.o_out,
+            &v_concat, h * v_dim, hidden,
+        )
+    } else {
+        crate::ane_mla::ane_o_proj_fast(ane, &v_concat)
+    }
         .unwrap_or_else(|e| {
             eprintln!("[ANE] O proj dispatch failed, CPU fallback: {e}");
             let mut out = vec![0.0f32; hidden];

@@ -43,8 +43,12 @@ pub struct AneMlaKernels {
     pub v_total: usize,
 
     /// Track which layer's weights are currently staged to avoid re-staging.
-    /// Using Cell for interior mutability (single-threaded decode).
     pub staged_layer: std::cell::Cell<Option<usize>>,
+
+    /// Per-layer pre-staged input IOSurfaces (weights baked at load time).
+    /// Indexed by layer. Each entry has [q_a_in, q_b_in, kv_a_in, o_in].
+    /// If populated, decode uses these instead of re-staging weights.
+    pub layer_inputs: Vec<[TensorData; 4]>,
 }
 
 /// Compile all MLA Conv1x1 kernels for a given model configuration.
@@ -103,6 +107,7 @@ pub fn compile_mla_kernels(
         o_exec, o_in, o_out,
         hidden, q_lora_rank, q_total, kv_out_dim, v_total,
         staged_layer: std::cell::Cell::new(None),
+        layer_inputs: Vec::new(), // populated later by prestage_all_layers
     })
 }
 
@@ -291,6 +296,76 @@ pub fn prestage_mla_layer(
     prestage_weights(&kernels.q_b_in, w_qb, kernels.q_lora_rank, kernels.q_total);
     prestage_weights(&kernels.kv_a_in, w_kv_a, kernels.hidden, kernels.kv_out_dim);
     prestage_weights(&kernels.o_in, w_o, kernels.v_total, kernels.hidden);
+}
+
+/// Pre-stage all layers' weights into per-layer IOSurface buffers.
+/// Called once at model load. Memory: ~11 GB for 61 layers (K2).
+/// After this, decode only writes activation fp16 (14 KB per dispatch).
+pub fn prestage_all_layers(
+    kernels: &mut AneMlaKernels,
+    get_layer_weights: impl Fn(usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>),
+    num_layers: usize,
+) {
+    let seq = 1;
+    let q_a_sp = conv1x1_spatial_width(seq, kernels.q_lora_rank);
+    let q_b_sp = conv1x1_spatial_width(seq, kernels.q_total);
+    let kv_a_sp = conv1x1_spatial_width(seq, kernels.kv_out_dim);
+    let o_sp = conv1x1_spatial_width(seq, kernels.hidden);
+
+    let t = std::time::Instant::now();
+    kernels.layer_inputs.clear();
+
+    for layer in 0..num_layers {
+        let (w_qa, w_qb, w_kv_a, w_o) = get_layer_weights(layer);
+
+        // Allocate per-layer IOSurfaces
+        let q_a_in = TensorData::new(Shape { batch: 1, channels: kernels.hidden, height: 1, width: q_a_sp });
+        let q_b_in = TensorData::new(Shape { batch: 1, channels: kernels.q_lora_rank, height: 1, width: q_b_sp });
+        let kv_a_in = TensorData::new(Shape { batch: 1, channels: kernels.hidden, height: 1, width: kv_a_sp });
+        let o_in = TensorData::new(Shape { batch: 1, channels: kernels.v_total, height: 1, width: o_sp });
+
+        // Pre-transpose + stage weights
+        let w_qa_t = transpose_weights(&w_qa, kernels.hidden, kernels.q_lora_rank);
+        let w_qb_t = transpose_weights(&w_qb, kernels.q_lora_rank, kernels.q_total);
+        let w_kv_a_t = transpose_weights(&w_kv_a, kernels.hidden, kernels.kv_out_dim);
+        let w_o_t = transpose_weights(&w_o, kernels.v_total, kernels.hidden);
+
+        prestage_weights_transposed(&q_a_in, &w_qa_t, kernels.hidden, kernels.q_lora_rank);
+        prestage_weights_transposed(&q_b_in, &w_qb_t, kernels.q_lora_rank, kernels.q_total);
+        prestage_weights_transposed(&kv_a_in, &w_kv_a_t, kernels.hidden, kernels.kv_out_dim);
+        prestage_weights_transposed(&o_in, &w_o_t, kernels.v_total, kernels.hidden);
+
+        kernels.layer_inputs.push([q_a_in, q_b_in, kv_a_in, o_in]);
+    }
+
+    let elapsed = t.elapsed().as_secs_f64();
+    eprintln!("[ANE] Pre-staged {num_layers} layers in {elapsed:.1}s ({:.0} MB total)",
+        num_layers as f64 * 4.0 * q_a_sp as f64 * kernels.hidden as f64 * 4.0 / 1e6);
+}
+
+/// Dispatch using per-layer pre-staged IOSurface (0ms staging, only activation write).
+pub fn ane_projection_layered(
+    exec: &Executable,
+    layer_input: &TensorData,  // per-layer, weights pre-staged
+    output_buf: &TensorData,
+    activation: &[f32],
+    ic: usize,
+    oc: usize,
+) -> Result<Vec<f32>, String> {
+    let sp = layer_input.shape().width;
+    // Direct fp16 activation write (14 KB, not 46 MB)
+    unsafe {
+        ane_bridge::stage_activation_fp16(layer_input, activation, ic, sp);
+    }
+    exec.run_cached_direct(&[layer_input], &[output_buf])
+        .map_err(|e| format!("ANE dispatch: {e}"))?;
+    let out_sp = output_buf.shape().width;
+    let out_buf = output_buf.as_f32_slice();
+    let mut result = vec![0.0f32; oc];
+    for c in 0..oc {
+        result[c] = out_buf[c * out_sp];
+    }
+    Ok(result)
 }
 
 /// Run Q LoRA projection on ANE (fast path — weights pre-staged).
