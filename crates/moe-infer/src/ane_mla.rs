@@ -41,6 +41,10 @@ pub struct AneMlaKernels {
     pub q_total: usize,
     pub kv_out_dim: usize, // kv_lora_rank + rope_dim
     pub v_total: usize,
+
+    /// Track which layer's weights are currently staged to avoid re-staging.
+    /// Using Cell for interior mutability (single-threaded decode).
+    pub staged_layer: std::cell::Cell<Option<usize>>,
 }
 
 /// Compile all MLA Conv1x1 kernels for a given model configuration.
@@ -98,6 +102,7 @@ pub fn compile_mla_kernels(
         kv_a_exec, kv_a_in, kv_a_out,
         o_exec, o_in, o_out,
         hidden, q_lora_rank, q_total, kv_out_dim, v_total,
+        staged_layer: std::cell::Cell::new(None),
     })
 }
 
