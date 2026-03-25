@@ -737,6 +737,42 @@ impl MetalDequantGemv {
     }
 
     /// Compute y = packed_weights @ x, returning elapsed time in seconds.
+    /// GPU-side timing: returns (result, cpu_secs, gpu_secs).
+    /// Uses MTLCommandBuffer.GPUStartTime/GPUEndTime for precise GPU timing.
+    pub fn gemv_gpu_timed(&self, weights: &PackedWeights4Bit, x: &[f32]) -> (Vec<f32>, f64, f64) {
+        assert_eq!(x.len(), weights.in_features);
+        let out_n = weights.out_features;
+        let mut y = vec![0.0f32; out_n];
+        let (packed_buf, scales_buf, zeros_buf, x_buf, y_buf, in_feat_buf, group_buf) =
+            self.create_buffers(weights, x, &y);
+        // Warmup
+        {
+            let cmd = self.queue.commandBuffer().expect("cmd");
+            let enc = cmd.computeCommandEncoder().expect("enc");
+            self.encode_dispatch(&enc, &packed_buf, &scales_buf, &zeros_buf,
+                &x_buf, &y_buf, &in_feat_buf, &group_buf, out_n);
+            enc.endEncoding();
+            cmd.commit();
+            unsafe { cmd.waitUntilCompleted(); }
+        }
+        // Timed
+        let t0 = std::time::Instant::now();
+        let cmd = self.queue.commandBuffer().expect("cmd");
+        let enc = cmd.computeCommandEncoder().expect("enc");
+        self.encode_dispatch(&enc, &packed_buf, &scales_buf, &zeros_buf,
+            &x_buf, &y_buf, &in_feat_buf, &group_buf, out_n);
+        enc.endEncoding();
+        cmd.commit();
+        unsafe { cmd.waitUntilCompleted(); }
+        let cpu_secs = t0.elapsed().as_secs_f64();
+        let gpu_secs = unsafe { cmd.GPUEndTime() - cmd.GPUStartTime() };
+        unsafe {
+            let src = y_buf.contents().as_ptr() as *const f32;
+            std::ptr::copy_nonoverlapping(src, y.as_mut_ptr(), out_n);
+        }
+        (y, cpu_secs, gpu_secs)
+    }
+
     pub fn gemv_timed(&self, weights: &PackedWeights4Bit, x: &[f32]) -> (Vec<f32>, f64) {
         assert_eq!(x.len(), weights.in_features);
 
