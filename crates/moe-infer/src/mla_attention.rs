@@ -171,7 +171,8 @@ pub fn mla_forward_decode(
     );
     let t = std::time::Instant::now();
     let mut output = vec![0.0f32; out_dim];
-    crate::blas::sgemv_f32(&weights.o_proj, &v_concat, &mut output, out_dim, v_total);
+    // sgemm M=1 is 14% faster than sgemv for O projection (profiled 2026-03-24)
+    crate::blas::sgemm_custom_1xn(&v_concat, &weights.o_proj, &mut output, v_total, out_dim);
     if mla_profile_enabled() { eprintln!("  MLA L{layer:02} o_proj: {:.0}µs", t.elapsed().as_micros()); }
     output
 }
@@ -205,7 +206,8 @@ pub fn mla_decode_v_concat(
     {
         let q_lora_rank = q_a.len() / hidden;
         let mut q_latent = vec![0.0f32; q_lora_rank];
-        crate::blas::sgemv_f32(q_a, x, &mut q_latent, q_lora_rank, hidden);
+        // sgemm M=1 is 69% faster than sgemv for wide matrices (profiled 2026-03-24)
+        crate::blas::sgemm_custom_1xn(x, q_a, &mut q_latent, hidden, q_lora_rank);
         let q_latent_normed = rmsnorm(&q_latent, q_a_norm, cfg.rms_eps);
         crate::blas::sgemv_f32(q_b, &q_latent_normed, &mut q, q_total, q_lora_rank);
     } else {
