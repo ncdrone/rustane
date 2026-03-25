@@ -770,10 +770,19 @@ fn run_mla_only(
     let normed = rmsnorm(x, &lf.input_norm, eps);
     let attn_weights = make_attn_weights(lf);
 
-    let attn_out = mla_forward_decode(
-        &normed, &attn_weights, cache, layer, pos,
-        &model.rope, &model.mla_config, model.attn_scale,
-    );
+    let use_ane = model.ane_mla.is_some() && ane_mla_enabled();
+    let attn_out = if use_ane {
+        let ane = model.ane_mla.as_ref().unwrap();
+        ane_mla_forward_decode(
+            &normed, &attn_weights, ane, cache, layer, pos,
+            &model.rope, &model.mla_config, model.attn_scale,
+        )
+    } else {
+        mla_forward_decode(
+            &normed, &attn_weights, cache, layer, pos,
+            &model.rope, &model.mla_config, model.attn_scale,
+        )
+    };
 
     let mut residual = vec![0.0f32; hidden];
     for d in 0..hidden { residual[d] = x[d] + attn_out[d]; }
@@ -1577,10 +1586,9 @@ pub fn generate_v2(
                     &buf_a
                 };
 
-                // Phase 1: MLA attention — no background thread, full memory bandwidth.
-                // NOTE: Overlapping conversion with MLA tested (iter 17) — REGRESSION:
-                // MLA doubled from 135ms to 270ms due to DRAM bandwidth contention.
-                // MLA sgemv needs full 273 GB/s bandwidth; conversion steals half.
+                // Phase 1: MLA attention.
+                // CPU path: no background thread (sgemv needs full 273 GB/s bandwidth — iter 17).
+                // ANE path: ANE has its own memory path, doesn't contend with DRAM.
                 let t_mla = std::time::Instant::now();
                 let (mut residual, normed2) = run_mla_only(
                     model, &mut cache, layer, &x, pos, lf,
