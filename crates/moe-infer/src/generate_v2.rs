@@ -175,6 +175,8 @@ pub struct ModelV2 {
     pub pool_metal_bufs: std::cell::UnsafeCell<Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>>,
     /// ANE MLA kernels (Conv1x1 projections). None if ANE unavailable or compilation failed.
     pub ane_mla: Option<crate::ane_mla::AneMlaKernels>,
+    /// ANE shared expert FFN kernels (gate+up+down Conv1x1). None if ANE unavailable.
+    pub ane_shared_ffn: Option<crate::ane_mla::AneSharedFfnKernels>,
 }
 
 /// Sampling configuration.
@@ -370,6 +372,7 @@ impl ModelV2 {
         };
 
         let ane_mla = Self::try_compile_ane(&mla_config);
+        let ane_shared_ffn = Self::try_compile_shared_ffn(&config);
 
         Ok(Self {
             weights, config, mla_config, rope, attn_scale,
@@ -379,7 +382,25 @@ impl ModelV2 {
             pool_metal_bufs: std::cell::UnsafeCell::new(vec![None; pool_buffers.len()]),
             pool_buffers: std::cell::UnsafeCell::new(pool_buffers),
             ane_mla,
+            ane_shared_ffn,
         })
+    }
+
+    /// Attempt to compile ANE shared expert FFN kernels.
+    fn try_compile_shared_ffn(cfg: &InferConfig) -> Option<crate::ane_mla::AneSharedFfnKernels> {
+        let hidden = cfg.hidden_size();
+        let inter = cfg.moe_inter_size();
+        if inter == 0 { return None; }
+        match crate::ane_mla::compile_shared_ffn_kernels(hidden, inter) {
+            Ok(kernels) => {
+                eprintln!("[ANE] Shared FFN kernels compiled: 3 Conv1x1 graphs (gate, up, down) — {hidden}↔{inter}");
+                Some(kernels)
+            }
+            Err(e) => {
+                eprintln!("[ANE] Shared FFN compile failed, falling back to CPU: {e}");
+                None
+            }
+        }
     }
 
     /// Attempt to compile ANE MLA kernels. Returns None on failure (graceful fallback to CPU).

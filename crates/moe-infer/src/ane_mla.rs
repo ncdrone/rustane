@@ -204,3 +204,103 @@ pub fn ane_o_proj(
         v_concat, w_o, kernels.v_total, kernels.hidden,
     )
 }
+
+// ---------------------------------------------------------------------------
+// Shared expert FFN on ANE (E06-D)
+//
+// Shared expert: gate[hidden→inter] + up[hidden→inter] + SiLU fusion + down[inter→hidden]
+// Each projection fits in 32MB SRAM individually:
+//   7168 × 2048 × 2 bytes = 28.7 MB (under 32 MB cliff)
+// SiLU stays on CPU (element-wise, no ANE advantage for dynamic weights).
+// ---------------------------------------------------------------------------
+
+/// Pre-compiled ANE graphs for shared expert FFN projections.
+pub struct AneSharedFfnKernels {
+    pub gate_exec: Executable,
+    pub gate_in: TensorData,
+    pub gate_out: TensorData,
+
+    pub up_exec: Executable,
+    pub up_in: TensorData,
+    pub up_out: TensorData,
+
+    pub down_exec: Executable,
+    pub down_in: TensorData,
+    pub down_out: TensorData,
+
+    pub hidden: usize,
+    pub inter: usize,
+}
+
+/// Compile shared expert FFN Conv1x1 kernels.
+/// Total compilations: 3 (gate, up, down). Running total with MLA: 7/119.
+pub fn compile_shared_ffn_kernels(
+    hidden: usize,
+    inter: usize,
+) -> Result<AneSharedFfnKernels, String> {
+    let qos = NSQualityOfService::UserInteractive;
+    let seq = 1;
+
+    // gate: [hidden → inter]
+    let gate_graph = build_mla_conv1x1(hidden, inter, seq);
+    let gate_exec = gate_graph.compile(qos).map_err(|e| format!("gate compile: {e}"))?;
+    let gate_sp = conv1x1_spatial_width(seq, inter);
+    let gate_in = TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: gate_sp });
+    let gate_out = TensorData::new(Shape { batch: 1, channels: inter, height: 1, width: seq });
+
+    // up: [hidden → inter] (same shape as gate, but separate exec for clarity)
+    let up_graph = build_mla_conv1x1(hidden, inter, seq);
+    let up_exec = up_graph.compile(qos).map_err(|e| format!("up compile: {e}"))?;
+    let up_in = TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: gate_sp });
+    let up_out = TensorData::new(Shape { batch: 1, channels: inter, height: 1, width: seq });
+
+    // down: [inter → hidden]
+    let down_graph = build_mla_conv1x1(inter, hidden, seq);
+    let down_exec = down_graph.compile(qos).map_err(|e| format!("down compile: {e}"))?;
+    let down_sp = conv1x1_spatial_width(seq, hidden);
+    let down_in = TensorData::new(Shape { batch: 1, channels: inter, height: 1, width: down_sp });
+    let down_out = TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: seq });
+
+    Ok(AneSharedFfnKernels {
+        gate_exec, gate_in, gate_out,
+        up_exec, up_in, up_out,
+        down_exec, down_in, down_out,
+        hidden, inter,
+    })
+}
+
+/// Run shared expert FFN on ANE: gate + up → SiLU (CPU) → down.
+pub fn ane_shared_ffn(
+    kernels: &AneSharedFfnKernels,
+    x: &[f32],
+    w_gate: &[f32],  // [inter, hidden] row-major
+    w_up: &[f32],    // [inter, hidden] row-major
+    w_down: &[f32],  // [hidden, inter] row-major
+) -> Result<Vec<f32>, String> {
+    // gate: x[hidden] → gate_out[inter]
+    let gate_out = ane_projection(
+        &kernels.gate_exec, &kernels.gate_in, &kernels.gate_out,
+        x, w_gate, kernels.hidden, kernels.inter,
+    )?;
+
+    // up: x[hidden] → up_out[inter]
+    let up_out = ane_projection(
+        &kernels.up_exec, &kernels.up_in, &kernels.up_out,
+        x, w_up, kernels.hidden, kernels.inter,
+    )?;
+
+    // SiLU fusion (CPU — element-wise, trivial)
+    let mut gated = vec![0.0f32; kernels.inter];
+    for i in 0..kernels.inter {
+        let silu = gate_out[i] / (1.0 + (-gate_out[i]).exp());
+        gated[i] = silu * up_out[i];
+    }
+
+    // down: gated[inter] → out[hidden]
+    let out = ane_projection(
+        &kernels.down_exec, &kernels.down_in, &kernels.down_out,
+        &gated, w_down, kernels.inter, kernels.hidden,
+    )?;
+
+    Ok(out)
+}
