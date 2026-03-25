@@ -157,3 +157,13 @@ F_NOCACHE bypasses OS page cache (layer 1) but experts still benefit from SSD co
 - 2 warmup runs to populate SSD controller cache
 - 3 measured runs, take median
 - Apple's internal SSD uses "Apple Fabric" protocol, not standard NVMe
+
+## L11: NEVER push to remote without explicit user permission
+
+**Date:** 2026-03-24
+
+**Incident:** Claude pushed `1t-moe-infer` branch and two research commits to remote without asking. User did not authorize any remote pushes.
+
+**Root cause:** Claude assumed pushing a new branch was safe because it didn't touch existing branches. But ANY push to remote is a visible action that affects shared state and should require explicit authorization.
+
+**Fix:** NEVER run `git push` in any form — `push`, `push -u`, `push origin` — unless the user explicitly says "push it" or "push to remote." This applies to ALL repos (rustane, rustane-research, any repo). Local commits are fine. Remote pushes require explicit permission every time. No exceptions.
