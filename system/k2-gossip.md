@@ -29,15 +29,64 @@ Apple SSD uses "Apple Fabric" protocol, not standard NVMe.
 - NVMe SSD: 17.5 GB/s pread
 
 ## Per-Layer Breakdown (MEASURED, warm, with F_NOCACHE)
-- **MLA: ~2.2ms/layer** (22%) — Q LoRA (1.3ms) + o_proj (1.2ms) dominate
-- **FFN: ~7ms/layer** (72%) — max(pread ~3-5ms, shared_ffn ~1.5-2.7ms) + Metal ~3ms
-- **convert_wait: ~24ms total** (~0.4ms/layer) — f16→f32 conversion mostly hidden behind FFN, but some layers take slightly longer. Cannot overlap with MLA (iter 17: MLA needs full bandwidth).
-- **lm_head: 24ms** (4%) — single-threaded cblas_sgemv, already bandwidth-saturated
-- **other: ~1ms total** (<1%) — thread::scope overhead + residual adds
-- **Previous (no F_NOCACHE)**: FFN was 9ms/layer due to page cache pollution + bandwidth contention
+- **MLA: ~1.9ms/layer** (19%) — o_proj 925µs (48% of MLA), q_proj 586µs (30%), w_uv 166µs, w_uk 119µs, kv 117µs
+- **FFN: ~7.1ms/layer** (71%) — max(pread ~3-5ms, shared_ffn ~1.5-2.7ms) + Metal ~3ms
+- **convert_wait: ~38ms total** (~0.6ms/layer) — hidden behind FFN
+- **lm_head: 19ms** (3%)
+- **other: ~1.5ms total** (0.2%)
+
+## Metal GPU Profiling (2026-03-24, GPU-side timestamps)
+- **Expert gate+up [7168→2048]**: CPU 486µs, GPU 245µs → 50% CPU overhead!
+- **Expert down [2048→7168]**: CPU 567µs, GPU 347µs → 39% CPU overhead!
+- **GPU bandwidth: 22-32 GB/s = 5-8% of M4 Max 400 GB/s peak**
+- Root cause: expert matrices too small (7.8 MB) to saturate 40 GPU EUs
+- FIX: batch 8 experts into SINGLE dispatch → eliminate 7× CPU overhead (241µs each)
+- Projected savings: 103ms/token from CPU overhead + higher GPU bandwidth = 17-25% speedup
+
+## MLA Component Breakdown (per-layer, RUSTANE_MLA_PROFILE=1)
+- o_proj: 925µs (48%) — #1 MLA target, bandwidth-bound [8192→7168]
+- q_proj (Q LoRA): 586µs (30%) — two sgemv calls [7168→1536] + [1536→12288]
+- value_recon+w_uv: 166µs (9%)
+- w_uk_absorb: 119µs (6%) — 64 sequential tiny sgemv
+- kv_compress: 117µs (6%)
+- attn_scores+softmax: 2µs (0.1%) — negligible
+
+## ANE Findings (2026-03-24, comprehensive profiling)
+- ANE for single-token decode: SLOWER than CPU (proven across all approaches)
+- ANE crossover at seq=2 tokens for all projections (HUGE for prefill/spec-decode)
+- ANE at seq=64: 5-35x faster than CPU on every projection
+- 119 compile limit GONE on macOS 26.3 (150+ compiles succeed)
+- Baked matmul weights compile at all K2 dims (even 117 MB O projection)
+- Conv1x1 fails on asymmetric dims (compiler tiling bug) — use matmul instead
+- IOSurface spatial width must be ≥ 64 (not just mod-16), silent garbage below
+- ANE shared gate [7168→2048] is 1.75x faster than CPU (only projection where ANE wins at seq=1)
 
 ## The Goal
 Get tok/s as high as possible. Theoretical max ~5 tok/s.
+
+## PRIORITY: K2-FFN — Metal Expert Dispatch Optimization (71% of decode)
+This is the K2-FFN optimization variant. The #1 target is METAL EXPERT DISPATCH.
+MLA and ANE have been exhaustively profiled and the remaining wins are marginal.
+Metal FFN is 71% of decode and running at 5-8% GPU bandwidth utilization.
+
+### K2-FFN Experiment Queue (in priority order)
+1. **Batch 8 experts into single Metal dispatch** — eliminate 7× CPU overhead (241µs each = 1.7ms/layer). GPU at 5-8% bandwidth because expert matrices (7.8 MB) too small for 40 EUs. Batching → 62.4 MB → closer to peak.
+2. **Restore x_cache[7168] in fused_gate_up_silu kernel** — 28 KB fits 32 KB TG memory. Currently reading x from device memory (removed due to old x_cache[4096] OOB). 8 rows share same x = 7× redundant device reads eliminated.
+3. **Single command buffer for fused+down** — currently 2 separate commit+wait per expert. Single cmdbuf eliminates 1 roundtrip per expert.
+4. **Fuse fused+down into single kernel** — eliminate intermediate buffer write/read between gate+up+SiLU and down projection.
+5. **BF16 x vector** — half the x bandwidth (Metal 4 supports BF16 natively).
+
+### Key files for Metal kernel work
+- `crates/moe-kernels/src/dequant.rs` — Metal shader source + dispatch logic
+- `fused_gate_up_silu` kernel (line ~197) — gate+up+SiLU fused, ROWS_PER_TG=8
+- `dequant_4bit_gemv_v2` kernel (line ~121) — down projection
+- `MetalDequantGemv::fused_and_down_single_cmdbuf` (line ~529) — dispatch orchestration
+- New: `gemv_gpu_timed()` — GPU-side timing via GPUStartTime/GPUEndTime
+
+### Metal profiling infrastructure (already on 1t-moe-infer branch)
+- `crates/moe-kernels/tests/test_metal_gpu_timing.rs` — GPU-side timing test
+- `crates/moe-infer/tests/profile_full_system.rs` — comprehensive system profiler
+- `gemv_gpu_timed()` on MetalDequantGemv — returns (result, cpu_secs, gpu_secs)
 
 ## Iteration Log
 

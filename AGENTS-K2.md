@@ -1,7 +1,8 @@
 # AGENTS-K2.md — Kimi-K2 (1T) Inference Optimization
 
 Optimize Kimi-K2 (1 trillion parameters) inference on Apple M4 Max 128GB.
-Current: 1.3 tok/s. Goal: as fast as possible.
+Current: 1.75 tok/s. Goal: as fast as possible.
+**Variant: K2-FFN** — Metal expert dispatch is 71% of decode at 5-8% GPU bandwidth utilization.
 
 ## Build & Test
 
@@ -32,7 +33,7 @@ cargo run -p moe-infer --release --bin infer -- \
 ### Tier 2 — Performance (median of 3, must not regress >5%)
 | Metric | Baseline | Command |
 |--------|----------|---------|
-| K2 warm decode tok/s | 1.3 | `bench_k2_tok_per_sec` |
+| K2 warm decode tok/s | 1.75 | `bench_k2_tok_per_sec` |
 
 ## Locked Files
 ```
@@ -51,12 +52,17 @@ Three compute units available:
 - **Metal GPU**: 15 TFLOPS — currently handles expert INT4 dispatch only
 - **ANE**: 17.8 TFLOPS — currently **UNUSED** (ane-bridge crate exists, was used for Qwen3 prefill)
 
-Current decode per layer (~12.4 ms):
+Current decode per layer (~10 ms warm):
 ```
-MoE FFN:     ~8 ms   (experts pread + Metal dispatch + shared FFN)
-MLA attn:    ~0.4 ms (64 heads, Q LoRA, sgemm scores, O proj)
-Other:       ~4 ms   (conversion, norms, Metal overhead, L2 misses)
+MoE FFN:     ~7.1 ms (71%) — pread 3-5ms + Metal fused 245µs GPU + Metal down 347µs GPU
+                              BUT: 50% of Metal wall time is CPU cmd buffer overhead!
+                              GPU bandwidth: 22-32 GB/s = 5-8% of M4 Max 400 GB/s peak
+MLA attn:    ~1.9 ms (19%) — o_proj 925µs, q_proj 586µs, w_uk 119µs, kv 117µs, w_uv 166µs
+convert:     ~0.6 ms (6%)  — f16→f32 hidden behind FFN
+lm_head:     ~19 ms  (3%)  — once per token, not per layer
 ```
+
+METAL FFN IS THE TARGET. GPU is barely utilized. CPU overhead dominates Metal dispatch.
 
 ## Memory Budget
 ```
@@ -76,8 +82,15 @@ crates/moe-infer/src/weights.rs        ← weight loading
 crates/expert-pager/src/pool.rs        ← expert pool (built, NOT wired into decode)
 crates/expert-pager/src/loader.rs      ← pread loader
 crates/moe-router/src/lib.rs           ← sigmoid routing
-crates/ane-bridge/src/                 ← ANE private API (UNUSED for decode)
+crates/ane-bridge/src/                 ← ANE private API (for prefill, not decode)
+crates/moe-kernels/src/dequant.rs     ← **Metal shaders + dispatch** (PRIMARY TARGET)
 configs/kimi-k2.toml                   ← K2 config
+```
+
+## Metal Kernel Profiling (use gemv_gpu_timed for GPU-side timing)
+```rust
+let (result, cpu_secs, gpu_secs) = metal.gemv_gpu_timed(&weights, &x);
+// gpu_secs uses MTLCommandBuffer.GPUStartTime/GPUEndTime — precise GPU timing
 ```
 
 ## Rules
