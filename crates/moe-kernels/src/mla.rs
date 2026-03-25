@@ -349,6 +349,35 @@ pub fn build_mla_conv1x1_baked(ic: usize, oc: usize, seq: usize, weights: &[f32]
     g
 }
 
+/// Build a matmul projection with BAKED weights (compile-time constants).
+/// Workaround for conv1x1 failing on asymmetric dimensions.
+///
+/// Input: [1, IC, 1, padded_seq] — activation
+/// Output: [1, OC, 1, padded_seq]
+pub fn build_mla_matmul_baked(ic: usize, oc: usize, seq: usize, weights: &[f32]) -> Graph {
+    assert_eq!(weights.len(), oc * ic);
+    let padded_seq = pad16(seq);
+    let mut g = Graph::new();
+
+    // Input: [1, IC, 1, padded_seq]
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: padded_seq });
+
+    // Reshape input for matmul: [1, IC, 1, padded_seq] → [1, 1, padded_seq, IC]
+    let acts = g.reshape(input, Shape { batch: 1, channels: 1, height: padded_seq, width: ic });
+
+    // Baked weight constant: [1, 1, IC, OC]
+    let weight_const = g.constant(weights, Shape { batch: 1, channels: 1, height: ic, width: oc });
+
+    // Matmul: [1, 1, padded_seq, IC] × [1, 1, IC, OC] → [1, 1, padded_seq, OC]
+    let mm = g.matrix_multiplication(acts, weight_const, false, false);
+
+    // Reshape back: [1, 1, padded_seq, OC] → [1, OC, 1, padded_seq]
+    let mm_t = g.transpose(mm, [0, 1, 3, 2]);
+    let _out = g.reshape(mm_t, Shape { batch: 1, channels: oc, height: 1, width: padded_seq });
+
+    g
+}
+
 /// Spatial width needed for a Conv1x1 projection IOSurface.
 /// Accounts for ANE minimum spatial width ≥ 64.
 pub fn conv1x1_spatial_width(seq: usize, oc: usize) -> usize {
