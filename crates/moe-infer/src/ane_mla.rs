@@ -225,9 +225,56 @@ fn ane_profile_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("RUSTANE_ANE_PROFILE").is_ok())
 }
 
+/// Transpose a weight matrix from [oc, ic] row-major to [ic, oc] row-major.
+/// Suitable for pre-computing at model load time.
+pub fn transpose_weights(weights: &[f32], ic: usize, oc: usize) -> Vec<f32> {
+    let mut transposed = vec![0.0f32; ic * oc];
+    for c in 0..ic {
+        for j in 0..oc {
+            transposed[c * oc + j] = weights[j * ic + c];
+        }
+    }
+    transposed
+}
+
+/// Fast weight prestaging from pre-transposed [IC, OC] row-major weights.
+/// Uses contiguous copy_from_slice per channel (memcpy speed, no cache misses).
+pub fn prestage_weights_transposed(
+    input_buf: &TensorData,
+    weights_t: &[f32],  // [ic, oc] row-major (pre-transposed)
+    ic: usize,
+    oc: usize,
+) {
+    let sp = input_buf.shape().width;
+    let padded_seq = moe_kernels::mla::padded_seq(1);
+    let total = ic * sp;
+    let mut full_buf = vec![0.0f32; total];
+    // Contiguous copy: each channel's oc weights are sequential in weights_t
+    for c in 0..ic {
+        let dst = c * sp + padded_seq;
+        let src = c * oc;
+        full_buf[dst..dst + oc].copy_from_slice(&weights_t[src..src + oc]);
+    }
+    input_buf.copy_from_f32(&full_buf);
+}
+
 /// Pre-stage all 4 MLA projection weights for one layer.
-/// Call once when switching layers (not per token).
-/// Uses copy_from_f32 for bulk conversion (more efficient than element-wise).
+/// Accepts pre-transposed weights for fast staging (contiguous memcpy).
+pub fn prestage_mla_layer_transposed(
+    kernels: &AneMlaKernels,
+    w_qa_t: &[f32],   // [hidden, q_lora_rank] pre-transposed
+    w_qb_t: &[f32],   // [q_lora_rank, q_total] pre-transposed
+    w_kv_a_t: &[f32], // [hidden, kv_out_dim] pre-transposed
+    w_o_t: &[f32],    // [v_total, hidden] pre-transposed
+) {
+    prestage_weights_transposed(&kernels.q_a_in, w_qa_t, kernels.hidden, kernels.q_lora_rank);
+    prestage_weights_transposed(&kernels.q_b_in, w_qb_t, kernels.q_lora_rank, kernels.q_total);
+    prestage_weights_transposed(&kernels.kv_a_in, w_kv_a_t, kernels.hidden, kernels.kv_out_dim);
+    prestage_weights_transposed(&kernels.o_in, w_o_t, kernels.v_total, kernels.hidden);
+}
+
+/// Pre-stage all 4 MLA projection weights for one layer (slow path).
+/// Transposes inline. Use prestage_mla_layer_transposed for production.
 pub fn prestage_mla_layer(
     kernels: &AneMlaKernels,
     w_qa: &[f32],

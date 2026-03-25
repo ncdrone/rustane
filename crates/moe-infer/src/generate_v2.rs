@@ -674,10 +674,16 @@ fn ane_mla_forward_decode(
     let kv_rank = cfg.kv_lora_rank;
     let hidden = cfg.hidden_size;
 
-    // Prestage all 4 projection weights for this layer (slow once, fast dispatch 4x)
+    // Prestage weights: transpose + bulk f32→fp16 once per layer.
+    // Uses contiguous memcpy staging after transpose (fast NEON).
     if let (Some(q_a), Some(q_b)) = (&weights.q_a_proj, &weights.q_b_proj) {
-        crate::ane_mla::prestage_mla_layer(
-            ane, q_a, q_b, &weights.kv_a_proj, &weights.o_proj,
+        let w_qa_t = crate::ane_mla::transpose_weights(q_a, hidden, cfg.kv_lora_rank.max(q_a.len() / hidden));
+        let q_lora_rank = q_a.len() / hidden;
+        let w_qb_t = crate::ane_mla::transpose_weights(q_b, q_lora_rank, cfg.q_total_dim());
+        let w_kv_a_t = crate::ane_mla::transpose_weights(&weights.kv_a_proj, hidden, kv_rank + rope_dim);
+        let w_o_t = crate::ane_mla::transpose_weights(&weights.o_proj, h * v_dim, hidden);
+        crate::ane_mla::prestage_mla_layer_transposed(
+            ane, &w_qa_t, &w_qb_t, &w_kv_a_t, &w_o_t,
         );
     }
 
