@@ -8,8 +8,8 @@
 //! - Absorbed attention avoids explicit KV decompression
 //! - Rolling buffer with GQA support
 //!
-//! For DeepSeek-V3/Kimi-K2:
-//!   kv_lora_rank = 512, hidden_size = 7168, num_heads = 56, kv_heads = 8
+//! For DeepSeek-V3: kv_lora_rank=512, hidden=7168, num_heads=128, kv_heads=128
+//! For Kimi-K2:    kv_lora_rank=512, hidden=7168, num_heads=64,  kv_heads=64
 
 /// MLA configuration.
 #[derive(Clone, Debug)]
@@ -29,12 +29,13 @@ pub struct MlaConfig {
 }
 
 impl MlaConfig {
-    /// DeepSeek-V3 / target-1T configuration.
+    /// DeepSeek-V3 (671B) configuration.
+    /// Source: configs/deepseek-v3.toml (verified against HF config.json)
     pub fn deepseek_v3() -> Self {
         Self {
             hidden_size: 7168,
-            num_heads: 56,
-            num_kv_heads: 8,
+            num_heads: 128,
+            num_kv_heads: 128,
             head_dim: 128,
             kv_lora_rank: 512,
             qk_nope_head_dim: 128,
@@ -42,6 +43,32 @@ impl MlaConfig {
             v_head_dim: 128,
             num_layers: 61,
         }
+    }
+
+    /// Kimi-K2 (1T) configuration.
+    /// Source: configs/kimi-k2.toml (verified against HF config.json)
+    pub fn kimi_k2() -> Self {
+        Self {
+            hidden_size: 7168,
+            num_heads: 64,
+            num_kv_heads: 64,
+            head_dim: 128,
+            kv_lora_rank: 512,
+            qk_nope_head_dim: 128,
+            qk_rope_head_dim: 64,
+            v_head_dim: 128,
+            num_layers: 61,
+        }
+    }
+
+    /// Q total dimension: num_heads × (nope + rope).
+    pub fn q_total_dim(&self) -> usize {
+        self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+    }
+
+    /// V total dimension: num_heads × v_head_dim (= o_proj input dim).
+    pub fn v_total_dim(&self) -> usize {
+        self.num_heads * self.v_head_dim
     }
 
     /// Bytes per token in the compressed KV cache.
@@ -179,4 +206,118 @@ fn matvec(x: &[f32], w: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// ANE Conv1x1 graph builders for MLA decode projections.
+//
+// These use Conv1x1 (3x faster than matmul on ANE per maderix benchmarks).
+// Pattern from engine/src/kernels/dyn_matmul.rs:88 (build_conv).
+//
+// For decode (seq_len=1), we use baked-weight Conv1x1 graphs:
+//   Input:  [1, IC, 1, 1]   — single token activation
+//   Weight: [OC, IC, 1, 1]  — baked at compile time (same dims every layer)
+//   Output: [1, OC, 1, 1]
+//
+// Shape-sharing: all 61 layers use the same dimensions, so we compile 1 graph
+// per projection type and swap weights via IOSurface staging (maderix pattern).
+// ---------------------------------------------------------------------------
+
+use ane_bridge::ane::{Graph, Shape};
+
+/// Pad spatial width to multiple of 16 (ANE requirement — silent corruption otherwise).
+pub fn pad16(x: usize) -> usize {
+    (x + 15) & !15
+}
+
+/// Build a Conv1x1 projection graph with dynamic weights (staged in spatial dim).
+///
+/// Input IOSurface: [1, IC, 1, pad16(seq + OC)]
+///   spatial[0..seq]     = activation
+///   spatial[seq..seq+OC] = weight column-major (IC values per output channel)
+///
+/// Output: [1, OC, 1, seq]
+///
+/// This is the maderix dynamic-weight pattern: weights packed alongside activations
+/// in the spatial dimension. Compile once, stage weights per-layer via memcpy.
+pub fn build_mla_conv1x1(ic: usize, oc: usize, seq: usize) -> Graph {
+    let sp = pad16(seq + oc);
+    let mut g = Graph::new();
+
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: sp });
+
+    // Slice activations: [1, IC, 1, seq]
+    let acts = g.slice(input, [0, 0, 0, 0], [1, ic, 1, seq]);
+
+    // Slice weights: [1, IC, 1, OC]
+    let wts = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
+
+    // Transpose weights: [1, IC, 1, OC] → [1, OC, 1, IC]
+    let wts_t = g.transpose(wts, [0, 3, 2, 1]);
+
+    // Reshape to conv filter: [1, OC, 1, IC] → [OC, IC, 1, 1]
+    let wts_conv = g.reshape(wts_t, Shape { batch: oc, channels: ic, height: 1, width: 1 });
+
+    // Conv1x1: [1, IC, 1, seq] * [OC, IC, 1, 1] → [1, OC, 1, seq]
+    let _out = g.convolution_2d_1x1_dynamic(acts, wts_conv);
+
+    g
+}
+
+/// Build a grouped Conv1x1 for batched per-head absorption (W_UK or W_UV).
+///
+/// Instead of 64 sequential sgemv([nope, kv_rank]) calls, dispatch one grouped conv:
+///   Input:  [1, kv_rank, 1, pad16(1 + num_heads * nope)]
+///     spatial[0]                          = compressed KV token (kv_rank channels)
+///     spatial[1..1+num_heads*nope]        = per-head W_UK weights (kv_rank × nope each)
+///
+///   Output: [1, num_heads * nope, 1, 1]   = all heads absorbed
+///
+/// Uses grouped convolution: groups=num_heads, each group maps kv_rank → nope channels.
+pub fn build_mla_grouped_absorption(
+    kv_rank: usize,
+    nope: usize,
+    num_heads: usize,
+) -> Graph {
+    let total_oc = num_heads * nope;
+    let sp = pad16(1 + total_oc); // 1 token + flattened per-head weights
+    let mut g = Graph::new();
+
+    let input = g.placeholder(Shape { batch: 1, channels: kv_rank, height: 1, width: sp });
+
+    // Slice activation: [1, kv_rank, 1, 1] (single compressed KV token)
+    let acts = g.slice(input, [0, 0, 0, 0], [1, kv_rank, 1, 1]);
+
+    // Slice weights: [1, kv_rank, 1, total_oc]
+    let wts = g.slice(input, [0, 0, 0, 1], [1, kv_rank, 1, total_oc]);
+
+    // Transpose: [1, kv_rank, 1, total_oc] → [1, total_oc, 1, kv_rank]
+    let wts_t = g.transpose(wts, [0, 3, 2, 1]);
+
+    // Reshape to grouped conv filter: [total_oc, kv_rank, 1, 1]
+    // With groups=num_heads: each group has nope output channels, kv_rank input channels
+    let wts_conv = g.reshape(wts_t, Shape {
+        batch: total_oc,
+        channels: kv_rank,
+        height: 1,
+        width: 1,
+    });
+
+    // Grouped Conv1x1: groups=num_heads
+    // Input [1, kv_rank, 1, 1] is broadcast across groups (each group sees all kv_rank channels)
+    // Weight [total_oc, kv_rank, 1, 1] with groups → each group: [nope, kv_rank, 1, 1]
+    // Output: [1, total_oc, 1, 1]
+    let _out = g.convolution_2d_1x1_dynamic(acts, wts_conv);
+
+    g
+}
+
+/// Spatial width needed for a Conv1x1 projection IOSurface.
+pub fn conv1x1_spatial_width(seq: usize, oc: usize) -> usize {
+    pad16(seq + oc)
+}
+
+/// Spatial width needed for grouped absorption IOSurface.
+pub fn absorption_spatial_width(num_heads: usize, nope: usize) -> usize {
+    pad16(1 + num_heads * nope)
 }
