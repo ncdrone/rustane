@@ -8,7 +8,7 @@
 //! If baked Conv1x1 > CPU sgemv: ANE is only for prefill/multi-stream.
 
 use std::time::Instant;
-use moe_kernels::mla::{build_mla_conv1x1_baked, pad16, MlaConfig};
+use moe_kernels::mla::{build_mla_conv1x1_baked, build_mla_matmul_baked, pad16, MlaConfig};
 use ane_bridge::ane::{Shape, TensorData};
 use objc2_foundation::NSQualityOfService;
 
@@ -39,10 +39,10 @@ fn baked_vs_cpu_k2_q_lora_compress() {
     let cpu_us = t.elapsed().as_micros() as f64 / iters as f64;
     eprintln!("CPU sgemv [{}→{}]: {:.0}µs", ic, oc, cpu_us);
 
-    // === ANE baked weight ===
+    // === ANE baked weight (matmul path — conv fails on asymmetric dims) ===
     let t_compile = Instant::now();
-    let graph = build_mla_conv1x1_baked(ic, oc, 1, &weights);
-    let exec = graph.compile(qos).expect("baked compile");
+    let graph = build_mla_matmul_baked(ic, oc, 1, &weights);
+    let exec = graph.compile(qos).expect("baked matmul compile");
     let compile_ms = t_compile.elapsed().as_secs_f64() * 1000.0;
     eprintln!("ANE compile (baked [{}→{}]): {:.1}ms", ic, oc, compile_ms);
 
@@ -134,7 +134,7 @@ fn baked_vs_cpu_all_k2_projections() {
         let cpu_us = t.elapsed().as_micros() as f64 / iters as f64;
 
         // ANE baked
-        let graph = build_mla_conv1x1_baked(ic, oc, 1, &weights);
+        let graph = build_mla_matmul_baked(ic, oc, 1, &weights);
         let exec = match graph.compile(qos) {
             Ok(e) => e,
             Err(e) => { eprintln!("{name}: compile failed: {e}"); continue; }
