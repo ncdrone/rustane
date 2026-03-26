@@ -5,6 +5,11 @@
 .PHONY: help build test sweep-600m sweep-1b sweep-3b sweep-5b sweep-full \
 	forward-ladder forward-ceiling forward-7b forward-10b train-600m submit
 
+STREAMS ?= 1
+USE_LEAN_WORKSPACE ?= 1
+ATTN_SHARDS ?=
+FFN_SHARDS ?=
+
 help: ## Show this help
 	@echo "  Rustane — available commands:"
 	@echo ""
@@ -23,12 +28,18 @@ help: ## Show this help
 	@echo "  make forward-10b          Forward pass at 10B (~45s, needs 46GB)"
 	@echo "  make forward-ladder       Forward pass 5B to 20B (~8 min, needs 93GB)"
 	@echo "  make forward-ceiling      Forward pass 25B/30B (~10 min, needs 130GB)"
+	@echo "  add STREAMS=<N>           Use multistream forward benchmark mode"
+	@echo "  example: make forward-ladder STREAMS=4"
+	@echo "  add ATTN_SHARDS=<1/2/4/8/10>   Attention head sharding for forward benchmarks"
+	@echo "  add FFN_SHARDS=<2/4/6/8/10/12/16> FFN sharding for forward benchmarks"
+	@echo "  examples: make forward-10b FFN_SHARDS=8"
+	@echo "            make forward-ladder ATTN_SHARDS=10 FFN_SHARDS=10"
 	@echo ""
 	@echo "  Training on real data:"
 	@echo "  make train-600m DATA=/path/to/train.bin"
 	@echo ""
 	@echo "  Leaderboard:"
-	@echo "  make submit               Submit last benchmark to bench.rustane.org"
+	@echo "  make submit               Submit queued benchmark results to bench.rustane.org"
 
 build: ## Build all crates
 	cargo build
@@ -39,33 +50,49 @@ test: ## Run all unit + integration tests
 # ── Training validation ─────────────────────────────────────────────
 
 sweep-600m: ## Validate training pipeline at 600M (~17s)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
 
 sweep-1b: ## Validate training pipeline at 1B (~35s)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_1b_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_1b_a
 
 sweep-3b: ## Validate training pipeline at 3B (~80s, needs 55GB)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_3b_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_3b_a
 
 sweep-5b: ## Validate training pipeline at 5B (~150s, needs 85GB)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_5b_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_5b_a
 
 sweep-full: ## Full parameter sweep, 25 configs, 600M-5B (~60 min, needs 85GB)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_full
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_full
 
 # ── Forward-only scale probes ────────────────────────────────────────
 
 forward-ladder: ## Forward pass 5B to 20B (~8 min, needs 93GB)
-	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder
+	@if [ "$(STREAMS)" = "1" ]; then \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder; \
+	else \
+		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_ladder_multistream; \
+	fi
 
 forward-ceiling: ## Push forward pass to 25B/30B (~10 min, needs 130GB)
-	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_find_ceiling
+	@if [ "$(STREAMS)" = "1" ]; then \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_find_ceiling; \
+	else \
+		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_ceiling_multistream; \
+	fi
 
 forward-7b: ## Single forward pass at 7B (~30s, needs 31GB)
-	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_7b
+	@if [ "$(STREAMS)" = "1" ]; then \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_7b; \
+	else \
+		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_7b_multistream; \
+	fi
 
 forward-10b: ## Single forward pass at 10B (~45s, needs 46GB)
-	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b
+	@if [ "$(STREAMS)" = "1" ]; then \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b; \
+	else \
+		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_10b_multistream; \
+	fi
 
 # ── Real data training ───────────────────────────────────────────────
 
@@ -81,42 +108,51 @@ train-600m: ## Train 600M on real data (needs climbmix-400B data file)
 
 LEADERBOARD_API ?= https://api.bench.rustane.org
 
-submit: ## Submit benchmark result to leaderboard
-	@if [ ! -f target/bench-result.json ]; then \
-		echo "No benchmark results found. Run a benchmark first:"; \
-		echo "  make sweep-600m"; \
-		echo "  make forward-7b"; \
-		exit 1; \
+submit: ## Submit queued benchmark results to leaderboard
+	@if [ -f target/bench-result.json ]; then \
+		echo "Note: target/bench-result.json is from the old single-file flow and is ignored."; \
+		echo "      Pending submissions now live in target/bench-results/."; \
+		echo ""; \
 	fi
-	@echo ""
-	@echo "Submit to rustane leaderboard (bench.rustane.org)"
-	@echo ""
-	@read -p "Your name: " NAME; \
-	read -p "X handle (optional, e.g. @danpacary): " XHANDLE; \
-	TMPFILE=$$(mktemp); \
-	jq --arg name "$$NAME" --arg x "$$XHANDLE" \
-		'.submitter = {name: $$name, x_handle: $$x}' \
-		target/bench-result.json > "$$TMPFILE"; \
+	@if [ -z "$$(ls target/bench-results/*.json 2>/dev/null)" ]; then \
+		echo "No pending results. Run a benchmark first."; exit 1; \
+	fi
+	@mkdir -p target/bench-results/submitted
+	@COUNT=$$(ls target/bench-results/*.json | wc -l | tr -d ' '); \
 	echo ""; \
-	echo "Submitting..."; \
-	RESPONSE=$$(curl -s -X POST $(LEADERBOARD_API)/api/submit \
-		-H "Content-Type: application/json" \
-		-d @"$$TMPFILE"); \
-	echo "$$RESPONSE" | jq .; \
-	RESULT_ID=$$(echo "$$RESPONSE" | jq -r '.id // empty'); \
-	if [ -n "$$RESULT_ID" ]; then \
-		echo ""; \
-		echo "View: https://bench.rustane.org/?id=$$RESULT_ID"; \
-		echo ""; \
-		read -p "Share on X? (y/n): " SHARE; \
-		if [ "$$SHARE" = "y" ]; then \
-			TOKS=$$(jq -r '.results.tok_per_s' target/bench-result.json); \
-			MS=$$(jq -r '.results.ms_per_step' target/bench-result.json); \
-			BENCH=$$(jq -r '.benchmark' target/bench-result.json); \
-			CHIP=$$(jq -r '.hardware.chip' target/bench-result.json); \
-			RAM=$$(jq -r '.hardware.ram_gb' target/bench-result.json); \
-			TEXT="Just ran rustane $$BENCH on $$CHIP $${RAM}GB%0A%0A$${TOKS} tok/s | $${MS}ms/step%0A%0Ahttps://bench.rustane.org/?id=$$RESULT_ID"; \
-			open "https://twitter.com/intent/tweet?text=$$TEXT"; \
+	echo "$$COUNT pending result(s) in target/bench-results/"; \
+	echo ""; \
+	read -p "Your name: " NAME; \
+	read -p "X handle (optional): " XHANDLE; \
+	echo ""; \
+	SUBMITTED=0; \
+	for f in $$(ls target/bench-results/*.json | sort); do \
+		BENCH=$$(jq -r '.benchmark' "$$f"); \
+		echo "Submitting $$BENCH ($$f)..."; \
+		TMPFILE=$$(mktemp); \
+		jq --arg name "$$NAME" --arg x "$$XHANDLE" \
+			'.submitter = {name: $$name, x_handle: $$x}' "$$f" > "$$TMPFILE"; \
+		RESPONSE=$$(curl -s -X POST $(LEADERBOARD_API)/api/submit \
+			-H "Content-Type: application/json" -d @"$$TMPFILE"); \
+		rm -f "$$TMPFILE"; \
+		RESULT_ID=$$(echo "$$RESPONSE" | jq -r '.id // empty'); \
+		if [ -n "$$RESULT_ID" ]; then \
+			PARAMS=$$(jq -r '.config.params_m' "$$f"); \
+			TOKS=$$(jq -r '.results.tok_per_s' "$$f"); \
+			MS=$$(jq -r '.results.ms_per_step' "$$f"); \
+			FWD=$$(jq -r '.results.ms_fwd' "$$f"); \
+			BWD=$$(jq -r '.results.ms_bwd' "$$f"); \
+			LOSS=$$(jq -r '"\(.results.loss_start) → \(.results.loss_end)"' "$$f"); \
+			echo "  ✅ $${PARAMS}M | $${TOKS} tok/s | $${MS}ms/step (fwd=$${FWD} bwd=$${BWD}) | loss $${LOSS}"; \
+			echo "     → https://bench.rustane.org/?id=$$RESULT_ID"; \
+			mv "$$f" target/bench-results/submitted/; \
+			SUBMITTED=$$((SUBMITTED + 1)); \
+		else \
+			echo "  ❌ $$BENCH failed:"; \
+			echo "$$RESPONSE" | jq .; \
+			echo "  Stopping. $$SUBMITTED submitted, remaining kept."; \
+			exit 1; \
 		fi; \
-	fi; \
-	rm -f "$$TMPFILE"
+	done; \
+	echo ""; \
+	echo "$$SUBMITTED result(s) submitted."

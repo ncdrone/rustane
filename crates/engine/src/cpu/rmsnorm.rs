@@ -268,7 +268,11 @@ mod tests {
 
         for i in 0..4 {
             let expected = x[i] * expected_rms_inv * 0.5;
-            assert!((out[i] - expected).abs() < 1e-5, "out[{i}] = {} vs {expected}", out[i]);
+            assert!(
+                (out[i] - expected).abs() < 1e-5,
+                "out[{i}] = {} vs {expected}",
+                out[i]
+            );
         }
     }
 
@@ -307,7 +311,8 @@ mod tests {
 
             assert!(
                 (dx[i] - numerical).abs() < 1e-2,
-                "dx[{i}]: analytical={} vs numerical={numerical}", dx[i]
+                "dx[{i}]: analytical={} vs numerical={numerical}",
+                dx[i]
             );
         }
     }
@@ -346,12 +351,20 @@ mod tests {
         }
 
         for s in 0..seq {
-            assert!((rms_inv_cf[s] - rms_inv_batch[s]).abs() < 1e-5,
-                "rms_inv[{s}]: cf={} vs batch={}", rms_inv_cf[s], rms_inv_batch[s]);
+            assert!(
+                (rms_inv_cf[s] - rms_inv_batch[s]).abs() < 1e-5,
+                "rms_inv[{s}]: cf={} vs batch={}",
+                rms_inv_cf[s],
+                rms_inv_batch[s]
+            );
         }
         for i in 0..dim * seq {
-            assert!((out_cf[i] - out_batch_cf[i]).abs() < 1e-5,
-                "out[{i}]: cf={} vs batch={}", out_cf[i], out_batch_cf[i]);
+            assert!(
+                (out_cf[i] - out_batch_cf[i]).abs() < 1e-5,
+                "out[{i}]: cf={} vs batch={}",
+                out_cf[i],
+                out_batch_cf[i]
+            );
         }
     }
 
@@ -376,7 +389,17 @@ mod tests {
         let mut dx_cf = vec![0.0f32; dim * seq];
         let mut dgamma_cf = vec![0.0f32; dim];
         let mut dot_buf = vec![0.0f32; seq];
-        backward_channel_first(&dy_cf, &x_cf, &gamma, &rms_inv, &mut dx_cf, &mut dgamma_cf, dim, seq, &mut dot_buf);
+        backward_channel_first(
+            &dy_cf,
+            &x_cf,
+            &gamma,
+            &rms_inv,
+            &mut dx_cf,
+            &mut dgamma_cf,
+            dim,
+            seq,
+            &mut dot_buf,
+        );
 
         // Transpose, batch backward, transpose back
         let mut dy_t = vec![0.0f32; seq * dim];
@@ -389,7 +412,16 @@ mod tests {
         }
         let mut dx_t = vec![0.0f32; seq * dim];
         let mut dgamma_batch = vec![0.0f32; dim];
-        backward_batch(&dy_t, &x_t, &gamma, &rms_inv, &mut dx_t, &mut dgamma_batch, dim, seq);
+        backward_batch(
+            &dy_t,
+            &x_t,
+            &gamma,
+            &rms_inv,
+            &mut dx_t,
+            &mut dgamma_batch,
+            dim,
+            seq,
+        );
         let mut dx_batch_cf = vec![0.0f32; dim * seq];
         for d in 0..dim {
             for s in 0..seq {
@@ -398,12 +430,20 @@ mod tests {
         }
 
         for d in 0..dim {
-            assert!((dgamma_cf[d] - dgamma_batch[d]).abs() < 1e-4,
-                "dgamma[{d}]: cf={} vs batch={}", dgamma_cf[d], dgamma_batch[d]);
+            assert!(
+                (dgamma_cf[d] - dgamma_batch[d]).abs() < 1e-4,
+                "dgamma[{d}]: cf={} vs batch={}",
+                dgamma_cf[d],
+                dgamma_batch[d]
+            );
         }
         for i in 0..dim * seq {
-            assert!((dx_cf[i] - dx_batch_cf[i]).abs() < 1e-4,
-                "dx[{i}]: cf={} vs batch={}", dx_cf[i], dx_batch_cf[i]);
+            assert!(
+                (dx_cf[i] - dx_batch_cf[i]).abs() < 1e-4,
+                "dx[{i}]: cf={} vs batch={}",
+                dx_cf[i],
+                dx_batch_cf[i]
+            );
         }
     }
 }

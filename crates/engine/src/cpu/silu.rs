@@ -87,7 +87,8 @@ mod tests {
             let numerical = (out_p[i] - out_m[i]) / (2.0 * eps);
             assert!(
                 (dx[i] - numerical).abs() < 1e-3,
-                "dx[{i}]: analytical={} vs numerical={numerical}", dx[i]
+                "dx[{i}]: analytical={} vs numerical={numerical}",
+                dx[i]
             );
         }
     }

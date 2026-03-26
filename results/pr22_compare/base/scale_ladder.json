@@ -1,0 +1,31 @@
+[
+  {
+    "name": "5B",
+    "params_b": 5.008272384,
+    "dim": 3072,
+    "hidden": 8192,
+    "heads": 24,
+    "nlayers": 44,
+    "seq": 512,
+    "compile_s": 0.0,
+    "alloc_s": 0.0,
+    "median_fwd_ms": 0.0,
+    "p5_fwd_ms": 0.0,
+    "p95_fwd_ms": 0.0,
+    "tok_per_s": 0.0,
+    "loss": 0.0,
+    "est_ram_gb": 25.239098624,
+    "rss_mb_after_compile": 14.5625,
+    "rss_mb_after_alloc": 14.578125,
+    "rss_mb_after_warmup": 14.578125,
+    "rss_mb_peak_timed": 14.578125,
+    "ffn_mode": "fused",
+    "ffn_dispatches_per_layer": 1,
+    "forward_dispatches_per_layer": 3,
+    "forward_dispatches_per_token": 0.005859375,
+    "dispatches_per_forward": 132,
+    "dispatches_per_token": 0.2578125,
+    "success": false,
+    "error": "sdpaFwd compile: Compile(\"_ANECompiler : ANECCompile() FAILED\")"
+  }
+]

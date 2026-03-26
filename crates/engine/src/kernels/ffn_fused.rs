@@ -15,8 +15,8 @@
 //! gate_out = silu(h1) * h3
 //! ffn_out = gate_out @ W2^T  (W2 stored as [DIM,HIDDEN], transposed inside kernel)
 
-use ane_bridge::ane::{Graph, Shape};
 use crate::model::ModelConfig;
+use ane_bridge::ane::{Graph, Shape};
 
 /// Build the fused FFN forward graph.
 pub fn build(cfg: &ModelConfig) -> Graph {
@@ -29,7 +29,12 @@ pub fn build(cfg: &ModelConfig) -> Graph {
     let alpha = 1.0 / (2.0 * nlayers as f32).sqrt(); // DeepNet residual scaling
 
     let mut g = Graph::new();
-    let input = g.placeholder(Shape { batch: 1, channels: dim, height: 1, width: sp_in });
+    let input = g.placeholder(Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: sp_in,
+    });
 
     // ── Slice inputs ──
     let x2norm = g.slice(input, [0, 0, 0, 0], [1, dim, 1, seq]);
@@ -40,11 +45,35 @@ pub fn build(cfg: &ModelConfig) -> Graph {
 
     // ── Gate and up projections: xnorm @ W1, xnorm @ W3 ──
     // Reshape for matmul: [1,DIM,1,SEQ] → [1,1,DIM,SEQ] → [1,1,SEQ,DIM]
-    let xn2 = g.reshape(x2norm, Shape { batch: 1, channels: 1, height: dim, width: seq });
+    let xn2 = g.reshape(
+        x2norm,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: dim,
+            width: seq,
+        },
+    );
     let xnt = g.transpose(xn2, [0, 1, 3, 2]);
 
-    let w12 = g.reshape(w1, Shape { batch: 1, channels: 1, height: dim, width: hidden });
-    let w32 = g.reshape(w3, Shape { batch: 1, channels: 1, height: dim, width: hidden });
+    let w12 = g.reshape(
+        w1,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: dim,
+            width: hidden,
+        },
+    );
+    let w32 = g.reshape(
+        w3,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: dim,
+            width: hidden,
+        },
+    );
 
     // [1,1,SEQ,DIM] @ [1,1,DIM,HIDDEN] → [1,1,SEQ,HIDDEN]
     let h1m = g.matrix_multiplication(xnt, w12, false, false);
@@ -53,8 +82,24 @@ pub fn build(cfg: &ModelConfig) -> Graph {
     // Reshape back to [1,HIDDEN,1,SEQ]
     let h1t = g.transpose(h1m, [0, 1, 3, 2]);
     let h3t = g.transpose(h3m, [0, 1, 3, 2]);
-    let h1 = g.reshape(h1t, Shape { batch: 1, channels: hidden, height: 1, width: seq });
-    let h3 = g.reshape(h3t, Shape { batch: 1, channels: hidden, height: 1, width: seq });
+    let h1 = g.reshape(
+        h1t,
+        Shape {
+            batch: 1,
+            channels: hidden,
+            height: 1,
+            width: seq,
+        },
+    );
+    let h3 = g.reshape(
+        h3t,
+        Shape {
+            batch: 1,
+            channels: hidden,
+            height: 1,
+            width: seq,
+        },
+    );
 
     // ── SiLU gate: silu(h1) * h3 ──
     let sig = g.sigmoid(h1);
@@ -63,16 +108,48 @@ pub fn build(cfg: &ModelConfig) -> Graph {
 
     // ── Down projection: gate @ W2^T ──
     // W2 stored as [DIM, HIDDEN], need transpose for gate[HIDDEN,SEQ] @ W2^T → [DIM,SEQ]
-    let g2 = g.reshape(gate, Shape { batch: 1, channels: 1, height: hidden, width: seq });
+    let g2 = g.reshape(
+        gate,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: hidden,
+            width: seq,
+        },
+    );
     let gt = g.transpose(g2, [0, 1, 3, 2]); // [1,1,SEQ,HIDDEN]
-    let w22 = g.reshape(w2_raw, Shape { batch: 1, channels: 1, height: dim, width: hidden });
+    let w22 = g.reshape(
+        w2_raw,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: dim,
+            width: hidden,
+        },
+    );
     let w2t = g.transpose(w22, [0, 1, 3, 2]); // [1,1,HIDDEN,DIM]
     let fm = g.matrix_multiplication(gt, w2t, false, false); // [1,1,SEQ,DIM]
     let ft = g.transpose(fm, [0, 1, 3, 2]);
-    let ffn_out = g.reshape(ft, Shape { batch: 1, channels: dim, height: 1, width: seq });
+    let ffn_out = g.reshape(
+        ft,
+        Shape {
+            batch: 1,
+            channels: dim,
+            height: 1,
+            width: seq,
+        },
+    );
 
     // ── Residual: x_next = x2 + alpha * ffn_out ──
-    let alpha_const = g.constant_with_scalar(alpha, Shape { batch: 1, channels: 1, height: 1, width: 1 });
+    let alpha_const = g.constant_with_scalar(
+        alpha,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: 1,
+            width: 1,
+        },
+    );
     let ffn_scaled = g.multiplication(ffn_out, alpha_const);
     let x_next = g.addition(x2, ffn_scaled);
 
@@ -80,6 +157,24 @@ pub fn build(cfg: &ModelConfig) -> Graph {
     let _out = g.concat(&[x_next, h1, h3, gate], 1);
 
     g
+}
+
+/// ANE hard limit on input IOSurface spatial width.
+/// At 1B (hidden=5632, seq=512): sp = 2*512 + 3*5632 = 17,920 > 16,384.
+/// hidden=5120 (sp=16,384) is the exact boundary.
+pub const ANE_MAX_SPATIAL_WIDTH: usize = 16_384;
+
+/// Returns true when the fused FFN kernel exceeds the ANE spatial width limit
+/// and must be decomposed into separate dyn_matmul dispatches + CPU ops.
+pub fn needs_decomposition(cfg: &ModelConfig) -> bool {
+    input_spatial_width(cfg) > ANE_MAX_SPATIAL_WIDTH
+}
+
+/// Returns true when the dual W1+W3 kernel fits within ANE spatial width.
+/// Dual kernel: sp = seq + 2*hidden. Boundary: hidden <= (16384 - seq) / 2.
+/// Falls back to separate W1/W3 dispatches if too large.
+pub fn can_use_dual_w13(cfg: &ModelConfig) -> bool {
+    cfg.seq + 2 * cfg.hidden <= ANE_MAX_SPATIAL_WIDTH
 }
 
 /// Input spatial width for ffnFused.

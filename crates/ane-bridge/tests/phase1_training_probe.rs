@@ -12,7 +12,7 @@
 //!
 //! Run: cargo test -p ane-bridge --test phase1_training_probe --release -- --include-ignored --nocapture
 
-use ane::{Graph, Shape, NSQualityOfService, TensorData};
+use ane::{Graph, NSQualityOfService, Shape, TensorData};
 use std::time::Instant;
 
 #[test]
@@ -20,10 +20,10 @@ use std::time::Instant;
 fn dynmatmul_training_probe() {
     println!("\n=== Phase 1: DynMatmul Training Probe ===\n");
 
-    let ic = 768usize;  // input channels (model dim)
-    let seq = 64usize;  // sequence length (min spatial width)
-    let oc = 64usize;   // output channels
-    let sp = seq + oc;   // total spatial width
+    let ic = 768usize; // input channels (model dim)
+    let seq = 64usize; // sequence length (min spatial width)
+    let oc = 64usize; // output channels
+    let sp = seq + oc; // total spatial width
 
     // ── 1. Build graph ──────────────────────────────────────────────
     let mut g = Graph::new();
@@ -38,14 +38,17 @@ fn dynmatmul_training_probe() {
     let weights = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
 
     // Transpose to [1, 1, IC, N] for matmul (move channels → height)
-    let acts_t = g.transpose(acts, [0, 2, 1, 3]);       // [1, IC, 1, SEQ] → [1, 1, IC, SEQ]
-    let weights_t = g.transpose(weights, [0, 2, 1, 3]);  // [1, IC, 1, OC] → [1, 1, IC, OC]
+    let acts_t = g.transpose(acts, [0, 2, 1, 3]); // [1, IC, 1, SEQ] → [1, 1, IC, SEQ]
+    let weights_t = g.transpose(weights, [0, 2, 1, 3]); // [1, IC, 1, OC] → [1, 1, IC, OC]
 
     // Matmul: acts^T @ weights = [1,1,SEQ,IC] @ [1,1,IC,OC] = [1,1,SEQ,OC]
     let _output = g.matrix_multiplication(acts_t, weights_t, true, false);
 
     println!("Graph: input=[1,{ic},1,{sp}] → slice → transpose → matmul → [1,1,{seq},{oc}]");
-    println!("FLOPs per eval: 2 × {ic} × {seq} × {oc} = {}", 2 * ic * seq * oc);
+    println!(
+        "FLOPs per eval: 2 × {ic} × {seq} × {oc} = {}",
+        2 * ic * seq * oc
+    );
     println!();
 
     // ── 2. Compile ──────────────────────────────────────────────────
@@ -125,8 +128,10 @@ fn dynmatmul_training_probe() {
 
     println!("Compute + weight staging ({iters} iters):");
     println!("  Total: {staged_us:.1} µs/iter");
-    println!("  Staging overhead: {staging_overhead_us:.1} µs ({:.1}%)",
-             staging_overhead_us / staged_us * 100.0);
+    println!(
+        "  Staging overhead: {staging_overhead_us:.1} µs ({:.1}%)",
+        staging_overhead_us / staged_us * 100.0
+    );
     println!();
 
     // ── 7. Verify dynamic update changes output ────────────────────
@@ -138,7 +143,9 @@ fn dynmatmul_training_probe() {
     executable.run(&[&input_tensor], &[&output_tensor]).unwrap();
     let result_b = output_tensor.read_f32();
 
-    let diff: f32 = result_a.iter().zip(result_b.iter())
+    let diff: f32 = result_a
+        .iter()
+        .zip(result_b.iter())
         .map(|(a, b)| (a - b).abs())
         .sum();
     assert!(diff > 0.0, "Output should change when weights change!");
@@ -258,7 +265,9 @@ fn dynmatmul_gpt2_ffn_size() {
     let staged_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     let overhead = staged_us - compute_us;
 
-    println!("With staging: {staged_us:.1} µs (overhead: {overhead:.1} µs, {:.1}%)",
-             overhead / staged_us * 100.0);
+    println!(
+        "With staging: {staged_us:.1} µs (overhead: {overhead:.1} µs, {:.1}%)",
+        overhead / staged_us * 100.0
+    );
     println!();
 }

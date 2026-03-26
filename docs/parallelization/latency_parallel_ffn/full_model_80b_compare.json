@@ -1,0 +1,289 @@
+{
+  "config_name": "80B",
+  "dim": 5120,
+  "hidden": 13824,
+  "heads": 40,
+  "nlayers": 256,
+  "seq": 512,
+  "baseline": {
+    "mode": "baseline",
+    "shard_count": 1,
+    "compile_s": 0.9026188,
+    "warmup_wall_ms": 64650.19,
+    "timed_samples_ms": [
+      56640.57,
+      56045.867
+    ],
+    "mean_full_forward_ms": 56343.22,
+    "tok_per_s": 9.087163,
+    "peak_rss_mb": 311832.25,
+    "ane_hw_ms": 0.0,
+    "ane_busy_pct": 0.0,
+    "avg_layer_ms": 220.0907,
+    "total_ffn_ms": 43949.945,
+    "total_non_ffn_ms": 12393.273,
+    "ffn_pct_of_wall": 78.00397,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0,
+      "loss_abs_diff": 0.0
+    },
+    "correctness_pass": true,
+    "full_forward_win_pct_vs_baseline": 0.0,
+    "meets_perf_gate": false,
+    "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+  },
+  "modes": [
+    {
+      "mode": "shard2",
+      "shard_count": 2,
+      "compile_s": 0.7091427,
+      "warmup_wall_ms": 51069.31,
+      "timed_samples_ms": [
+        51292.22,
+        51095.242
+      ],
+      "mean_full_forward_ms": 51193.73,
+      "tok_per_s": 10.0012245,
+      "peak_rss_mb": 313312.56,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 199.97551,
+      "total_ffn_ms": 39193.402,
+      "total_non_ffn_ms": 12000.328,
+      "ffn_pct_of_wall": 76.55899,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 9.1395,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard4",
+      "shard_count": 4,
+      "compile_s": 0.8144822,
+      "warmup_wall_ms": 36202.066,
+      "timed_samples_ms": [
+        36442.004,
+        36570.83
+      ],
+      "mean_full_forward_ms": 36506.414,
+      "tok_per_s": 14.024933,
+      "peak_rss_mb": 313924.25,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 142.60318,
+      "total_ffn_ms": 24394.504,
+      "total_non_ffn_ms": 12111.91,
+      "ffn_pct_of_wall": 66.82252,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 35.207085,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard6",
+      "shard_count": 6,
+      "compile_s": 0.98079246,
+      "warmup_wall_ms": 32693.344,
+      "timed_samples_ms": [
+        32124.336,
+        32297.408
+      ],
+      "mean_full_forward_ms": 32210.871,
+      "tok_per_s": 15.895255,
+      "peak_rss_mb": 314356.8,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 125.823715,
+      "total_ffn_ms": 20252.914,
+      "total_non_ffn_ms": 11957.957,
+      "ffn_pct_of_wall": 62.876022,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 42.83097,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard8",
+      "shard_count": 8,
+      "compile_s": 0.99638116,
+      "warmup_wall_ms": 29796.607,
+      "timed_samples_ms": [
+        29682.41,
+        29680.21
+      ],
+      "mean_full_forward_ms": 29681.31,
+      "tok_per_s": 17.249912,
+      "peak_rss_mb": 313103.0,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 115.94262,
+      "total_ffn_ms": 17685.94,
+      "total_non_ffn_ms": 11995.371,
+      "ffn_pct_of_wall": 59.586113,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 47.320526,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard12",
+      "shard_count": 12,
+      "compile_s": 1.3297279,
+      "warmup_wall_ms": 27550.113,
+      "timed_samples_ms": [
+        27486.332,
+        27519.459
+      ],
+      "mean_full_forward_ms": 27502.895,
+      "tok_per_s": 18.616222,
+      "peak_rss_mb": 313092.44,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 107.43318,
+      "total_ffn_ms": 15497.367,
+      "total_non_ffn_ms": 12005.527,
+      "ffn_pct_of_wall": 56.348133,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 51.18686,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard16",
+      "shard_count": 16,
+      "compile_s": 1.5052528,
+      "warmup_wall_ms": 26885.096,
+      "timed_samples_ms": [
+        26833.688,
+        26343.889
+      ],
+      "mean_full_forward_ms": 26588.79,
+      "tok_per_s": 19.256237,
+      "peak_rss_mb": 312878.62,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 103.86246,
+      "total_ffn_ms": 14645.025,
+      "total_non_ffn_ms": 11943.764,
+      "ffn_pct_of_wall": 55.079697,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 52.809246,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard24",
+      "shard_count": 24,
+      "compile_s": 2.0268927,
+      "warmup_wall_ms": 27698.785,
+      "timed_samples_ms": [
+        27679.666,
+        27690.246
+      ],
+      "mean_full_forward_ms": 27684.957,
+      "tok_per_s": 18.493797,
+      "peak_rss_mb": 313122.7,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 108.14436,
+      "total_ffn_ms": 15776.533,
+      "total_non_ffn_ms": 11908.424,
+      "ffn_pct_of_wall": 56.98594,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 50.86373,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    },
+    {
+      "mode": "shard32",
+      "shard_count": 32,
+      "compile_s": 2.5428877,
+      "warmup_wall_ms": 30353.791,
+      "timed_samples_ms": [
+        30166.55,
+        30195.021
+      ],
+      "mean_full_forward_ms": 30180.785,
+      "tok_per_s": 16.964436,
+      "peak_rss_mb": 313438.12,
+      "ane_hw_ms": 0.0,
+      "ane_busy_pct": 0.0,
+      "avg_layer_ms": 117.89369,
+      "total_ffn_ms": 18285.562,
+      "total_non_ffn_ms": 11895.223,
+      "ffn_pct_of_wall": 60.58677,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 46.43404,
+      "meets_perf_gate": true,
+      "bucket_note": "1 warmup plus 2 measured stats-enabled full-model passes; wall, FFN, RSS, and ANE usage all come from the same measured samples."
+    }
+  ],
+  "primary_success": true,
+  "winning_modes": [
+    "shard2",
+    "shard4",
+    "shard6",
+    "shard8",
+    "shard12",
+    "shard16",
+    "shard24",
+    "shard32"
+  ],
+  "thresholds": {
+    "max_abs_diff_tol": 0.02,
+    "mean_abs_diff_tol": 0.005,
+    "cosine_similarity_tol": 0.999,
+    "loss_abs_diff_tol": 0.0001,
+    "perf_win_pct_tol": 5.0
+  }
+}

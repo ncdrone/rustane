@@ -84,18 +84,33 @@ impl MetalAdam {
         let queue = device.newCommandQueue()?;
 
         let source = objc2_foundation::NSString::from_str(ADAM_SHADER);
-        let library = device.newLibraryWithSource_options_error(&source, None).ok()?;
+        let library = device
+            .newLibraryWithSource_options_error(&source, None)
+            .ok()?;
         let fn_name = objc2_foundation::NSString::from_str("adam_step");
         let function = library.newFunctionWithName(&fn_name)?;
-        let pipeline = device.newComputePipelineStateWithFunction_error(&function).ok()?;
+        let pipeline = device
+            .newComputePipelineStateWithFunction_error(&function)
+            .ok()?;
 
-        Some(Self { device, queue, pipeline })
+        Some(Self {
+            device,
+            queue,
+            pipeline,
+        })
     }
 
     /// Start a batch of Adam updates. Encode all dispatches, then call `execute()`.
     /// Pass hyperparams that are constant across all tensors in the batch.
     /// Creates 6 shared scalar buffers once; `add()` only creates lr+wd per call.
-    pub fn begin_batch(&self, t: u32, beta1: f32, beta2: f32, eps: f32, grad_scale: f32) -> AdamBatch<'_> {
+    pub fn begin_batch(
+        &self,
+        t: u32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        grad_scale: f32,
+    ) -> AdamBatch<'_> {
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let enc = cmd.computeCommandEncoder().expect("compute encoder");
         let bc1 = 1.0f32 / (1.0 - beta1.powi(t as i32));
@@ -145,17 +160,22 @@ impl MetalAdam {
             return None;
         }
         unsafe {
-            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
-                std::ptr::NonNull::new(ptr)?,
-                byte_len,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            )
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    std::ptr::NonNull::new(ptr)?,
+                    byte_len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
         }
     }
 
     /// Create a copy-based Metal buffer (works with any alignment).
-    fn make_buffer(&self, ptr: *const f32, byte_len: usize) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+    fn make_buffer(
+        &self,
+        ptr: *const f32,
+        byte_len: usize,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
         unsafe {
             self.device
                 .newBufferWithBytes_length_options(
@@ -221,28 +241,49 @@ impl<'a> AdamBatch<'a> {
             self.enc.setBuffer_offset_atIndex(Some(&self.eps_buf), 0, 7);
             self.enc.setBuffer_offset_atIndex(Some(&wd_buf), 0, 8);
             self.enc.setBuffer_offset_atIndex(Some(&self.bc1_buf), 0, 9);
-            self.enc.setBuffer_offset_atIndex(Some(&self.bc2_buf), 0, 10);
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.bc2_buf), 0, 10);
             self.enc.setBuffer_offset_atIndex(Some(&self.gs_buf), 0, 11);
 
             let tg = self.adam.pipeline.maxTotalThreadsPerThreadgroup().min(256);
-            let grid = MTLSize { width: n, height: 1, depth: 1 };
-            let group = MTLSize { width: tg, height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: n,
+                height: 1,
+                depth: 1,
+            };
+            let group = MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            };
             self.enc.dispatchThreads_threadsPerThreadgroup(grid, group);
         }
 
         // Track readbacks for copy-based buffers
         if param_needs_rb {
-            self.readbacks.push(Readback { buf: param_buf, dst: param.as_mut_ptr(), len: n });
+            self.readbacks.push(Readback {
+                buf: param_buf,
+                dst: param.as_mut_ptr(),
+                len: n,
+            });
         } else {
             self._held.push(param_buf);
         }
         if m_needs_rb {
-            self.readbacks.push(Readback { buf: m_buf, dst: m.as_mut_ptr(), len: n });
+            self.readbacks.push(Readback {
+                buf: m_buf,
+                dst: m.as_mut_ptr(),
+                len: n,
+            });
         } else {
             self._held.push(m_buf);
         }
         if v_needs_rb {
-            self.readbacks.push(Readback { buf: v_buf, dst: v.as_mut_ptr(), len: n });
+            self.readbacks.push(Readback {
+                buf: v_buf,
+                dst: v.as_mut_ptr(),
+                len: n,
+            });
         } else {
             self._held.push(v_buf);
         }
@@ -284,7 +325,10 @@ impl<'a> AdamBatch<'a> {
         ptr: *const f32,
         byte_len: usize,
     ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        if let Some(buf) = self.adam.try_buffer_no_copy(ptr as *const f32 as *mut c_void, byte_len) {
+        if let Some(buf) = self
+            .adam
+            .try_buffer_no_copy(ptr as *const f32 as *mut c_void, byte_len)
+        {
             buf
         } else {
             self.adam.make_buffer(ptr, byte_len)

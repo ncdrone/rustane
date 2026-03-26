@@ -72,7 +72,11 @@ Forward-only output:
 
 ### Sharing Your Results
 
-Run a test, copy the output, open an issue with your hardware info. We collect results across chips — every data point matters.
+Benchmarks now queue JSON results in `target/bench-results/`. Run one or more benchmarks, then use `make submit` to upload every pending result in timestamp order.
+
+Older `target/bench-result.json` files from the previous single-file flow are ignored by `make submit`.
+
+You can still open an issue with your hardware info if you want to share raw output directly. We collect results across chips and every data point matters.
 
 Include: chip model, RAM, macOS version, full test output.
 

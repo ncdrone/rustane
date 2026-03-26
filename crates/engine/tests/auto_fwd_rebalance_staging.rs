@@ -14,7 +14,7 @@
 //!
 //! Run: cargo test -p engine --test auto_fwd_rebalance_staging --release -- --nocapture
 
-use engine::layer::{self, CompiledKernels, LayerWeights, ForwardCache};
+use engine::layer::{self, CompiledKernels, ForwardCache, LayerWeights};
 use engine::model::ModelConfig;
 
 /// Forward pass output must be deterministic across multiple calls with same input.
@@ -27,7 +27,9 @@ fn forward_deterministic() {
 
     let dim = cfg.dim;
     let seq = cfg.seq;
-    let x: Vec<f32> = (0..dim * seq).map(|i| ((i * 17 + 3) % 1000) as f32 * 0.001 - 0.5).collect();
+    let x: Vec<f32> = (0..dim * seq)
+        .map(|i| ((i * 17 + 3) % 1000) as f32 * 0.001 - 0.5)
+        .collect();
 
     // Run forward twice with same input
     let mut cache1 = ForwardCache::new(&cfg);
@@ -39,14 +41,23 @@ fn forward_deterministic() {
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache2, &mut x_next2);
 
     // Must be bit-exact (same staging, same ANE, same math)
-    let max_diff: f32 = x_next1.iter().zip(x_next2.iter())
+    let max_diff: f32 = x_next1
+        .iter()
+        .zip(x_next2.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("Determinism: max_diff = {:.2e}", max_diff);
-    assert!(max_diff == 0.0, "Forward pass not deterministic: max_diff = {:.2e}", max_diff);
+    assert!(
+        max_diff == 0.0,
+        "Forward pass not deterministic: max_diff = {:.2e}",
+        max_diff
+    );
 
     // Also verify cache intermediates match
-    let cache_max_diff: f32 = cache1.h1.iter().zip(cache2.h1.iter())
+    let cache_max_diff: f32 = cache1
+        .h1
+        .iter()
+        .zip(cache2.h1.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("Cache h1 determinism: max_diff = {:.2e}", cache_max_diff);
@@ -63,7 +74,9 @@ fn forward_into_matches_forward() {
 
     let dim = cfg.dim;
     let seq = cfg.seq;
-    let x: Vec<f32> = (0..dim * seq).map(|i| ((i * 31 + 7) % 1000) as f32 * 0.001 - 0.5).collect();
+    let x: Vec<f32> = (0..dim * seq)
+        .map(|i| ((i * 31 + 7) % 1000) as f32 * 0.001 - 0.5)
+        .collect();
 
     // Allocating path (reference)
     let (x_next_ref, _cache_ref) = layer::forward(&cfg, &kernels, &weights, &x);
@@ -74,11 +87,17 @@ fn forward_into_matches_forward() {
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
     // Should match within ANE fp16 round-trip tolerance
-    let max_diff: f32 = x_next.iter().zip(x_next_ref.iter())
+    let max_diff: f32 = x_next
+        .iter()
+        .zip(x_next_ref.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("forward_into vs forward: max_diff = {:.2e}", max_diff);
-    assert!(max_diff < 1e-5, "Outputs diverge: max_diff = {:.2e} (expected < 1e-5)", max_diff);
+    assert!(
+        max_diff < 1e-5,
+        "Outputs diverge: max_diff = {:.2e} (expected < 1e-5)",
+        max_diff
+    );
 }
 
 /// Back-to-back forward calls reusing the same ForwardCache and KernelBuffers.
@@ -90,15 +109,21 @@ fn back_to_back_with_different_weights() {
 
     let dim = cfg.dim;
     let seq = cfg.seq;
-    let x: Vec<f32> = (0..dim * seq).map(|i| ((i * 17 + 3) % 1000) as f32 * 0.001 - 0.5).collect();
+    let x: Vec<f32> = (0..dim * seq)
+        .map(|i| ((i * 17 + 3) % 1000) as f32 * 0.001 - 0.5)
+        .collect();
 
     // Two different weight sets (simulates different layers sharing kernel buffers)
     let weights_a = LayerWeights::random(&cfg);
     let mut weights_b = LayerWeights::random(&cfg);
     // Make weights_b different — must change wo/w2 (not zero-init'd copies)
     // because DeepNet zero-init makes output independent of wq/wk/wv/w1/w3 when wo=w2=0
-    for (i, x) in weights_b.wo.iter_mut().enumerate() { *x = 0.01 * ((i * 13 + 7) % 100) as f32 * 0.01; }
-    for (i, x) in weights_b.w2.iter_mut().enumerate() { *x = 0.01 * ((i * 17 + 3) % 100) as f32 * 0.01; }
+    for (i, x) in weights_b.wo.iter_mut().enumerate() {
+        *x = 0.01 * ((i * 13 + 7) % 100) as f32 * 0.01;
+    }
+    for (i, x) in weights_b.w2.iter_mut().enumerate() {
+        *x = 0.01 * ((i * 17 + 3) % 100) as f32 * 0.01;
+    }
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; dim * seq];
@@ -116,16 +141,27 @@ fn back_to_back_with_different_weights() {
     let x_next_a2 = x_next.clone();
 
     // Verify weights_a results match across both runs
-    let max_diff: f32 = x_next_a.iter().zip(x_next_a2.iter())
+    let max_diff: f32 = x_next_a
+        .iter()
+        .zip(x_next_a2.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("weights_a run1 vs run3: max_diff = {:.2e}", max_diff);
-    assert!(max_diff == 0.0, "Stale IOSurface data: weights_a results differ after weights_b run (max_diff={:.2e})", max_diff);
+    assert!(
+        max_diff == 0.0,
+        "Stale IOSurface data: weights_a results differ after weights_b run (max_diff={:.2e})",
+        max_diff
+    );
 
     // Verify weights_a and weights_b produce different results
-    let ab_diff: f32 = x_next_a.iter().zip(x_next_b.iter())
+    let ab_diff: f32 = x_next_a
+        .iter()
+        .zip(x_next_b.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("weights_a vs weights_b: max_diff = {:.2e}", ab_diff);
-    assert!(ab_diff > 0.01, "Different weights should produce different outputs");
+    assert!(
+        ab_diff > 0.01,
+        "Different weights should produce different outputs"
+    );
 }

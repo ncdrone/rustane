@@ -1,0 +1,209 @@
+{
+  "mode": "ffn4_training_path",
+  "wall_only": {
+    "rmsnorm1_ms": 0.1041664,
+    "stage_sdpa_ms": 0.98531675,
+    "ane_sdpa_ms": 3.1042001,
+    "read_sdpa_ms": 0.4195416,
+    "stage_wo_ms": 0.4923584,
+    "ane_wo_ms": 0.5947498,
+    "read_wo_ms": 0.1125,
+    "residual_rmsnorm2_ms": 0.21260841,
+    "ffn_shards": [
+      {
+        "shard_idx": 0,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.9737332,
+          "ane_wall_ms": 1.0396084,
+          "ane_hw_ns": null,
+          "readback_ms": 0.1338916
+        },
+        "gate_cpu_ms": 0.66525817,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.7056413,
+          "ane_wall_ms": 0.8377999,
+          "ane_hw_ns": null,
+          "readback_ms": 0.051558398
+        },
+        "merge_cpu_ms": 0.1746084,
+        "cache_store_ms": 0.12018321,
+        "shard_total_ms": 12.703441
+      },
+      {
+        "shard_idx": 1,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.8602583,
+          "ane_wall_ms": 1.038642,
+          "ane_hw_ns": null,
+          "readback_ms": 0.1497086
+        },
+        "gate_cpu_ms": 0.70748335,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 8.264483,
+          "ane_wall_ms": 0.8686082,
+          "ane_hw_ns": null,
+          "readback_ms": 0.063050196
+        },
+        "merge_cpu_ms": 0.1853998,
+        "cache_store_ms": 0.1073416,
+        "shard_total_ms": 13.246274
+      },
+      {
+        "shard_idx": 2,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.8671919,
+          "ane_wall_ms": 1.0308415,
+          "ane_hw_ns": null,
+          "readback_ms": 0.14231679
+        },
+        "gate_cpu_ms": 0.6964748,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.9410505,
+          "ane_wall_ms": 0.8845832,
+          "ane_hw_ns": null,
+          "readback_ms": 0.061966605
+        },
+        "merge_cpu_ms": 0.16955021,
+        "cache_store_ms": 0.100775,
+        "shard_total_ms": 12.896151
+      },
+      {
+        "shard_idx": 3,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.8180084,
+          "ane_wall_ms": 1.090075,
+          "ane_hw_ns": null,
+          "readback_ms": 0.1461582
+        },
+        "gate_cpu_ms": 0.6774416,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.977759,
+          "ane_wall_ms": 0.8855918,
+          "ane_hw_ns": null,
+          "readback_ms": 0.0547252
+        },
+        "merge_cpu_ms": 0.18742499,
+        "cache_store_ms": 0.10036681,
+        "shard_total_ms": 12.938677
+      }
+    ],
+    "ffn_residual_ms": 0.0766584,
+    "ffn_wall_ms": 51.9162,
+    "ffn_sum_ane_wall_ms": 7.67575,
+    "ffn_sum_cpu_ms": 44.18047,
+    "ffn_sum_ane_hw_ms": null,
+    "host_overhead_ms": null,
+    "total_ms": 58.0707
+  },
+  "wall_and_hw": {
+    "rmsnorm1_ms": 0.098299995,
+    "stage_sdpa_ms": 0.9271334,
+    "ane_sdpa_ms": 3.1102498,
+    "read_sdpa_ms": 0.3911336,
+    "stage_wo_ms": 0.4431582,
+    "ane_wo_ms": 0.5514082,
+    "read_wo_ms": 0.10976641,
+    "residual_rmsnorm2_ms": 0.2016586,
+    "ffn_shards": [
+      {
+        "shard_idx": 0,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.8951414,
+          "ane_wall_ms": 0.9840164,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.1398002
+        },
+        "gate_cpu_ms": 0.6846916,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.6338334,
+          "ane_wall_ms": 0.88181657,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.062266607
+        },
+        "merge_cpu_ms": 0.18894999,
+        "cache_store_ms": 0.1053168,
+        "shard_total_ms": 12.577059
+      },
+      {
+        "shard_idx": 1,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.8190664,
+          "ane_wall_ms": 0.96538335,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.1348166
+        },
+        "gate_cpu_ms": 0.6601914,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.8322997,
+          "ane_wall_ms": 0.8663918,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.0476834
+        },
+        "merge_cpu_ms": 0.1932086,
+        "cache_store_ms": 0.100258194,
+        "shard_total_ms": 12.620308
+      },
+      {
+        "shard_idx": 2,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.7791502,
+          "ane_wall_ms": 1.1279668,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.131967
+        },
+        "gate_cpu_ms": 0.67726684,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.516783,
+          "ane_wall_ms": 0.8344752,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.053349994
+        },
+        "merge_cpu_ms": 0.17131679,
+        "cache_store_ms": 0.108375,
+        "shard_total_ms": 12.401667
+      },
+      {
+        "shard_idx": 3,
+        "w13": {
+          "kernel_name": "w13",
+          "staging_ms": 1.8223917,
+          "ane_wall_ms": 0.9893832,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.1337248
+        },
+        "gate_cpu_ms": 0.6763584,
+        "w2": {
+          "kernel_name": "w2",
+          "staging_ms": 7.6928415,
+          "ane_wall_ms": 0.88723344,
+          "ane_hw_ns": 0,
+          "readback_ms": 0.0542252
+        },
+        "merge_cpu_ms": 0.17052479,
+        "cache_store_ms": 0.103824995,
+        "shard_total_ms": 12.531275
+      }
+    ],
+    "ffn_residual_ms": 0.0772332,
+    "ffn_wall_ms": 50.252586,
+    "ffn_sum_ane_wall_ms": 7.536667,
+    "ffn_sum_cpu_ms": 42.666862,
+    "ffn_sum_ane_hw_ms": 0.0,
+    "host_overhead_ms": 7.536667,
+    "total_ms": 56.21336
+  }
+}

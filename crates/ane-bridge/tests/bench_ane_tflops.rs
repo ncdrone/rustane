@@ -2,7 +2,7 @@
 //!
 //! Run: cargo test -p ane-bridge --test bench_ane_tflops -- --include-ignored --nocapture
 
-use ane::{Graph, Shape, NSQualityOfService, TensorData};
+use ane::{Graph, NSQualityOfService, Shape, TensorData};
 use std::time::Instant;
 
 #[test]
@@ -22,7 +22,10 @@ fn ane_conv1x1_tflops() {
         (3072, 768, 512, "3072→768, w=512 (gpt_karpathy FFN down)"),
     ];
 
-    println!("{:<45} {:>10} {:>10} {:>10}", "Config", "µs", "TFLOPS", "iters");
+    println!(
+        "{:<45} {:>10} {:>10} {:>10}",
+        "Config", "µs", "TFLOPS", "iters"
+    );
     println!("{}", "-".repeat(80));
 
     for (ic, oc, w, label) in configs {
@@ -45,11 +48,14 @@ fn bench_conv1x1(ic: usize, oc: usize, w: usize) -> Result<(f64, f64, usize), St
     let x = g.placeholder(Shape::spatial(ic, 1, w));
 
     // Conv1x1 weight: Shape::spatial(out_channels, 1, 1), data has oc*ic elements
-    let w_data: Vec<f32> = (0..oc * ic).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
+    let w_data: Vec<f32> = (0..oc * ic)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.01)
+        .collect();
     let weight = g.constant(&w_data, Shape::spatial(oc, 1, 1));
     let _out = g.convolution_2d_1x1(x, weight, None);
 
-    let executable = g.compile(NSQualityOfService::Default)
+    let executable = g
+        .compile(NSQualityOfService::Default)
         .map_err(|e| format!("compile: {e}"))?;
 
     let input_data: Vec<f32> = (0..ic * w).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
@@ -58,7 +64,8 @@ fn bench_conv1x1(ic: usize, oc: usize, w: usize) -> Result<(f64, f64, usize), St
 
     // Warmup
     for _ in 0..10 {
-        executable.run(&[&input], &[&output])
+        executable
+            .run(&[&input], &[&output])
             .map_err(|e| format!("eval: {e}"))?;
     }
 
@@ -68,7 +75,8 @@ fn bench_conv1x1(ic: usize, oc: usize, w: usize) -> Result<(f64, f64, usize), St
 
     for _ in 0..iters {
         let t0 = Instant::now();
-        executable.run(&[&input], &[&output])
+        executable
+            .run(&[&input], &[&output])
             .map_err(|e| format!("eval: {e}"))?;
         let elapsed = t0.elapsed();
         times_us.push(elapsed.as_secs_f64() * 1e6);

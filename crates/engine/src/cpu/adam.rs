@@ -149,7 +149,10 @@ mod tests {
             step(&mut param, &grad, &mut m, &mut v, t, &cfg);
         }
         let final_sum: f32 = param.iter().sum();
-        assert!(final_sum < initial, "param should decrease: {initial} -> {final_sum}");
+        assert!(
+            final_sum < initial,
+            "param should decrease: {initial} -> {final_sum}"
+        );
     }
 
     #[test]
@@ -158,7 +161,10 @@ mod tests {
         let grad = [0.0f32; 2];
         let mut m = [0.0f32; 2];
         let mut v = [0.0f32; 2];
-        let cfg = AdamConfig { weight_decay: 0.1, ..Default::default() };
+        let cfg = AdamConfig {
+            weight_decay: 0.1,
+            ..Default::default()
+        };
 
         let before = param[0];
         step(&mut param, &grad, &mut m, &mut v, 1, &cfg);
@@ -172,7 +178,10 @@ mod tests {
         let grad = [1.0f32; 2];
         let mut m = [0.0f32; 2];
         let mut v = [0.0f32; 2];
-        let cfg = AdamConfig { weight_decay: 0.0, ..Default::default() };
+        let cfg = AdamConfig {
+            weight_decay: 0.0,
+            ..Default::default()
+        };
 
         step(&mut param, &grad, &mut m, &mut v, 1, &cfg);
         // m should be (1-beta1)*grad = 0.1

@@ -3,7 +3,9 @@
 //! Uses synthetic random token data to verify the full pipeline works.
 //! Exit criterion: loss decreases over training steps.
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelBackwardWorkspace, TrainConfig};
+use engine::full_model::{
+    self, ModelBackwardWorkspace, ModelGrads, ModelOptState, ModelWeights, TrainConfig,
+};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
@@ -56,16 +58,32 @@ fn six_layer_loss_decreases() {
         let target_tokens: Vec<u32> = data[1..cfg.seq + 1].iter().map(|&t| t as u32).collect();
 
         grads.zero_out();
-        let fwd = full_model::forward(
-            &cfg, &kernels, &weights, &input_tokens, &target_tokens, 0.0,
-        );
+        let fwd = full_model::forward(&cfg, &kernels, &weights, &input_tokens, &target_tokens, 0.0);
         let loss = fwd.loss;
         full_model::backward(
-            &cfg, &kernels, &weights, &fwd, &input_tokens, 0.0, 1.0, &mut grads, &mut bwd_ws,
+            &cfg,
+            &kernels,
+            &weights,
+            &fwd,
+            &input_tokens,
+            0.0,
+            1.0,
+            &mut grads,
+            &mut bwd_ws,
         );
 
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
+        full_model::update_weights(
+            &cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            1.0,
+        );
 
         let elapsed = t0.elapsed().as_secs_f32();
         losses.push(loss);
@@ -74,7 +92,10 @@ fn six_layer_loss_decreases() {
 
     let first = losses[0];
     let last = *losses.last().unwrap();
-    println!("\nloss: {first:.4} → {last:.4} (delta = {:.4})", last - first);
+    println!(
+        "\nloss: {first:.4} → {last:.4} (delta = {:.4})",
+        last - first
+    );
     assert!(
         last < first,
         "loss should decrease when overfitting on one sample: first={first:.4}, last={last:.4}"
@@ -96,5 +117,8 @@ fn forward_produces_valid_loss() {
     println!("Forward pass loss: {loss:.4}");
     // Loss should be around -ln(1/VOCAB) = ln(8192) ≈ 9.01 for random weights
     assert!(loss > 0.0, "loss should be positive");
-    assert!(loss < 20.0, "loss should be reasonable for random init: {loss}");
+    assert!(
+        loss < 20.0,
+        "loss should be reasonable for random init: {loss}"
+    );
 }

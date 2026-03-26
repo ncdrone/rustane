@@ -12,8 +12,18 @@ use std::time::Instant;
 
 fn bench_matmul_vs_conv(name: &str, ic: usize, oc: usize, seq: usize, iters: usize) {
     let sp = dyn_matmul::spatial_width(seq, oc);
-    let input_shape = Shape { batch: 1, channels: ic, height: 1, width: sp };
-    let output_shape = Shape { batch: 1, channels: oc, height: 1, width: seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: sp,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: oc,
+        height: 1,
+        width: seq,
+    };
 
     // Compile both variants
     let graph_mm = dyn_matmul::build(ic, oc, seq);
@@ -42,8 +52,12 @@ fn bench_matmul_vs_conv(name: &str, ic: usize, oc: usize, seq: usize, iters: usi
     let out_conv = TensorData::new(output_shape);
 
     // Verify numerical equivalence
-    exe_mm.run(&[&input_td], &[&out_mm]).expect("matmul eval failed");
-    exe_conv.run(&[&input_td], &[&out_conv]).expect("conv eval failed");
+    exe_mm
+        .run(&[&input_td], &[&out_mm])
+        .expect("matmul eval failed");
+    exe_conv
+        .run(&[&input_td], &[&out_conv])
+        .expect("conv eval failed");
 
     let mm_vals = out_mm.as_f32_slice();
     let conv_vals = out_conv.as_f32_slice();
@@ -59,15 +73,21 @@ fn bench_matmul_vs_conv(name: &str, ic: usize, oc: usize, seq: usize, iters: usi
 
     // Warmup
     for _ in 0..10 {
-        exe_mm.run_cached(&[&input_td], &[&out_mm]).expect("warmup mm");
-        exe_conv.run_cached(&[&input_td], &[&out_conv]).expect("warmup conv");
+        exe_mm
+            .run_cached(&[&input_td], &[&out_mm])
+            .expect("warmup mm");
+        exe_conv
+            .run_cached(&[&input_td], &[&out_conv])
+            .expect("warmup conv");
     }
 
     // Benchmark matmul path
     let mut mm_us = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
-        exe_mm.run_cached(&[&input_td], &[&out_mm]).expect("mm eval");
+        exe_mm
+            .run_cached(&[&input_td], &[&out_mm])
+            .expect("mm eval");
         mm_us.push(t.elapsed().as_micros() as f64);
     }
 
@@ -75,7 +95,9 @@ fn bench_matmul_vs_conv(name: &str, ic: usize, oc: usize, seq: usize, iters: usi
     let mut conv_us = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
-        exe_conv.run_cached(&[&input_td], &[&out_conv]).expect("conv eval");
+        exe_conv
+            .run_cached(&[&input_td], &[&out_conv])
+            .expect("conv eval");
         conv_us.push(t.elapsed().as_micros() as f64);
     }
 
@@ -92,24 +114,48 @@ fn bench_matmul_vs_conv(name: &str, ic: usize, oc: usize, seq: usize, iters: usi
     let speedup = mm_med / conv_med;
 
     println!("\n=== {name} ({ic}x{oc}, seq={seq}) ===");
-    println!("  Numerical: max_diff={:.6}, avg_diff={:.8}", max_diff, avg_diff);
+    println!(
+        "  Numerical: max_diff={:.6}, avg_diff={:.8}",
+        max_diff, avg_diff
+    );
     if max_diff < 1e-2 {
         println!("  GATE PASS: conv output matches matmul within tolerance");
     } else {
         println!("  WARNING: diff too large, investigate");
     }
-    println!("  Matmul:  median={:.1}us  p5={:.1}  p95={:.1}",
-             mm_med, p(&mm_us, 5.0), p(&mm_us, 95.0));
-    println!("  Conv1x1: median={:.1}us  p5={:.1}  p95={:.1}",
-             conv_med, p(&conv_us, 5.0), p(&conv_us, 95.0));
-    println!("  Speedup: {:.2}x (conv is {})",
-             speedup, if speedup > 1.0 { "FASTER" } else { "SLOWER" });
+    println!(
+        "  Matmul:  median={:.1}us  p5={:.1}  p95={:.1}",
+        mm_med,
+        p(&mm_us, 5.0),
+        p(&mm_us, 95.0)
+    );
+    println!(
+        "  Conv1x1: median={:.1}us  p5={:.1}  p95={:.1}",
+        conv_med,
+        p(&conv_us, 5.0),
+        p(&conv_us, 95.0)
+    );
+    println!(
+        "  Speedup: {:.2}x (conv is {})",
+        speedup,
+        if speedup > 1.0 { "FASTER" } else { "SLOWER" }
+    );
 }
 
 fn bench_dual(name: &str, ic: usize, oc: usize, seq: usize, iters: usize) {
     let sp = dyn_matmul::dual_spatial_width(seq, oc);
-    let input_shape = Shape { batch: 1, channels: ic, height: 1, width: sp };
-    let output_shape = Shape { batch: 1, channels: oc, height: 1, width: seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: sp,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: oc,
+        height: 1,
+        width: seq,
+    };
 
     let graph_mm = dyn_matmul::build_dual(ic, oc, seq);
     let exe_mm = graph_mm
@@ -134,7 +180,9 @@ fn bench_dual(name: &str, ic: usize, oc: usize, seq: usize, iters: usize) {
     let out_conv = TensorData::new(output_shape);
 
     exe_mm.run(&[&input_td], &[&out_mm]).expect("dual mm eval");
-    exe_conv.run(&[&input_td], &[&out_conv]).expect("dual conv eval");
+    exe_conv
+        .run(&[&input_td], &[&out_conv])
+        .expect("dual conv eval");
 
     let mm_vals = out_mm.as_f32_slice();
     let conv_vals = out_conv.as_f32_slice();

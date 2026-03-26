@@ -3,31 +3,39 @@
 //! gpt_karpathy: 6 layers, 48.8M params, SwiGLU, MHA, RoPE.
 //! Tied embedding weights (embedding table = output projection transposed).
 
-use crate::cpu::{rmsnorm, cross_entropy, embedding, vdsp};
-use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, ForwardCache, BackwardWorkspace};
-use crate::model::ModelConfig;
-use crate::training::LayerOptState;
+use crate::cpu::{cross_entropy, embedding, rmsnorm, vdsp};
+use crate::layer::{
+    self, BackwardWorkspace, CompiledKernels, ForwardCache, LayerGrads, LayerWeights,
+};
 use crate::metal_adam::MetalAdam;
+use crate::model::ModelConfig;
+use crate::sharding::{
+    ModeAdjustment, ResolvedBackwardMode, ResolvedForwardMode, ShardPolicy, ShardRequest,
+    resolve_modes,
+};
+use crate::training::LayerOptState;
 
 /// Full model weights.
 pub struct ModelWeights {
-    pub embed: Vec<f32>,       // [VOCAB * DIM]
+    pub embed: Vec<f32>, // [VOCAB * DIM]
     pub layers: Vec<LayerWeights>,
     pub gamma_final: Vec<f32>, // [DIM]
 }
 
 /// Full model gradients.
 pub struct ModelGrads {
-    pub dembed: Vec<f32>,      // [VOCAB * DIM]
+    pub dembed: Vec<f32>, // [VOCAB * DIM]
     pub layers: Vec<LayerGrads>,
     pub dgamma_final: Vec<f32>,
 }
 
 /// Full model optimizer state.
 pub struct ModelOptState {
-    pub embed_m: Vec<f32>, pub embed_v: Vec<f32>,
+    pub embed_m: Vec<f32>,
+    pub embed_v: Vec<f32>,
     pub layers: Vec<LayerOptState>,
-    pub gamma_final_m: Vec<f32>, pub gamma_final_v: Vec<f32>,
+    pub gamma_final_m: Vec<f32>,
+    pub gamma_final_v: Vec<f32>,
 }
 
 /// Training hyperparameters (from Obj-C reference).
@@ -69,22 +77,64 @@ impl Default for TrainConfig {
     }
 }
 
+/// Training-path parallelization controls.
+///
+/// Phase 4 scaffolding only: all current training code still executes the
+/// baseline path. These fields exist so training benchmarks and the trainer
+/// can thread an explicit options object before sharded forward/backward is
+/// enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrainingParallelOptions {
+    pub forward_mode: ResolvedForwardMode,
+    pub backward_mode: ResolvedBackwardMode,
+    pub adjustments: Vec<ModeAdjustment>,
+}
+
+impl TrainingParallelOptions {
+    pub fn disabled() -> Self {
+        Self {
+            forward_mode: ResolvedForwardMode::Baseline,
+            backward_mode: ResolvedBackwardMode::Baseline,
+            adjustments: Vec::new(),
+        }
+    }
+
+    pub fn forward_enabled(&self) -> bool {
+        !self.forward_mode.is_baseline()
+    }
+
+    pub fn backward_enabled(&self) -> bool {
+        !self.backward_mode.is_baseline()
+    }
+
+    pub fn from_env_for_cfg(cfg: &ModelConfig) -> Result<Self, String> {
+        let resolution = resolve_modes(cfg, ShardRequest::from_env()?, ShardPolicy::FailFast)?;
+        Ok(Self {
+            forward_mode: resolution.forward,
+            backward_mode: resolution.backward,
+            adjustments: resolution.adjustments,
+        })
+    }
+}
+
 /// Everything needed from forward pass for backward.
 pub struct ForwardResult {
     pub loss: f32,
     pub caches: Vec<ForwardCache>,
-    pub dlogits: Vec<f32>,        // [SEQ * VOCAB]
-    pub x_final: Vec<f32>,        // [DIM * SEQ] channel-first, post-norm
-    pub x_prenorm: Vec<f32>,      // [DIM * SEQ] channel-first, pre-final-norm
-    pub rms_inv_final: Vec<f32>,  // [SEQ]
-    pub logits_capped: Vec<f32>,  // [SEQ * VOCAB] post-softcap (empty if no softcap)
+    pub dlogits: Vec<f32>,       // [SEQ * VOCAB]
+    pub x_final: Vec<f32>,       // [DIM * SEQ] channel-first, post-norm
+    pub x_prenorm: Vec<f32>,     // [DIM * SEQ] channel-first, pre-final-norm
+    pub rms_inv_final: Vec<f32>, // [SEQ]
+    pub logits_capped: Vec<f32>, // [SEQ * VOCAB] post-softcap (empty if no softcap)
 }
 
 impl ModelWeights {
     pub fn random(cfg: &ModelConfig) -> Self {
         Self {
             embed: random_vec(cfg.vocab * cfg.dim, 0.005), // Obj-C E50 value
-            layers: (0..cfg.nlayers).map(|_| LayerWeights::random(cfg)).collect(),
+            layers: (0..cfg.nlayers)
+                .map(|_| LayerWeights::random(cfg))
+                .collect(),
             gamma_final: vec![1.0; cfg.dim],
         }
     }
@@ -113,7 +163,9 @@ impl ModelOptState {
         Self {
             embed_m: vec![0.0; cfg.vocab * cfg.dim],
             embed_v: vec![0.0; cfg.vocab * cfg.dim],
-            layers: (0..cfg.nlayers).map(|_| LayerOptState::zeros(cfg)).collect(),
+            layers: (0..cfg.nlayers)
+                .map(|_| LayerOptState::zeros(cfg))
+                .collect(),
             gamma_final_m: vec![0.0; cfg.dim],
             gamma_final_v: vec![0.0; cfg.dim],
         }
@@ -123,12 +175,14 @@ impl ModelOptState {
 /// Pre-allocated workspace for full model backward pass.
 /// Eliminates ~1.2 GB of per-call allocations (dl, dx_final, dy, rms_dot_buf, layer workspace).
 pub struct ModelBackwardWorkspace {
-    pub dl: Vec<f32>,            // [SEQ * VOCAB]
-    pub dx_final: Vec<f32>,      // [DIM * SEQ]
-    pub dy: Vec<f32>,            // [DIM * SEQ]
-    pub dy_buf: Vec<f32>,        // [DIM * SEQ] swap buffer for backward_into
-    pub rms_dot_buf: Vec<f32>,   // [SEQ]
+    pub dl: Vec<f32>,          // [SEQ * VOCAB]
+    pub dx_final: Vec<f32>,    // [DIM * SEQ]
+    pub dy: Vec<f32>,          // [DIM * SEQ]
+    pub dy_buf: Vec<f32>,      // [DIM * SEQ] swap buffer for backward_into
+    pub rms_dot_buf: Vec<f32>, // [SEQ]
     pub layer_ws: BackwardWorkspace,
+    pub training_attn_sharded: Option<layer::ShardedAttentionBackwardRuntime>,
+    pub training_ffn_sharded: Option<layer::ShardedFfnBackwardRuntime>,
 }
 
 impl ModelBackwardWorkspace {
@@ -140,6 +194,8 @@ impl ModelBackwardWorkspace {
             dy_buf: vec![0.0; cfg.dim * cfg.seq],
             rms_dot_buf: vec![0.0; cfg.seq],
             layer_ws: BackwardWorkspace::new(cfg),
+            training_attn_sharded: None,
+            training_ffn_sharded: None,
         }
     }
 }
@@ -149,16 +205,17 @@ impl ModelBackwardWorkspace {
 /// ~37MB for model-level buffers (logits, dlogits, etc.).
 pub struct ModelForwardWorkspace {
     pub caches: Vec<ForwardCache>,
-    pub x_row: Vec<f32>,        // [SEQ * DIM]
-    pub x_buf: Vec<f32>,        // [DIM * SEQ] current layer input
-    pub x_next_buf: Vec<f32>,   // [DIM * SEQ] current layer output
-    pub x_final: Vec<f32>,      // [DIM * SEQ] post final rmsnorm
-    pub x_prenorm: Vec<f32>,    // [DIM * SEQ] pre final rmsnorm (= last layer output)
-    pub rms_inv_final: Vec<f32>,// [SEQ]
-    pub x_final_row: Vec<f32>,  // [SEQ * DIM]
-    pub logits: Vec<f32>,       // [SEQ * VOCAB]
-    pub logits_capped: Vec<f32>,// [SEQ * VOCAB] (for softcap backward)
-    pub dlogits: Vec<f32>,      // [SEQ * VOCAB]
+    pub x_row: Vec<f32>,         // [SEQ * DIM]
+    pub x_buf: Vec<f32>,         // [DIM * SEQ] current layer input
+    pub x_next_buf: Vec<f32>,    // [DIM * SEQ] current layer output
+    pub x_final: Vec<f32>,       // [DIM * SEQ] post final rmsnorm
+    pub x_prenorm: Vec<f32>,     // [DIM * SEQ] pre final rmsnorm (= last layer output)
+    pub rms_inv_final: Vec<f32>, // [SEQ]
+    pub x_final_row: Vec<f32>,   // [SEQ * DIM]
+    pub logits: Vec<f32>,        // [SEQ * VOCAB]
+    pub logits_capped: Vec<f32>, // [SEQ * VOCAB] (for softcap backward)
+    pub dlogits: Vec<f32>,       // [SEQ * VOCAB]
+    pub combined_forward: Option<layer::CombinedForwardRuntime>,
 }
 
 impl ModelForwardWorkspace {
@@ -178,7 +235,257 @@ impl ModelForwardWorkspace {
             logits: vec![0.0; seq * vocab],
             logits_capped: vec![0.0; seq * vocab],
             dlogits: vec![0.0; seq * vocab],
+            combined_forward: None,
         }
+    }
+
+    /// Lean workspace for forward-only benchmarks.
+    /// Uses only 2 ForwardCache slots (ping-pong) instead of N layers.
+    /// Saves ~462MB per layer at dim=5120 — critical for 50B+ scales.
+    pub fn new_lean(cfg: &ModelConfig) -> Self {
+        let dim = cfg.dim;
+        let seq = cfg.seq;
+        let vocab = cfg.vocab;
+        Self {
+            caches: (0..2).map(|_| ForwardCache::new(cfg)).collect(),
+            x_row: vec![0.0; seq * dim],
+            x_buf: vec![0.0; dim * seq],
+            x_next_buf: vec![0.0; dim * seq],
+            x_final: vec![0.0; dim * seq],
+            x_prenorm: vec![0.0; dim * seq],
+            rms_inv_final: vec![0.0; seq],
+            x_final_row: vec![0.0; seq * dim],
+            logits: vec![0.0; seq * vocab],
+            logits_capped: vec![0.0; seq * vocab],
+            dlogits: vec![0.0; seq * vocab],
+            combined_forward: None,
+        }
+    }
+}
+
+fn ensure_combined_forward_runtime(
+    cfg: &ModelConfig,
+    ws: &mut ModelForwardWorkspace,
+    mode: ResolvedForwardMode,
+) {
+    if mode.is_baseline() {
+        ws.combined_forward = None;
+        return;
+    }
+    if ws.combined_forward.as_ref().map(|runtime| runtime.mode()) != Some(mode) {
+        ws.combined_forward = Some(
+            layer::CombinedForwardRuntime::compile(cfg, mode)
+                .expect("compile combined forward runtime"),
+        );
+    }
+}
+
+fn finalize_logits_and_loss(
+    cfg: &ModelConfig,
+    weights: &ModelWeights,
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+) -> f32 {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let vocab = cfg.vocab;
+
+    ws.x_prenorm.copy_from_slice(&ws.x_buf);
+    rmsnorm::forward_channel_first(
+        &ws.x_prenorm,
+        &weights.gamma_final,
+        &mut ws.x_final,
+        &mut ws.rms_inv_final,
+        dim,
+        seq,
+    );
+    vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
+    ws.logits.fill(0.0);
+    vdsp::sgemm_at(
+        &ws.x_final_row,
+        seq,
+        dim,
+        &weights.embed,
+        vocab,
+        &mut ws.logits,
+    );
+
+    if softcap > 0.0 {
+        vdsp::sscal(&mut ws.logits, 1.0 / softcap);
+        vdsp::tanhf(&ws.logits, &mut ws.logits_capped);
+        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits);
+    }
+
+    let total_loss = cross_entropy::forward_backward_batch(
+        &ws.logits,
+        targets,
+        vocab,
+        &mut ws.dlogits,
+        1.0 / seq as f32,
+    );
+
+    total_loss / seq as f32
+}
+
+fn forward_ws_nonbaseline(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+    mode: ResolvedForwardMode,
+) -> f32 {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let cache_len = ws.caches.len();
+
+    ensure_combined_forward_runtime(cfg, ws, mode);
+    let runtime = ws
+        .combined_forward
+        .as_mut()
+        .expect("combined forward runtime present");
+
+    embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
+    vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
+
+    for (layer_idx, layer_weights) in weights.layers.iter().enumerate() {
+        let cache_idx = if cache_len == cfg.nlayers {
+            layer_idx
+        } else {
+            layer_idx % cache_len
+        };
+        layer::forward_into_combined(
+            cfg,
+            kernels,
+            layer_weights,
+            &ws.x_buf,
+            &mut ws.caches[cache_idx],
+            &mut ws.x_next_buf,
+            runtime,
+        );
+        std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
+    }
+
+    finalize_logits_and_loss(cfg, weights, targets, softcap, ws)
+}
+
+/// Forward-only pass using lean workspace (2 cache slots, no backward data retained).
+/// Identical computation to forward_ws but reuses 2 ForwardCache slots.
+/// Only valid for decomposed FFN configs (dim >= ~1536) where prev_cache readback is a no-op.
+pub fn forward_only_ws(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+) -> f32 {
+    assert!(
+        ws.caches.len() >= 2,
+        "forward_only_ws requires at least 2 cache slots"
+    );
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let vocab = cfg.vocab;
+
+    // 1. Embedding lookup → x_buf [DIM, SEQ]
+    embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
+    vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
+
+    // 2. Forward through NL layers, reusing 2 cache slots (ping-pong).
+    for l in 0..cfg.nlayers {
+        let cur = l % 2;
+        if l > 0 {
+            let (first, second) = ws.caches.split_at_mut(1);
+            let (prev_cache, cur_cache) = if cur == 0 {
+                (&mut first[0], &mut second[0])
+            } else {
+                (&mut second[0], &mut first[0])
+            };
+            layer::forward_into_pipelined(
+                cfg,
+                kernels,
+                &weights.layers[l],
+                &ws.x_buf,
+                cur_cache,
+                &mut ws.x_next_buf,
+                Some(prev_cache),
+            );
+        } else {
+            layer::forward_into_pipelined(
+                cfg,
+                kernels,
+                &weights.layers[0],
+                &ws.x_buf,
+                &mut ws.caches[0],
+                &mut ws.x_next_buf,
+                None,
+            );
+        }
+        std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
+    }
+    // Read last layer's deferred cache (no-op for decomposed FFN)
+    let last = (cfg.nlayers - 1) % 2;
+    layer::read_ffn_cache(cfg, kernels, &mut ws.caches[last]);
+
+    // 3-7. Final norm → logits → loss (same as forward_ws)
+    ws.x_prenorm.copy_from_slice(&ws.x_buf);
+    rmsnorm::forward_channel_first(
+        &ws.x_prenorm,
+        &weights.gamma_final,
+        &mut ws.x_final,
+        &mut ws.rms_inv_final,
+        dim,
+        seq,
+    );
+    vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
+    ws.logits.fill(0.0);
+    vdsp::sgemm_at(
+        &ws.x_final_row,
+        seq,
+        dim,
+        &weights.embed,
+        vocab,
+        &mut ws.logits,
+    );
+
+    let has_softcap = softcap > 0.0;
+    if has_softcap {
+        vdsp::sscal(&mut ws.logits, 1.0 / softcap);
+        vdsp::tanhf(&ws.logits, &mut ws.logits_capped);
+        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits);
+    }
+
+    let total_loss = cross_entropy::forward_backward_batch(
+        &ws.logits,
+        targets,
+        vocab,
+        &mut ws.dlogits,
+        1.0 / seq as f32,
+    );
+
+    total_loss / seq as f32
+}
+
+pub fn forward_only_ws_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+    mode: ResolvedForwardMode,
+) -> f32 {
+    if mode.is_baseline() {
+        ws.combined_forward = None;
+        forward_only_ws(cfg, kernels, weights, tokens, targets, softcap, ws)
+    } else {
+        forward_ws_nonbaseline(cfg, kernels, weights, tokens, targets, softcap, ws, mode)
     }
 }
 
@@ -207,9 +514,25 @@ pub fn forward_ws(
     for l in 0..cfg.nlayers {
         if l > 0 {
             let (prev_caches, curr_caches) = ws.caches.split_at_mut(l);
-            layer::forward_into_pipelined(cfg, kernels, &weights.layers[l], &ws.x_buf, &mut curr_caches[0], &mut ws.x_next_buf, Some(&mut prev_caches[l - 1]));
+            layer::forward_into_pipelined(
+                cfg,
+                kernels,
+                &weights.layers[l],
+                &ws.x_buf,
+                &mut curr_caches[0],
+                &mut ws.x_next_buf,
+                Some(&mut prev_caches[l - 1]),
+            );
         } else {
-            layer::forward_into_pipelined(cfg, kernels, &weights.layers[0], &ws.x_buf, &mut ws.caches[0], &mut ws.x_next_buf, None);
+            layer::forward_into_pipelined(
+                cfg,
+                kernels,
+                &weights.layers[0],
+                &ws.x_buf,
+                &mut ws.caches[0],
+                &mut ws.x_next_buf,
+                None,
+            );
         }
         std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
     }
@@ -220,33 +543,52 @@ pub fn forward_ws(
     ws.x_prenorm.copy_from_slice(&ws.x_buf);
 
     // 4. Final RMSNorm
-    rmsnorm::forward_channel_first(&ws.x_prenorm, &weights.gamma_final, &mut ws.x_final, &mut ws.rms_inv_final, dim, seq);
+    rmsnorm::forward_channel_first(
+        &ws.x_prenorm,
+        &weights.gamma_final,
+        &mut ws.x_final,
+        &mut ws.rms_inv_final,
+        dim,
+        seq,
+    );
 
     // 5. Logits: x_final^T @ embed^T → [SEQ, VOCAB]
     //    sgemm_at uses beta=1.0 (C += A@B^T), so zero logits first to prevent
     //    accumulation across microbatch calls.
     vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
     ws.logits.fill(0.0);
-    vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
+    vdsp::sgemm_at(
+        &ws.x_final_row,
+        seq,
+        dim,
+        &weights.embed,
+        vocab,
+        &mut ws.logits,
+    );
 
     // 6. Softcap: logits = softcap * tanh(logits / softcap)
     //    Store unscaled tanh in logits_capped for backward (avoids extra pass + simplifies derivative).
     let has_softcap = softcap > 0.0;
     if has_softcap {
-        vdsp::sscal(&mut ws.logits, 1.0 / softcap);                      // pass 1: logits /= softcap
-        vdsp::tanhf(&ws.logits, &mut ws.logits_capped);                   // pass 2: logits_capped = tanh(logits/softcap)
-        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits);          // pass 3: logits = softcap * tanh(...)
+        vdsp::sscal(&mut ws.logits, 1.0 / softcap); // pass 1: logits /= softcap
+        vdsp::tanhf(&ws.logits, &mut ws.logits_capped); // pass 2: logits_capped = tanh(logits/softcap)
+        vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits); // pass 3: logits = softcap * tanh(...)
     }
 
     // 7. Cross-entropy
     let total_loss = cross_entropy::forward_backward_batch(
-        &ws.logits, targets, vocab, &mut ws.dlogits, 1.0 / seq as f32,
+        &ws.logits,
+        targets,
+        vocab,
+        &mut ws.dlogits,
+        1.0 / seq as f32,
     );
 
     total_loss / seq as f32
 }
 
 /// Backward pass using pre-allocated workspaces (reads from fwd_ws, writes grads).
+/// Returns raw gradient L2 norm (computed inline during backward, saves ~20ms standalone).
 pub fn backward_ws(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
@@ -257,7 +599,7 @@ pub fn backward_ws(
     loss_scale: f32,
     grads: &mut ModelGrads,
     bwd_ws: &mut ModelBackwardWorkspace,
-) {
+) -> f32 {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
@@ -278,13 +620,20 @@ pub fn backward_ws(
     // 3a. dx_final = embed^T @ dl (needed for RMSNorm backward, sequential)
     unsafe {
         vdsp::cblas_sgemm(
-            101, 112, 112,
-            dim as i32, seq as i32, vocab as i32,
+            101,
+            112,
+            112,
+            dim as i32,
+            seq as i32,
+            vocab as i32,
             1.0,
-            weights.embed.as_ptr(), dim as i32,
-            bwd_ws.dl.as_ptr(), vocab as i32,
+            weights.embed.as_ptr(),
+            dim as i32,
+            bwd_ws.dl.as_ptr(),
+            vocab as i32,
             0.0,
-            bwd_ws.dx_final.as_mut_ptr(), seq as i32,
+            bwd_ws.dx_final.as_mut_ptr(),
+            seq as i32,
         );
     }
 
@@ -297,29 +646,50 @@ pub fn backward_ws(
     let de_addr = grads.dembed.as_mut_ptr() as usize;
     let (sv, sd, ss) = (vocab as i32, dim as i32, seq as i32);
     std::thread::scope(|s| {
-        let sgemm_handle = s.spawn(move || {
-            unsafe {
-                vdsp::cblas_sgemm(
-                    101, 112, 112,
-                    sv, sd, ss,
-                    1.0,
-                    dl_addr as *const f32, sv,
-                    xf_addr as *const f32, ss,
-                    1.0,
-                    de_addr as *mut f32, sd,
-                );
-            }
+        let sgemm_handle = s.spawn(move || unsafe {
+            vdsp::cblas_sgemm(
+                101,
+                112,
+                112,
+                sv,
+                sd,
+                ss,
+                1.0,
+                dl_addr as *const f32,
+                sv,
+                xf_addr as *const f32,
+                ss,
+                1.0,
+                de_addr as *mut f32,
+                sd,
+            );
         });
 
         // 4. Final RMSNorm backward (main thread)
         rmsnorm::backward_channel_first(
-            &bwd_ws.dx_final, &fwd_ws.x_prenorm, &weights.gamma_final, &fwd_ws.rms_inv_final,
-            &mut bwd_ws.dy, &mut grads.dgamma_final, dim, seq, &mut bwd_ws.rms_dot_buf,
+            &bwd_ws.dx_final,
+            &fwd_ws.x_prenorm,
+            &weights.gamma_final,
+            &fwd_ws.rms_inv_final,
+            &mut bwd_ws.dy,
+            &mut grads.dgamma_final,
+            dim,
+            seq,
+            &mut bwd_ws.rms_dot_buf,
         );
 
         // 5. Backward through NL layers (main thread)
         for l in (0..cfg.nlayers).rev() {
-            layer::backward_into(cfg, kernels, &weights.layers[l], &fwd_ws.caches[l], &bwd_ws.dy, &mut grads.layers[l], &mut bwd_ws.layer_ws, &mut bwd_ws.dy_buf);
+            layer::backward_into(
+                cfg,
+                kernels,
+                &weights.layers[l],
+                &fwd_ws.caches[l],
+                &bwd_ws.dy,
+                &mut grads.layers[l],
+                &mut bwd_ws.layer_ws,
+                &mut bwd_ws.dy_buf,
+            );
             std::mem::swap(&mut bwd_ws.dy, &mut bwd_ws.dy_buf);
         }
 
@@ -328,6 +698,206 @@ pub fn backward_ws(
 
     // 6. Embedding backward (after dembed sgemm completes)
     embedding::backward_channel_first(&bwd_ws.dy, dim, tokens, &mut grads.dembed);
+    0.0 // caller should use grad_norm() if needed
+}
+
+pub fn forward_ws_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+    options: &TrainingParallelOptions,
+) -> f32 {
+    if options.forward_mode.is_baseline() {
+        ws.combined_forward = None;
+        forward_ws(cfg, kernels, weights, tokens, targets, softcap, ws)
+    } else {
+        forward_ws_nonbaseline(
+            cfg,
+            kernels,
+            weights,
+            tokens,
+            targets,
+            softcap,
+            ws,
+            options.forward_mode,
+        )
+    }
+}
+
+pub fn backward_ws_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    fwd_ws: &ModelForwardWorkspace,
+    tokens: &[u32],
+    softcap: f32,
+    loss_scale: f32,
+    grads: &mut ModelGrads,
+    bwd_ws: &mut ModelBackwardWorkspace,
+    options: &TrainingParallelOptions,
+) -> f32 {
+    if !options.backward_mode.is_baseline() {
+        match options.backward_mode {
+            ResolvedBackwardMode::Baseline => unreachable!("handled above"),
+            ResolvedBackwardMode::AttentionOnly { attn_shards } => {
+                if bwd_ws
+                    .training_attn_sharded
+                    .as_ref()
+                    .map(|runtime| runtime.shard_count())
+                    != Some(attn_shards)
+                {
+                    bwd_ws.training_attn_sharded = Some(
+                        layer::ShardedAttentionBackwardRuntime::compile(cfg, attn_shards)
+                            .expect("compile training sharded attention backward runtime"),
+                    );
+                }
+                bwd_ws.training_ffn_sharded = None;
+            }
+            ResolvedBackwardMode::FfnOnly { ffn_shards } => {
+                if bwd_ws
+                    .training_ffn_sharded
+                    .as_ref()
+                    .map(|runtime| runtime.shard_count())
+                    != Some(ffn_shards)
+                {
+                    bwd_ws.training_ffn_sharded = Some(
+                        layer::ShardedFfnBackwardRuntime::compile(cfg, ffn_shards)
+                            .expect("compile training sharded FFN backward runtime"),
+                    );
+                }
+                bwd_ws.training_attn_sharded = None;
+            }
+            ResolvedBackwardMode::AttentionFfn {
+                attn_shards,
+                ffn_shards,
+            } => {
+                if bwd_ws
+                    .training_attn_sharded
+                    .as_ref()
+                    .map(|runtime| runtime.shard_count())
+                    != Some(attn_shards)
+                {
+                    bwd_ws.training_attn_sharded = Some(
+                        layer::ShardedAttentionBackwardRuntime::compile(cfg, attn_shards)
+                            .expect("compile training sharded attention backward runtime"),
+                    );
+                }
+                if bwd_ws
+                    .training_ffn_sharded
+                    .as_ref()
+                    .map(|runtime| runtime.shard_count())
+                    != Some(ffn_shards)
+                {
+                    bwd_ws.training_ffn_sharded = Some(
+                        layer::ShardedFfnBackwardRuntime::compile(cfg, ffn_shards)
+                            .expect("compile training sharded FFN backward runtime"),
+                    );
+                }
+            }
+        }
+
+        let dim = cfg.dim;
+        let seq = cfg.seq;
+        let vocab = cfg.vocab;
+
+        if softcap > 0.0 {
+            let dl = &mut bwd_ws.dl;
+            let dlog = &fwd_ws.dlogits;
+            let t = &fwd_ws.logits_capped;
+            for i in 0..dl.len() {
+                dl[i] = dlog[i] * loss_scale * (1.0 - t[i] * t[i]);
+            }
+        } else {
+            vdsp::vsmul(&fwd_ws.dlogits, loss_scale, &mut bwd_ws.dl);
+        }
+
+        unsafe {
+            vdsp::cblas_sgemm(
+                101,
+                112,
+                112,
+                dim as i32,
+                seq as i32,
+                vocab as i32,
+                1.0,
+                weights.embed.as_ptr(),
+                dim as i32,
+                bwd_ws.dl.as_ptr(),
+                vocab as i32,
+                0.0,
+                bwd_ws.dx_final.as_mut_ptr(),
+                seq as i32,
+            );
+        }
+
+        let dl_addr = bwd_ws.dl.as_ptr() as usize;
+        let xf_addr = fwd_ws.x_final.as_ptr() as usize;
+        let de_addr = grads.dembed.as_mut_ptr() as usize;
+        let (sv, sd, ss) = (vocab as i32, dim as i32, seq as i32);
+        std::thread::scope(|s| {
+            let sgemm_handle = s.spawn(move || unsafe {
+                vdsp::cblas_sgemm(
+                    101,
+                    112,
+                    112,
+                    sv,
+                    sd,
+                    ss,
+                    1.0,
+                    dl_addr as *const f32,
+                    sv,
+                    xf_addr as *const f32,
+                    ss,
+                    1.0,
+                    de_addr as *mut f32,
+                    sd,
+                );
+            });
+
+            rmsnorm::backward_channel_first(
+                &bwd_ws.dx_final,
+                &fwd_ws.x_prenorm,
+                &weights.gamma_final,
+                &fwd_ws.rms_inv_final,
+                &mut bwd_ws.dy,
+                &mut grads.dgamma_final,
+                dim,
+                seq,
+                &mut bwd_ws.rms_dot_buf,
+            );
+
+            for l in (0..cfg.nlayers).rev() {
+                layer::backward_into_with_training_ffn(
+                    cfg,
+                    kernels,
+                    &weights.layers[l],
+                    &fwd_ws.caches[l],
+                    &bwd_ws.dy,
+                    &mut grads.layers[l],
+                    &mut bwd_ws.layer_ws,
+                    &mut bwd_ws.dy_buf,
+                    bwd_ws.training_attn_sharded.as_mut(),
+                    bwd_ws.training_ffn_sharded.as_mut(),
+                );
+                std::mem::swap(&mut bwd_ws.dy, &mut bwd_ws.dy_buf);
+            }
+
+            sgemm_handle.join().expect("dembed sgemm thread panicked");
+        });
+
+        embedding::backward_channel_first(&bwd_ws.dy, dim, tokens, &mut grads.dembed);
+        0.0
+    } else {
+        bwd_ws.training_attn_sharded = None;
+        bwd_ws.training_ffn_sharded = None;
+        backward_ws(
+            cfg, kernels, weights, fwd_ws, tokens, softcap, loss_scale, grads, bwd_ws,
+        )
+    }
 }
 
 /// Cosine LR schedule with linear warmup.
@@ -346,8 +916,8 @@ pub fn forward(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
     weights: &ModelWeights,
-    tokens: &[u32],   // [SEQ] input token IDs
-    targets: &[u32],  // [SEQ] target token IDs
+    tokens: &[u32],  // [SEQ] input token IDs
+    targets: &[u32], // [SEQ] target token IDs
     softcap: f32,
 ) -> ForwardResult {
     let dim = cfg.dim;
@@ -373,7 +943,14 @@ pub fn forward(
     let x_prenorm = x;
     let mut x_final = vec![0.0f32; dim * seq];
     let mut rms_inv_final = vec![0.0f32; seq];
-    rmsnorm::forward_channel_first(&x_prenorm, &weights.gamma_final, &mut x_final, &mut rms_inv_final, dim, seq);
+    rmsnorm::forward_channel_first(
+        &x_prenorm,
+        &weights.gamma_final,
+        &mut x_final,
+        &mut rms_inv_final,
+        dim,
+        seq,
+    );
 
     // 4. Logits: x_final^T @ embed^T → [SEQ, VOCAB]
     let mut x_final_row = vec![0.0f32; seq * dim];
@@ -388,14 +965,18 @@ pub fn forward(
     if has_softcap {
         logits_capped = vec![0.0f32; seq * vocab];
         vdsp::sscal(&mut logits, 1.0 / softcap);
-        vdsp::tanhf(&logits, &mut logits_capped);  // logits_capped = tanh(logits/softcap)
+        vdsp::tanhf(&logits, &mut logits_capped); // logits_capped = tanh(logits/softcap)
         vdsp::vsmul(&logits_capped, softcap, &mut logits); // logits = softcap * tanh(...)
     }
 
     // 6. Cross-entropy loss (batched — single alloc for all positions)
     let mut dlogits = vec![0.0f32; seq * vocab];
     let total_loss = cross_entropy::forward_backward_batch(
-        &logits, targets, vocab, &mut dlogits, 1.0 / seq as f32,
+        &logits,
+        targets,
+        vocab,
+        &mut dlogits,
+        1.0 / seq as f32,
     );
 
     ForwardResult {
@@ -411,17 +992,18 @@ pub fn forward(
 
 /// Full backward pass: logits grad → softcap → final norm → NL layers (reverse) → embedding.
 /// Takes a pre-allocated workspace to avoid per-call allocations (~1.2 GB churn).
+/// Returns raw gradient L2 norm (computed inline during backward, saves ~20ms standalone).
 pub fn backward(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
     weights: &ModelWeights,
     fwd: &ForwardResult,
-    tokens: &[u32],        // input token IDs (for embedding backward)
+    tokens: &[u32], // input token IDs (for embedding backward)
     softcap: f32,
     loss_scale: f32,
     grads: &mut ModelGrads,
     ws: &mut ModelBackwardWorkspace,
-) {
+) -> f32 {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
@@ -443,43 +1025,94 @@ pub fn backward(
     //    dembed += dl^T @ x_final^T: use BLAS trans flags, no mtrans needed
     unsafe {
         vdsp::cblas_sgemm(
-            101, 112, 112, // row-major, transA(dl), transB(x_final)
-            vocab as i32, dim as i32, seq as i32,
+            101,
+            112,
+            112, // row-major, transA(dl), transB(x_final)
+            vocab as i32,
+            dim as i32,
+            seq as i32,
             1.0,
-            ws.dl.as_ptr(), vocab as i32,
-            fwd.x_final.as_ptr(), seq as i32,
+            ws.dl.as_ptr(),
+            vocab as i32,
+            fwd.x_final.as_ptr(),
+            seq as i32,
             1.0,
-            grads.dembed.as_mut_ptr(), dim as i32,
+            grads.dembed.as_mut_ptr(),
+            dim as i32,
         );
     }
     //    dx_final = embed^T @ dl^T → directly in [dim,seq] channel-first, no mtrans
     unsafe {
         vdsp::cblas_sgemm(
-            101, 112, 112,
-            dim as i32, seq as i32, vocab as i32,
+            101,
+            112,
+            112,
+            dim as i32,
+            seq as i32,
+            vocab as i32,
             1.0,
-            weights.embed.as_ptr(), dim as i32,
-            ws.dl.as_ptr(), vocab as i32,
+            weights.embed.as_ptr(),
+            dim as i32,
+            ws.dl.as_ptr(),
+            vocab as i32,
             0.0,
-            ws.dx_final.as_mut_ptr(), seq as i32,
+            ws.dx_final.as_mut_ptr(),
+            seq as i32,
         );
     }
 
     // 4. Final RMSNorm backward (CPU) — channel-first, no transpose
     rmsnorm::backward_channel_first(
-        &ws.dx_final, &fwd.x_prenorm, &weights.gamma_final, &fwd.rms_inv_final,
-        &mut ws.dy, &mut grads.dgamma_final, dim, seq, &mut ws.rms_dot_buf,
+        &ws.dx_final,
+        &fwd.x_prenorm,
+        &weights.gamma_final,
+        &fwd.rms_inv_final,
+        &mut ws.dy,
+        &mut grads.dgamma_final,
+        dim,
+        seq,
+        &mut ws.rms_dot_buf,
     );
 
-    // 5. Backward through NL layers (reverse order, pre-allocated workspace)
+    // 5. Backward through NL layers (reverse order, zero-alloc via backward_into)
+    //    Inline grad_norm: accumulate per-layer norm during backward (saves ~20ms standalone).
+    let mut norm_sum = 0.0f32;
     for l in (0..cfg.nlayers).rev() {
-        // layer::backward returns dx into a new Vec; copy into ws.dy for next layer
-        let dx = layer::backward(cfg, kernels, &weights.layers[l], &fwd.caches[l], &ws.dy, &mut grads.layers[l], &mut ws.layer_ws);
-        ws.dy = dx;
+        layer::backward_into(
+            cfg,
+            kernels,
+            &weights.layers[l],
+            &fwd.caches[l],
+            &ws.dy,
+            &mut grads.layers[l],
+            &mut ws.layer_ws,
+            &mut ws.dy_buf,
+        );
+        std::mem::swap(&mut ws.dy, &mut ws.dy_buf);
+        // Accumulate grad norm for this layer (svesq is O(n) vectorized, ~1ms/layer)
+        let lg = &grads.layers[l];
+        for g in [
+            &lg.dwq,
+            &lg.dwk,
+            &lg.dwv,
+            &lg.dwo,
+            &lg.dw1,
+            &lg.dw3,
+            &lg.dw2,
+            &lg.dgamma1,
+            &lg.dgamma2,
+        ] {
+            norm_sum += vdsp::svesq(g);
+        }
     }
 
     // 6. Input embedding backward: channel-first scatter-add, no mtrans
     embedding::backward_channel_first(&ws.dy, dim, tokens, &mut grads.dembed);
+
+    // Include embedding + gamma_final norms
+    norm_sum += vdsp::svesq(&grads.dembed);
+    norm_sum += vdsp::svesq(&grads.dgamma_final);
+    norm_sum.sqrt()
 }
 
 /// Apply Adam to all model weights with split learning rates.
@@ -506,21 +1139,31 @@ pub fn update_weights(
     let (b1, b2, eps) = (tc.beta1, tc.beta2, tc.eps);
 
     // Destructure into independent borrows for safe parallel access.
-    let ModelWeights { embed: ref mut w_embed, layers: ref mut w_layers, gamma_final: ref mut w_gf } = *weights;
-    let ModelGrads { dembed: ref g_embed, layers: ref g_layers, dgamma_final: ref g_gf } = *grads;
+    let ModelWeights {
+        embed: ref mut w_embed,
+        layers: ref mut w_layers,
+        gamma_final: ref mut w_gf,
+    } = *weights;
+    let ModelGrads {
+        dembed: ref g_embed,
+        layers: ref g_layers,
+        dgamma_final: ref g_gf,
+    } = *grads;
     let ModelOptState {
-        embed_m: ref mut o_em, embed_v: ref mut o_ev,
+        embed_m: ref mut o_em,
+        embed_v: ref mut o_ev,
         layers: ref mut o_layers,
-        gamma_final_m: ref mut o_gfm, gamma_final_v: ref mut o_gfv,
+        gamma_final_m: ref mut o_gfm,
+        gamma_final_v: ref mut o_gfv,
     } = *opt;
 
     // 4-way split: embed+g1 | g2 | g3 | g4 (balanced by param count)
     // Each param: 28 bytes memory traffic (read grad/m/v/param, write m/v/param).
     // 4 threads → ~2x memory bandwidth on M4 Max UMA.
     let nl = cfg.nlayers;
-    let g1 = nl / 4;                       // embed + first quarter
-    let g2 = (nl - g1) / 3;                // second quarter
-    let g3 = (nl - g1 - g2) / 2;           // third quarter
+    let g1 = nl / 4; // embed + first quarter
+    let g2 = (nl - g1) / 3; // second quarter
+    let g3 = (nl - g1 - g2) / 2; // third quarter
     // g4 = nl - g1 - g2 - g3 (remainder on main thread)
 
     let (wl_a, wl_rest) = w_layers.split_at_mut(g1);
@@ -536,30 +1179,82 @@ pub fn update_weights(
     std::thread::scope(|s| {
         // Thread 1: embed + gamma_final + first group
         let h1 = s.spawn(move || {
-            step_fused(w_embed, g_embed, o_em, o_ev, t, embed_lr, b1, b2, eps, 0.0, grad_scale);
-            step_fused(w_gf, g_gf, o_gfm, o_gfv, t, lr, b1, b2, eps, 0.0, grad_scale);
+            step_fused(
+                w_embed, g_embed, o_em, o_ev, t, embed_lr, b1, b2, eps, 0.0, grad_scale,
+            );
+            step_fused(
+                w_gf, g_gf, o_gfm, o_gfv, t, lr, b1, b2, eps, 0.0, grad_scale,
+            );
             for l in 0..wl_a.len() {
-                update_layer(&mut wl_a[l], &gl_a[l], &mut ol_a[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+                update_layer(
+                    &mut wl_a[l],
+                    &gl_a[l],
+                    &mut ol_a[l],
+                    t,
+                    matrix_lr,
+                    b1,
+                    b2,
+                    eps,
+                    wd,
+                    lr,
+                    grad_scale,
+                );
             }
         });
 
         // Thread 2: second group
         let h2 = s.spawn(move || {
             for l in 0..wl_b.len() {
-                update_layer(&mut wl_b[l], &gl_b[l], &mut ol_b[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+                update_layer(
+                    &mut wl_b[l],
+                    &gl_b[l],
+                    &mut ol_b[l],
+                    t,
+                    matrix_lr,
+                    b1,
+                    b2,
+                    eps,
+                    wd,
+                    lr,
+                    grad_scale,
+                );
             }
         });
 
         // Thread 3: third group
         let h3 = s.spawn(move || {
             for l in 0..wl_c.len() {
-                update_layer(&mut wl_c[l], &gl_c[l], &mut ol_c[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+                update_layer(
+                    &mut wl_c[l],
+                    &gl_c[l],
+                    &mut ol_c[l],
+                    t,
+                    matrix_lr,
+                    b1,
+                    b2,
+                    eps,
+                    wd,
+                    lr,
+                    grad_scale,
+                );
             }
         });
 
         // Main thread: fourth group (remainder)
         for l in 0..wl_d.len() {
-            update_layer(&mut wl_d[l], &gl_d[l], &mut ol_d[l], t, matrix_lr, b1, b2, eps, wd, lr, grad_scale);
+            update_layer(
+                &mut wl_d[l],
+                &gl_d[l],
+                &mut ol_d[l],
+                t,
+                matrix_lr,
+                b1,
+                b2,
+                eps,
+                wd,
+                lr,
+                grad_scale,
+            );
         }
 
         h1.join().expect("Adam thread 1 panicked");
@@ -576,22 +1271,132 @@ fn update_layer(
     o: &mut LayerOptState,
     t: u32,
     matrix_lr: f32,
-    b1: f32, b2: f32, eps: f32, wd: f32,
+    b1: f32,
+    b2: f32,
+    eps: f32,
+    wd: f32,
     lr: f32,
     grad_scale: f32,
 ) {
     use crate::cpu::adam::step_fused;
-    step_fused(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-    step_fused(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
-    step_fused(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
+    step_fused(
+        &mut w.wq,
+        &g.dwq,
+        &mut o.m_wq,
+        &mut o.v_wq,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.wk,
+        &g.dwk,
+        &mut o.m_wk,
+        &mut o.v_wk,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.wv,
+        &g.dwv,
+        &mut o.m_wv,
+        &mut o.v_wv,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.wo,
+        &g.dwo,
+        &mut o.m_wo,
+        &mut o.v_wo,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.w1,
+        &g.dw1,
+        &mut o.m_w1,
+        &mut o.v_w1,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.w3,
+        &g.dw3,
+        &mut o.m_w3,
+        &mut o.v_w3,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.w2,
+        &g.dw2,
+        &mut o.m_w2,
+        &mut o.v_w2,
+        t,
+        matrix_lr,
+        b1,
+        b2,
+        eps,
+        wd,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.gamma1,
+        &g.dgamma1,
+        &mut o.m_gamma1,
+        &mut o.v_gamma1,
+        t,
+        lr,
+        b1,
+        b2,
+        eps,
+        0.0,
+        grad_scale,
+    );
+    step_fused(
+        &mut w.gamma2,
+        &g.dgamma2,
+        &mut o.m_gamma2,
+        &mut o.v_gamma2,
+        t,
+        lr,
+        b1,
+        b2,
+        eps,
+        0.0,
+        grad_scale,
+    );
 }
-
 
 /// Global gradient L2 norm (uses vDSP_svesq — single call per tensor, no scratch).
 /// Split across 2 threads: embed+gamma+layers[0..mid] on thread 1, layers[mid..] on main.
@@ -604,7 +1409,17 @@ pub fn grad_norm(grads: &ModelGrads) -> f32 {
             let mut sum = vdsp::svesq(&grads.dembed);
             sum += vdsp::svesq(&grads.dgamma_final);
             for lg in lo {
-                for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+                for g in [
+                    &lg.dwq,
+                    &lg.dwk,
+                    &lg.dwv,
+                    &lg.dwo,
+                    &lg.dw1,
+                    &lg.dw3,
+                    &lg.dw2,
+                    &lg.dgamma1,
+                    &lg.dgamma2,
+                ] {
                     sum += vdsp::svesq(g);
                 }
             }
@@ -613,7 +1428,17 @@ pub fn grad_norm(grads: &ModelGrads) -> f32 {
 
         let mut sum = 0.0f32;
         for lg in hi {
-            for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+            for g in [
+                &lg.dwq,
+                &lg.dwk,
+                &lg.dwv,
+                &lg.dwo,
+                &lg.dw1,
+                &lg.dw3,
+                &lg.dw2,
+                &lg.dgamma1,
+                &lg.dgamma2,
+            ] {
                 sum += vdsp::svesq(g);
             }
         }
@@ -649,7 +1474,9 @@ fn random_vec(n: usize, scale: f32) -> Vec<f32> {
     let mut v = vec![0.0f32; n];
     let mut seed: u64 = 42 + n as u64;
     for x in v.iter_mut() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let r = ((seed >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0;
         *x = r * scale;
     }
@@ -664,12 +1491,42 @@ pub fn train_step(
     weights: &mut ModelWeights,
     grads: &mut ModelGrads,
     opt: &mut ModelOptState,
-    data: &[u16],          // all training tokens
+    data: &[u16], // all training tokens
     step: u32,
     tc: &TrainConfig,
     metal_adam: &MetalAdam,
     fwd_ws: &mut ModelForwardWorkspace,
     bwd_ws: &mut ModelBackwardWorkspace,
+) -> f32 {
+    train_step_with_options(
+        cfg,
+        kernels,
+        weights,
+        grads,
+        opt,
+        data,
+        step,
+        tc,
+        metal_adam,
+        fwd_ws,
+        bwd_ws,
+        &TrainingParallelOptions::disabled(),
+    )
+}
+
+pub fn train_step_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &mut ModelWeights,
+    grads: &mut ModelGrads,
+    opt: &mut ModelOptState,
+    data: &[u16], // all training tokens
+    step: u32,
+    tc: &TrainConfig,
+    metal_adam: &MetalAdam,
+    fwd_ws: &mut ModelForwardWorkspace,
+    bwd_ws: &mut ModelBackwardWorkspace,
+    options: &TrainingParallelOptions,
 ) -> f32 {
     let seq = cfg.seq;
     grads.zero_out();
@@ -681,15 +1538,34 @@ pub fn train_step(
         // Random position (simple LCG)
         let pos = ((step as u64 * 7919 + _micro as u64 * 104729) % max_pos as u64) as usize;
         let input_tokens: Vec<u32> = data[pos..pos + seq].iter().map(|&t| t as u32).collect();
-        let target_tokens: Vec<u32> = data[pos + 1..pos + seq + 1].iter().map(|&t| t as u32).collect();
+        let target_tokens: Vec<u32> = data[pos + 1..pos + seq + 1]
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
 
-        let loss = forward_ws(
-            cfg, kernels, weights, &input_tokens, &target_tokens, tc.softcap, fwd_ws,
+        let loss = forward_ws_with_options(
+            cfg,
+            kernels,
+            weights,
+            &input_tokens,
+            &target_tokens,
+            tc.softcap,
+            fwd_ws,
+            options,
         );
         total_loss += loss;
 
-        backward_ws(
-            cfg, kernels, weights, fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, grads, bwd_ws,
+        backward_ws_with_options(
+            cfg,
+            kernels,
+            weights,
+            fwd_ws,
+            &input_tokens,
+            tc.softcap,
+            tc.loss_scale,
+            grads,
+            bwd_ws,
+            options,
         );
     }
 
@@ -708,7 +1584,17 @@ pub fn train_step(
 
     // Weight update with fused grad scaling (GPU applies grad * combined_scale inline)
     // Eliminates separate CPU sscal pass over ~168MB
-    update_weights(cfg, weights, grads, opt, step + 1, lr, tc, metal_adam, combined_scale);
+    update_weights(
+        cfg,
+        weights,
+        grads,
+        opt,
+        step + 1,
+        lr,
+        tc,
+        metal_adam,
+        combined_scale,
+    );
 
     total_loss / tc.accum_steps as f32
 }
@@ -741,7 +1627,14 @@ pub fn forward_losses(
     // Final RMSNorm — channel-first, no transpose
     let mut x_final = vec![0.0f32; dim * seq];
     let mut rms_inv = vec![0.0f32; seq];
-    rmsnorm::forward_channel_first(&x, &weights.gamma_final, &mut x_final, &mut rms_inv, dim, seq);
+    rmsnorm::forward_channel_first(
+        &x,
+        &weights.gamma_final,
+        &mut x_final,
+        &mut rms_inv,
+        dim,
+        seq,
+    );
 
     // Logits
     let mut x_final_row = vec![0.0f32; seq * dim];

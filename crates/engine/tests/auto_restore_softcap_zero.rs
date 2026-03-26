@@ -22,8 +22,10 @@
 //!   2. Finite/loss-decrease check fails → softcap=0.0 code path has a bug.
 //!   3. Continuity check fails → softcap logic has a discontinuity at 0.
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace,
-                          ModelBackwardWorkspace, TrainConfig};
+use engine::full_model::{
+    self, ModelBackwardWorkspace, ModelForwardWorkspace, ModelGrads, ModelOptState, ModelWeights,
+    TrainConfig,
+};
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
 
@@ -54,20 +56,45 @@ fn softcap_zero_produces_finite_loss_and_gradients() {
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
     let weights = ModelWeights::random(&cfg);
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
 
     // Forward with softcap=0.0
-    let loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, 0.0, &mut fwd_ws);
-    assert!(loss.is_finite(), "loss = {loss} (not finite with softcap=0.0)");
+    let loss = full_model::forward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        0.0,
+        &mut fwd_ws,
+    );
+    assert!(
+        loss.is_finite(),
+        "loss = {loss} (not finite with softcap=0.0)"
+    );
     assert!(loss > 0.0, "loss = {loss} (must be positive)");
 
     // Backward with softcap=0.0
-    full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, 0.0, 1.0, &mut grads, &mut bwd_ws);
+    full_model::backward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_ws,
+        &tokens,
+        0.0,
+        1.0,
+        &mut grads,
+        &mut bwd_ws,
+    );
 
     // All gradients must be finite
     assert_finite(&grads.dembed, "dembed");
@@ -93,8 +120,12 @@ fn softcap_zero_weights_move_after_5_steps() {
     let mut grads = ModelGrads::zeros(&cfg);
     let mut opt = ModelOptState::zeros(&cfg);
 
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 13 + 5) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 13 + 5) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 13 + 5) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 13 + 5) % cfg.vocab) as u32)
+        .collect();
 
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
@@ -112,18 +143,60 @@ fn softcap_zero_weights_move_after_5_steps() {
 
     for step in 0..5u32 {
         grads.zero_out();
-        let loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let loss = full_model::forward_ws(
+            &cfg,
+            &kernels,
+            &weights,
+            &tokens,
+            &targets,
+            tc.softcap,
+            &mut fwd_ws,
+        );
         assert!(loss.is_finite(), "step {step}: loss = {loss} (not finite)");
-        full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        full_model::backward_ws(
+            &cfg,
+            &kernels,
+            &weights,
+            &fwd_ws,
+            &tokens,
+            tc.softcap,
+            tc.loss_scale,
+            &mut grads,
+            &mut bwd_ws,
+        );
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
+        full_model::update_weights(
+            &cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            1.0,
+        );
     }
 
     // Embedding and gamma_final are non-zero-initialized → must move
-    let embed_diff: f32 = embed_init.iter().zip(&weights.embed).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    let gamma_diff: f32 = gamma_final_init.iter().zip(&weights.gamma_final).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(embed_diff > 0.0, "embedding didn't move with softcap=0.0 (max diff=0)");
-    assert!(gamma_diff > 0.0, "gamma_final didn't move with softcap=0.0 (max diff=0)");
+    let embed_diff: f32 = embed_init
+        .iter()
+        .zip(&weights.embed)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let gamma_diff: f32 = gamma_final_init
+        .iter()
+        .zip(&weights.gamma_final)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        embed_diff > 0.0,
+        "embedding didn't move with softcap=0.0 (max diff=0)"
+    );
+    assert!(
+        gamma_diff > 0.0,
+        "gamma_final didn't move with softcap=0.0 (max diff=0)"
+    );
 }
 
 #[test]
@@ -138,26 +211,51 @@ fn softcap_zero_and_near_zero_agree() {
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
     let weights = ModelWeights::random(&cfg);
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 7 + 3) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 7 + 3) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 7 + 3) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 7 + 3) % cfg.vocab) as u32)
+        .collect();
 
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
 
     // Path 1: softcap=0.0 (no tanh)
-    let loss_no_cap = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, 0.0, &mut fwd_ws);
+    let loss_no_cap = full_model::forward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        0.0,
+        &mut fwd_ws,
+    );
 
     // Path 2: softcap=1000.0 (huge cap → tanh(x/1000)≈x/1000 for small x, then *1000 ≈ x)
     // With large softcap, the tanh is near-linear and the result should be close to no-cap.
-    let loss_large_cap = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, 1000.0, &mut fwd_ws);
+    let loss_large_cap = full_model::forward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        1000.0,
+        &mut fwd_ws,
+    );
 
     assert!(loss_no_cap.is_finite(), "loss_no_cap = {loss_no_cap}");
-    assert!(loss_large_cap.is_finite(), "loss_large_cap = {loss_large_cap}");
+    assert!(
+        loss_large_cap.is_finite(),
+        "loss_large_cap = {loss_large_cap}"
+    );
 
     // With softcap=1000 (much larger than typical logit magnitude ~1-10),
     // tanh is near-linear so losses should agree within 5%.
     let rel_diff = (loss_no_cap - loss_large_cap).abs() / loss_no_cap.abs().max(1e-6);
-    assert!(rel_diff < 0.05,
+    assert!(
+        rel_diff < 0.05,
         "softcap=0.0 ({loss_no_cap:.4}) and softcap=1000.0 ({loss_large_cap:.4}) disagree \
          by {:.1}% — expected <5% for near-linear tanh regime",
-        rel_diff * 100.0);
+        rel_diff * 100.0
+    );
 }

@@ -1,0 +1,79 @@
+[
+  {
+    "group": "baseline",
+    "name": "7B",
+    "dim": 4096,
+    "hidden": 11008,
+    "heads": 32,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 240.393,
+    "error": null
+  },
+  {
+    "group": "baseline",
+    "name": "10B",
+    "dim": 4096,
+    "hidden": 11008,
+    "heads": 32,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 225.75395,
+    "error": null
+  },
+  {
+    "group": "baseline",
+    "name": "20B",
+    "dim": 5120,
+    "hidden": 13824,
+    "heads": 40,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 252.25684,
+    "error": null
+  },
+  {
+    "group": "baseline",
+    "name": "30B",
+    "dim": 6144,
+    "hidden": 16384,
+    "heads": 48,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 255.72958,
+    "error": null
+  },
+  {
+    "group": "baseline",
+    "name": "40B",
+    "dim": 5120,
+    "hidden": 13824,
+    "heads": 40,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 255.56364,
+    "error": null
+  },
+  {
+    "group": "larger",
+    "name": "50B",
+    "dim": 6144,
+    "hidden": 16384,
+    "heads": 48,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 258.01166,
+    "error": null
+  },
+  {
+    "group": "larger",
+    "name": "60B",
+    "dim": 6144,
+    "hidden": 16384,
+    "heads": 48,
+    "seq": 512,
+    "compile_ok": true,
+    "compile_ms": 258.86255,
+    "error": null
+  }
+]

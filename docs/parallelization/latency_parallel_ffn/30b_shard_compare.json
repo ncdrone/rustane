@@ -1,0 +1,416 @@
+{
+  "config_name": "30B",
+  "dim": 5120,
+  "hidden": 13824,
+  "heads": 40,
+  "nlayers": 96,
+  "seq": 512,
+  "baseline": {
+    "mode": "baseline",
+    "shard_count": 1,
+    "compile_s": 3.1703417,
+    "samples": [
+      {
+        "full_layer_ms": 239.0887,
+        "ffn_only_ms": 178.6336,
+        "w13_stage_ms": 5.473125,
+        "w13_ane_ms": 171.82703,
+        "w13_read_ms": 1.333458,
+        "gate_cpu_ms": 0.0,
+        "w2_stage_ms": 0.0,
+        "w2_ane_ms": 0.0,
+        "w2_read_ms": 0.0,
+        "merge_cpu_ms": 0.0
+      },
+      {
+        "full_layer_ms": 219.64429,
+        "ffn_only_ms": 166.80667,
+        "w13_stage_ms": 5.740125,
+        "w13_ane_ms": 160.162,
+        "w13_read_ms": 0.904541,
+        "gate_cpu_ms": 0.0,
+        "w2_stage_ms": 0.0,
+        "w2_ane_ms": 0.0,
+        "w2_read_ms": 0.0,
+        "merge_cpu_ms": 0.0
+      },
+      {
+        "full_layer_ms": 217.47646,
+        "ffn_only_ms": 165.36243,
+        "w13_stage_ms": 5.6810412,
+        "w13_ane_ms": 158.83922,
+        "w13_read_ms": 0.842166,
+        "gate_cpu_ms": 0.0,
+        "w2_stage_ms": 0.0,
+        "w2_ane_ms": 0.0,
+        "w2_read_ms": 0.0,
+        "merge_cpu_ms": 0.0
+      },
+      {
+        "full_layer_ms": 217.13544,
+        "ffn_only_ms": 165.07095,
+        "w13_stage_ms": 5.708917,
+        "w13_ane_ms": 158.56816,
+        "w13_read_ms": 0.79387504,
+        "gate_cpu_ms": 0.0,
+        "w2_stage_ms": 0.0,
+        "w2_ane_ms": 0.0,
+        "w2_read_ms": 0.0,
+        "merge_cpu_ms": 0.0
+      },
+      {
+        "full_layer_ms": 217.40746,
+        "ffn_only_ms": 165.32487,
+        "w13_stage_ms": 5.408625,
+        "w13_ane_ms": 159.0835,
+        "w13_read_ms": 0.83275,
+        "gate_cpu_ms": 0.0,
+        "w2_stage_ms": 0.0,
+        "w2_ane_ms": 0.0,
+        "w2_read_ms": 0.0,
+        "merge_cpu_ms": 0.0
+      }
+    ],
+    "median_full_layer_ms": 217.47646,
+    "median_ffn_only_ms": 165.36243,
+    "max_rss_mb": 3323.7344,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0
+    },
+    "correctness_pass": true,
+    "full_layer_win_pct_vs_baseline": 0.0,
+    "meets_perf_gate": false,
+    "bucket_note": "Baseline uses coarse FFN timer buckets from layer::forward_timed; W13/W2/gate/merge are not separately exposed."
+  },
+  "shard2": {
+    "mode": "shard2",
+    "shard_count": 2,
+    "compile_s": 0.64750904,
+    "samples": [
+      {
+        "full_layer_ms": 138.37062,
+        "ffn_only_ms": 84.80171,
+        "w13_stage_ms": 20.904543,
+        "w13_ane_ms": 21.60704,
+        "w13_read_ms": 0.88570803,
+        "gate_cpu_ms": 4.4595423,
+        "w2_stage_ms": 24.5605,
+        "w2_ane_ms": 12.2127495,
+        "w2_read_ms": 0.333375,
+        "merge_cpu_ms": 1.018167
+      },
+      {
+        "full_layer_ms": 122.40413,
+        "ffn_only_ms": 75.91517,
+        "w13_stage_ms": 14.049958,
+        "w13_ane_ms": 21.226707,
+        "w13_read_ms": 1.238,
+        "gate_cpu_ms": 4.465917,
+        "w2_stage_ms": 21.676792,
+        "w2_ane_ms": 11.956666,
+        "w2_read_ms": 0.345083,
+        "merge_cpu_ms": 1.118292
+      },
+      {
+        "full_layer_ms": 123.744,
+        "ffn_only_ms": 77.34204,
+        "w13_stage_ms": 13.962458,
+        "w13_ane_ms": 22.491333,
+        "w13_read_ms": 1.214334,
+        "gate_cpu_ms": 4.5680842,
+        "w2_stage_ms": 21.498499,
+        "w2_ane_ms": 12.201918,
+        "w2_read_ms": 0.385584,
+        "merge_cpu_ms": 1.038625
+      },
+      {
+        "full_layer_ms": 121.770546,
+        "ffn_only_ms": 75.05387,
+        "w13_stage_ms": 13.60025,
+        "w13_ane_ms": 21.978,
+        "w13_read_ms": 1.101666,
+        "gate_cpu_ms": 4.42775,
+        "w2_stage_ms": 21.4525,
+        "w2_ane_ms": 11.656416,
+        "w2_read_ms": 0.464333,
+        "merge_cpu_ms": 1.193583
+      },
+      {
+        "full_layer_ms": 121.83513,
+        "ffn_only_ms": 75.85434,
+        "w13_stage_ms": 14.151208,
+        "w13_ane_ms": 21.04075,
+        "w13_read_ms": 1.175667,
+        "gate_cpu_ms": 4.5014577,
+        "w2_stage_ms": 21.376583,
+        "w2_ane_ms": 12.680792,
+        "w2_read_ms": 0.3515,
+        "merge_cpu_ms": 1.112042
+      }
+    ],
+    "median_full_layer_ms": 122.40413,
+    "median_ffn_only_ms": 75.91517,
+    "max_rss_mb": 5412.6406,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0
+    },
+    "correctness_pass": true,
+    "full_layer_win_pct_vs_baseline": 43.71615,
+    "meets_perf_gate": true,
+    "bucket_note": "Shard buckets are recorded as max per-shard phase time; FFN-only wall time is end-to-end outer shard section wall."
+  },
+  "shard4": {
+    "mode": "shard4",
+    "shard_count": 4,
+    "compile_s": 0.7320149,
+    "samples": [
+      {
+        "full_layer_ms": 117.458084,
+        "ffn_only_ms": 62.768913,
+        "w13_stage_ms": 18.127293,
+        "w13_ane_ms": 19.032167,
+        "w13_read_ms": 0.74770904,
+        "gate_cpu_ms": 2.381458,
+        "w2_stage_ms": 15.857667,
+        "w2_ane_ms": 4.7268753,
+        "w2_read_ms": 0.60404205,
+        "merge_cpu_ms": 2.2996671
+      },
+      {
+        "full_layer_ms": 100.88838,
+        "ffn_only_ms": 54.506916,
+        "w13_stage_ms": 15.334333,
+        "w13_ane_ms": 19.800125,
+        "w13_read_ms": 0.55295897,
+        "gate_cpu_ms": 2.474959,
+        "w2_stage_ms": 12.385959,
+        "w2_ane_ms": 4.430459,
+        "w2_read_ms": 0.443917,
+        "merge_cpu_ms": 1.6950841
+      },
+      {
+        "full_layer_ms": 102.32666,
+        "ffn_only_ms": 55.862293,
+        "w13_stage_ms": 16.208,
+        "w13_ane_ms": 20.030334,
+        "w13_read_ms": 0.622666,
+        "gate_cpu_ms": 2.409916,
+        "w2_stage_ms": 13.262792,
+        "w2_ane_ms": 4.51925,
+        "w2_read_ms": 0.458459,
+        "merge_cpu_ms": 1.74975
+      },
+      {
+        "full_layer_ms": 101.38754,
+        "ffn_only_ms": 54.598877,
+        "w13_stage_ms": 14.873375,
+        "w13_ane_ms": 19.545208,
+        "w13_read_ms": 0.717625,
+        "gate_cpu_ms": 2.312333,
+        "w2_stage_ms": 12.14875,
+        "w2_ane_ms": 4.405083,
+        "w2_read_ms": 0.48799998,
+        "merge_cpu_ms": 1.8452921
+      },
+      {
+        "full_layer_ms": 102.415375,
+        "ffn_only_ms": 56.014126,
+        "w13_stage_ms": 15.616583,
+        "w13_ane_ms": 19.930164,
+        "w13_read_ms": 0.676166,
+        "gate_cpu_ms": 2.1986248,
+        "w2_stage_ms": 11.888625,
+        "w2_ane_ms": 4.139833,
+        "w2_read_ms": 0.52275,
+        "merge_cpu_ms": 1.773292
+      }
+    ],
+    "median_full_layer_ms": 102.32666,
+    "median_ffn_only_ms": 55.862293,
+    "max_rss_mb": 6688.547,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0
+    },
+    "correctness_pass": true,
+    "full_layer_win_pct_vs_baseline": 52.948166,
+    "meets_perf_gate": true,
+    "bucket_note": "Shard buckets are recorded as max per-shard phase time; FFN-only wall time is end-to-end outer shard section wall."
+  },
+  "shard6": {
+    "mode": "shard6",
+    "shard_count": 6,
+    "compile_s": 0.91872114,
+    "samples": [
+      {
+        "full_layer_ms": 106.518,
+        "ffn_only_ms": 51.667957,
+        "w13_stage_ms": 18.008585,
+        "w13_ane_ms": 18.357668,
+        "w13_read_ms": 1.018042,
+        "gate_cpu_ms": 1.609084,
+        "w2_stage_ms": 9.144667,
+        "w2_ane_ms": 6.018,
+        "w2_read_ms": 0.66425,
+        "merge_cpu_ms": 2.535292
+      },
+      {
+        "full_layer_ms": 93.17375,
+        "ffn_only_ms": 46.975666,
+        "w13_stage_ms": 15.036207,
+        "w13_ane_ms": 18.770084,
+        "w13_read_ms": 0.48670802,
+        "gate_cpu_ms": 1.629042,
+        "w2_stage_ms": 7.105292,
+        "w2_ane_ms": 8.152416,
+        "w2_read_ms": 0.502375,
+        "merge_cpu_ms": 2.724917
+      },
+      {
+        "full_layer_ms": 94.23842,
+        "ffn_only_ms": 47.465458,
+        "w13_stage_ms": 14.812918,
+        "w13_ane_ms": 19.49346,
+        "w13_read_ms": 0.615292,
+        "gate_cpu_ms": 1.5483329,
+        "w2_stage_ms": 6.009125,
+        "w2_ane_ms": 8.708041,
+        "w2_read_ms": 0.568208,
+        "merge_cpu_ms": 2.4077911
+      },
+      {
+        "full_layer_ms": 93.45841,
+        "ffn_only_ms": 47.09296,
+        "w13_stage_ms": 15.510416,
+        "w13_ane_ms": 18.446877,
+        "w13_read_ms": 0.50862503,
+        "gate_cpu_ms": 1.594709,
+        "w2_stage_ms": 6.064959,
+        "w2_ane_ms": 7.899208,
+        "w2_read_ms": 0.562458,
+        "merge_cpu_ms": 2.442417
+      },
+      {
+        "full_layer_ms": 92.93504,
+        "ffn_only_ms": 46.083042,
+        "w13_stage_ms": 14.598042,
+        "w13_ane_ms": 18.553,
+        "w13_read_ms": 0.336916,
+        "gate_cpu_ms": 1.548916,
+        "w2_stage_ms": 5.988917,
+        "w2_ane_ms": 8.168751,
+        "w2_read_ms": 0.58937496,
+        "merge_cpu_ms": 2.42225
+      }
+    ],
+    "median_full_layer_ms": 93.45841,
+    "median_ffn_only_ms": 47.09296,
+    "max_rss_mb": 6314.75,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0
+    },
+    "correctness_pass": true,
+    "full_layer_win_pct_vs_baseline": 57.025963,
+    "meets_perf_gate": true,
+    "bucket_note": "Shard buckets are recorded as max per-shard phase time; FFN-only wall time is end-to-end outer shard section wall."
+  },
+  "shard8": {
+    "mode": "shard8",
+    "shard_count": 8,
+    "compile_s": 0.9625156,
+    "samples": [
+      {
+        "full_layer_ms": 104.35666,
+        "ffn_only_ms": 51.61325,
+        "w13_stage_ms": 18.490124,
+        "w13_ane_ms": 19.92333,
+        "w13_read_ms": 0.910417,
+        "gate_cpu_ms": 1.254417,
+        "w2_stage_ms": 6.563125,
+        "w2_ane_ms": 10.381583,
+        "w2_read_ms": 0.95037496,
+        "merge_cpu_ms": 3.81775
+      },
+      {
+        "full_layer_ms": 89.91842,
+        "ffn_only_ms": 43.725376,
+        "w13_stage_ms": 16.473415,
+        "w13_ane_ms": 16.281166,
+        "w13_read_ms": 0.4305,
+        "gate_cpu_ms": 1.209125,
+        "w2_stage_ms": 4.489,
+        "w2_ane_ms": 11.008833,
+        "w2_read_ms": 0.532292,
+        "merge_cpu_ms": 3.424
+      },
+      {
+        "full_layer_ms": 94.39983,
+        "ffn_only_ms": 47.514168,
+        "w13_stage_ms": 16.2745,
+        "w13_ane_ms": 20.387417,
+        "w13_read_ms": 0.37975,
+        "gate_cpu_ms": 1.426667,
+        "w2_stage_ms": 4.670917,
+        "w2_ane_ms": 10.93175,
+        "w2_read_ms": 0.554792,
+        "merge_cpu_ms": 3.343916
+      },
+      {
+        "full_layer_ms": 88.62746,
+        "ffn_only_ms": 41.518497,
+        "w13_stage_ms": 14.788667,
+        "w13_ane_ms": 16.2795,
+        "w13_read_ms": 0.397584,
+        "gate_cpu_ms": 1.218125,
+        "w2_stage_ms": 5.1150002,
+        "w2_ane_ms": 10.2491665,
+        "w2_read_ms": 0.494709,
+        "merge_cpu_ms": 3.056708
+      },
+      {
+        "full_layer_ms": 92.98808,
+        "ffn_only_ms": 45.903454,
+        "w13_stage_ms": 15.761042,
+        "w13_ane_ms": 19.414707,
+        "w13_read_ms": 0.667625,
+        "gate_cpu_ms": 1.22875,
+        "w2_stage_ms": 5.759916,
+        "w2_ane_ms": 10.81775,
+        "w2_read_ms": 0.555667,
+        "merge_cpu_ms": 3.191333
+      }
+    ],
+    "median_full_layer_ms": 92.98808,
+    "median_ffn_only_ms": 45.903454,
+    "max_rss_mb": 5607.422,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0
+    },
+    "correctness_pass": true,
+    "full_layer_win_pct_vs_baseline": 57.242233,
+    "meets_perf_gate": true,
+    "bucket_note": "Shard buckets are recorded as max per-shard phase time; FFN-only wall time is end-to-end outer shard section wall."
+  },
+  "primary_success": true,
+  "winning_modes": [
+    "shard2",
+    "shard4",
+    "shard6",
+    "shard8"
+  ],
+  "thresholds": {
+    "max_abs_diff_tol": 0.02,
+    "mean_abs_diff_tol": 0.005,
+    "cosine_similarity_tol": 0.999,
+    "perf_win_pct_tol": 5.0
+  }
+}

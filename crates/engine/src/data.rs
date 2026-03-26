@@ -20,11 +20,16 @@ impl TokenData {
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
         let n_tokens = mmap.len() / 2;
-        Self { _mmap: mmap, n_tokens }
+        Self {
+            _mmap: mmap,
+            n_tokens,
+        }
     }
 
     /// Number of tokens in the file.
-    pub fn len(&self) -> usize { self.n_tokens }
+    pub fn len(&self) -> usize {
+        self.n_tokens
+    }
 
     /// Get token at position (uint16 → u32).
     pub fn token(&self, pos: usize) -> u32 {
@@ -46,13 +51,14 @@ pub struct TokenBytes {
 impl TokenBytes {
     /// Load token_bytes.bin (int32 little-endian array).
     pub fn load(path: &Path) -> Self {
-        let mut file = File::open(path)
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let mut file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         let mut raw = Vec::new();
         file.read_to_end(&mut raw).unwrap();
         let n = raw.len() / 4;
         let bytes: Vec<i32> = (0..n)
-            .map(|i| i32::from_le_bytes([raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3]]))
+            .map(|i| {
+                i32::from_le_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]])
+            })
             .collect();
         Self { bytes }
     }
@@ -66,11 +72,7 @@ impl TokenBytes {
 /// Compute val_bpb (bits per byte) from per-token losses and token byte lengths.
 /// `losses`: per-token cross-entropy losses (nats), `targets`: target token IDs.
 /// Returns (val_bpb, total_nats, total_bytes).
-pub fn compute_bpb(
-    losses: &[f32],
-    targets: &[u32],
-    token_bytes: &TokenBytes,
-) -> (f32, f32, usize) {
+pub fn compute_bpb(losses: &[f32], targets: &[u32], token_bytes: &TokenBytes) -> (f32, f32, usize) {
     let mut total_nats = 0.0f32;
     let mut total_bytes = 0usize;
     for (&loss, &tok) in losses.iter().zip(targets.iter()) {
@@ -90,6 +92,8 @@ pub fn compute_bpb(
 
 /// Simple PRNG for position sampling (same LCG as Obj-C reference).
 pub fn random_position(step: u64, micro: u64, max_pos: u64) -> usize {
-    let seed = step.wrapping_mul(7919).wrapping_add(micro.wrapping_mul(104729));
+    let seed = step
+        .wrapping_mul(7919)
+        .wrapping_add(micro.wrapping_mul(104729));
     (seed % max_pos) as usize
 }

@@ -1,0 +1,602 @@
+{
+  "config_name": "30Bgeom-16L",
+  "dim": 5120,
+  "hidden": 13824,
+  "heads": 40,
+  "nlayers": 16,
+  "seq": 512,
+  "baseline": {
+    "mode": "baseline",
+    "attn_shards": 1,
+    "ffn_shards": 1,
+    "compile_s": 0.8839395,
+    "warmup_wall_ms": 6322.297,
+    "timed_samples_ms": [
+      5779.8555,
+      5619.05
+    ],
+    "mean_full_forward_ms": 5699.4526,
+    "tok_per_s": 89.83319,
+    "peak_rss_mb": 21115.688,
+    "total_attn_ms": 776.8921,
+    "total_ffn_ms": 4898.624,
+    "total_other_ms": 23.936523,
+    "attn_pct_of_wall": 13.630995,
+    "ffn_pct_of_wall": 85.94903,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0,
+      "loss_abs_diff": 0.0
+    },
+    "correctness_pass": true,
+    "full_forward_win_pct_vs_baseline": 0.0,
+    "meets_perf_gate": false
+  },
+  "modes": [
+    {
+      "mode": "attn2",
+      "attn_shards": 2,
+      "ffn_shards": 1,
+      "compile_s": 1.0628624,
+      "warmup_wall_ms": 5445.4995,
+      "timed_samples_ms": [
+        5366.5522,
+        5398.899
+      ],
+      "mean_full_forward_ms": 5382.7256,
+      "tok_per_s": 95.119095,
+      "peak_rss_mb": 22581.953,
+      "total_attn_ms": 498.99692,
+      "total_ffn_ms": 4862.121,
+      "total_other_ms": 21.607422,
+      "attn_pct_of_wall": 9.270339,
+      "ffn_pct_of_wall": 90.32823,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 5.5571485,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "attn4",
+      "attn_shards": 4,
+      "ffn_shards": 1,
+      "compile_s": 1.4723973,
+      "warmup_wall_ms": 5388.0376,
+      "timed_samples_ms": [
+        5337.1997,
+        5363.9556
+      ],
+      "mean_full_forward_ms": 5350.5776,
+      "tok_per_s": 95.690605,
+      "peak_rss_mb": 22632.219,
+      "total_attn_ms": 478.24515,
+      "total_ffn_ms": 4843.1455,
+      "total_other_ms": 29.187012,
+      "attn_pct_of_wall": 8.938196,
+      "ffn_pct_of_wall": 90.51631,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 6.121202,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "attn5",
+      "attn_shards": 5,
+      "ffn_shards": 1,
+      "compile_s": 1.5498037,
+      "warmup_wall_ms": 5431.639,
+      "timed_samples_ms": [
+        5412.6284,
+        5398.6025
+      ],
+      "mean_full_forward_ms": 5405.615,
+      "tok_per_s": 94.716324,
+      "peak_rss_mb": 22229.438,
+      "total_attn_ms": 511.04135,
+      "total_ffn_ms": 4867.5522,
+      "total_other_ms": 27.021484,
+      "attn_pct_of_wall": 9.453897,
+      "ffn_pct_of_wall": 90.04622,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 5.155537,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "attn8",
+      "attn_shards": 8,
+      "ffn_shards": 1,
+      "compile_s": 2.1222765,
+      "warmup_wall_ms": 5464.427,
+      "timed_samples_ms": [
+        5402.4263,
+        5399.6733
+      ],
+      "mean_full_forward_ms": 5401.05,
+      "tok_per_s": 94.79639,
+      "peak_rss_mb": 22552.75,
+      "total_attn_ms": 506.22537,
+      "total_ffn_ms": 4866.9834,
+      "total_other_ms": 27.84082,
+      "attn_pct_of_wall": 9.372722,
+      "ffn_pct_of_wall": 90.1118,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 5.2356405,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn8",
+      "attn_shards": 1,
+      "ffn_shards": 8,
+      "compile_s": 0.97589177,
+      "warmup_wall_ms": 1935.9128,
+      "timed_samples_ms": [
+        1866.2595,
+        1899.8506
+      ],
+      "mean_full_forward_ms": 1883.055,
+      "tok_per_s": 271.8986,
+      "peak_rss_mb": 23068.89,
+      "total_attn_ms": 743.0076,
+      "total_ffn_ms": 1112.3071,
+      "total_other_ms": 27.740234,
+      "attn_pct_of_wall": 39.45756,
+      "ffn_pct_of_wall": 59.069283,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 66.96077,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn12",
+      "attn_shards": 1,
+      "ffn_shards": 12,
+      "compile_s": 1.3001479,
+      "warmup_wall_ms": 1789.8248,
+      "timed_samples_ms": [
+        1745.3738,
+        1722.362
+      ],
+      "mean_full_forward_ms": 1733.8679,
+      "tok_per_s": 295.29355,
+      "peak_rss_mb": 22419.422,
+      "total_attn_ms": 734.38574,
+      "total_ffn_ms": 969.36224,
+      "total_other_ms": 30.119934,
+      "attn_pct_of_wall": 42.355343,
+      "ffn_pct_of_wall": 55.9075,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 69.57835,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn16",
+      "attn_shards": 1,
+      "ffn_shards": 16,
+      "compile_s": 1.4019896,
+      "warmup_wall_ms": 1750.2532,
+      "timed_samples_ms": [
+        1725.1115,
+        1711.2122
+      ],
+      "mean_full_forward_ms": 1718.1619,
+      "tok_per_s": 297.9929,
+      "peak_rss_mb": 22530.766,
+      "total_attn_ms": 741.7721,
+      "total_ffn_ms": 943.1011,
+      "total_other_ms": 33.288696,
+      "attn_pct_of_wall": 43.17242,
+      "ffn_pct_of_wall": 54.89012,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 69.85391,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn8_attn2",
+      "attn_shards": 2,
+      "ffn_shards": 8,
+      "compile_s": 1.1470882,
+      "warmup_wall_ms": 1697.3102,
+      "timed_samples_ms": [
+        1648.3087,
+        1618.8849
+      ],
+      "mean_full_forward_ms": 1633.5968,
+      "tok_per_s": 313.41882,
+      "peak_rss_mb": 22674.406,
+      "total_attn_ms": 495.0581,
+      "total_ffn_ms": 1111.2332,
+      "total_other_ms": 27.305542,
+      "attn_pct_of_wall": 30.304792,
+      "ffn_pct_of_wall": 68.02371,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 71.33766,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn8_attn4",
+      "attn_shards": 4,
+      "ffn_shards": 8,
+      "compile_s": 1.5786123,
+      "warmup_wall_ms": 1628.7698,
+      "timed_samples_ms": [
+        1609.2185,
+        1639.5328
+      ],
+      "mean_full_forward_ms": 1624.3757,
+      "tok_per_s": 315.198,
+      "peak_rss_mb": 22591.828,
+      "total_attn_ms": 475.9421,
+      "total_ffn_ms": 1116.8416,
+      "total_other_ms": 31.592041,
+      "attn_pct_of_wall": 29.300001,
+      "ffn_pct_of_wall": 68.75513,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 71.49944,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn8_attn5",
+      "attn_shards": 5,
+      "ffn_shards": 8,
+      "compile_s": 1.6705778,
+      "warmup_wall_ms": 1672.1769,
+      "timed_samples_ms": [
+        1623.4482,
+        1634.4403
+      ],
+      "mean_full_forward_ms": 1628.9443,
+      "tok_per_s": 314.314,
+      "peak_rss_mb": 22546.047,
+      "total_attn_ms": 504.91376,
+      "total_ffn_ms": 1095.9011,
+      "total_other_ms": 28.129395,
+      "attn_pct_of_wall": 30.99638,
+      "ffn_pct_of_wall": 67.27677,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 71.41929,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn8_attn8",
+      "attn_shards": 8,
+      "ffn_shards": 8,
+      "compile_s": 2.2034833,
+      "warmup_wall_ms": 1683.7092,
+      "timed_samples_ms": [
+        1618.4054,
+        1638.4513
+      ],
+      "mean_full_forward_ms": 1628.4283,
+      "tok_per_s": 314.41357,
+      "peak_rss_mb": 22450.438,
+      "total_attn_ms": 502.50906,
+      "total_ffn_ms": 1097.0778,
+      "total_other_ms": 28.841553,
+      "attn_pct_of_wall": 30.858532,
+      "ffn_pct_of_wall": 67.370346,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 71.42834,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn12_attn2",
+      "attn_shards": 2,
+      "ffn_shards": 12,
+      "compile_s": 1.4580873,
+      "warmup_wall_ms": 1542.1305,
+      "timed_samples_ms": [
+        1512.5415,
+        1496.5594
+      ],
+      "mean_full_forward_ms": 1504.5505,
+      "tok_per_s": 340.30096,
+      "peak_rss_mb": 22762.36,
+      "total_attn_ms": 496.0608,
+      "total_ffn_ms": 973.67505,
+      "total_other_ms": 34.814697,
+      "attn_pct_of_wall": 32.970695,
+      "ffn_pct_of_wall": 64.71535,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 73.601845,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn12_attn4",
+      "attn_shards": 4,
+      "ffn_shards": 12,
+      "compile_s": 1.894707,
+      "warmup_wall_ms": 1512.8589,
+      "timed_samples_ms": [
+        1528.4626,
+        1514.106
+      ],
+      "mean_full_forward_ms": 1521.2843,
+      "tok_per_s": 336.55774,
+      "peak_rss_mb": 22542.61,
+      "total_attn_ms": 502.9613,
+      "total_ffn_ms": 985.5322,
+      "total_other_ms": 32.79077,
+      "attn_pct_of_wall": 33.061623,
+      "ffn_pct_of_wall": 64.78291,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 73.30824,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn12_attn5",
+      "attn_shards": 5,
+      "ffn_shards": 12,
+      "compile_s": 1.9643602,
+      "warmup_wall_ms": 1548.7385,
+      "timed_samples_ms": [
+        1535.6458,
+        1526.0227
+      ],
+      "mean_full_forward_ms": 1530.8342,
+      "tok_per_s": 334.45816,
+      "peak_rss_mb": 22512.984,
+      "total_attn_ms": 524.21704,
+      "total_ffn_ms": 978.2156,
+      "total_other_ms": 28.401611,
+      "attn_pct_of_wall": 34.24388,
+      "ffn_pct_of_wall": 63.900818,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 73.14068,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn12_attn8",
+      "attn_shards": 8,
+      "ffn_shards": 12,
+      "compile_s": 2.5590544,
+      "warmup_wall_ms": 1607.7422,
+      "timed_samples_ms": [
+        1572.4985,
+        1572.582
+      ],
+      "mean_full_forward_ms": 1572.5403,
+      "tok_per_s": 325.58783,
+      "peak_rss_mb": 22654.484,
+      "total_attn_ms": 554.2756,
+      "total_ffn_ms": 987.8357,
+      "total_other_ms": 30.429016,
+      "attn_pct_of_wall": 35.247147,
+      "ffn_pct_of_wall": 62.81783,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 72.40892,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn16_attn2",
+      "attn_shards": 2,
+      "ffn_shards": 16,
+      "compile_s": 1.601428,
+      "warmup_wall_ms": 1543.8041,
+      "timed_samples_ms": [
+        1462.1179,
+        1452.651
+      ],
+      "mean_full_forward_ms": 1457.3845,
+      "tok_per_s": 351.31427,
+      "peak_rss_mb": 22635.312,
+      "total_attn_ms": 493.13135,
+      "total_ffn_ms": 927.8778,
+      "total_other_ms": 36.375366,
+      "attn_pct_of_wall": 33.836735,
+      "ffn_pct_of_wall": 63.667328,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 74.4294,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn16_attn4",
+      "attn_shards": 4,
+      "ffn_shards": 16,
+      "compile_s": 2.0341046,
+      "warmup_wall_ms": 1499.1195,
+      "timed_samples_ms": [
+        1435.3545,
+        1431.317
+      ],
+      "mean_full_forward_ms": 1433.3357,
+      "tok_per_s": 357.2087,
+      "peak_rss_mb": 22939.062,
+      "total_attn_ms": 471.50665,
+      "total_ffn_ms": 932.3518,
+      "total_other_ms": 29.477234,
+      "attn_pct_of_wall": 32.89576,
+      "ffn_pct_of_wall": 65.04769,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 74.85135,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn16_attn5",
+      "attn_shards": 5,
+      "ffn_shards": 16,
+      "compile_s": 2.0954854,
+      "warmup_wall_ms": 1501.2632,
+      "timed_samples_ms": [
+        1469.975,
+        1480.8782
+      ],
+      "mean_full_forward_ms": 1475.4265,
+      "tok_per_s": 347.0183,
+      "peak_rss_mb": 22769.328,
+      "total_attn_ms": 511.9242,
+      "total_ffn_ms": 937.27277,
+      "total_other_ms": 26.229553,
+      "attn_pct_of_wall": 34.696693,
+      "ffn_pct_of_wall": 63.525547,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 74.11285,
+      "meets_perf_gate": true
+    },
+    {
+      "mode": "ffn16_attn8",
+      "attn_shards": 8,
+      "ffn_shards": 16,
+      "compile_s": 2.6545935,
+      "warmup_wall_ms": 1535.4164,
+      "timed_samples_ms": [
+        1486.6102,
+        1454.2869
+      ],
+      "mean_full_forward_ms": 1470.4485,
+      "tok_per_s": 348.19308,
+      "peak_rss_mb": 22885.672,
+      "total_attn_ms": 506.92493,
+      "total_ffn_ms": 931.6759,
+      "total_other_ms": 31.847656,
+      "attn_pct_of_wall": 34.47417,
+      "ffn_pct_of_wall": 63.35998,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 74.20018,
+      "meets_perf_gate": true
+    }
+  ],
+  "best_attention_only_mode": "attn4",
+  "best_ffn_only_mode": "ffn16",
+  "best_combined_mode": "ffn16_attn4",
+  "primary_success": true,
+  "winning_modes": [
+    "attn2",
+    "attn4",
+    "attn5",
+    "attn8",
+    "ffn8",
+    "ffn12",
+    "ffn16",
+    "ffn8_attn2",
+    "ffn8_attn4",
+    "ffn8_attn5",
+    "ffn8_attn8",
+    "ffn12_attn2",
+    "ffn12_attn4",
+    "ffn12_attn5",
+    "ffn12_attn8",
+    "ffn16_attn2",
+    "ffn16_attn4",
+    "ffn16_attn5",
+    "ffn16_attn8"
+  ],
+  "thresholds": {
+    "max_abs_diff_tol": 0.02,
+    "mean_abs_diff_tol": 0.005,
+    "cosine_similarity_tol": 0.999,
+    "loss_abs_diff_tol": 0.0001,
+    "perf_win_pct_tol": 5.0
+  }
+}

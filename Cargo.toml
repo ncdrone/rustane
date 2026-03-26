@@ -13,7 +13,7 @@ rust-version = "1.94.0"
 license = "MIT"
 
 [workspace.dependencies]
-ane = { git = "https://github.com/ncdrone/ane", branch = "main" }
+ane = { git = "https://github.com/ncdrone/ane" }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSObjCRuntime"] }
 objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-foundation", "objc2-core-foundation", "libc"] }

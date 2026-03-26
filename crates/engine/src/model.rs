@@ -7,7 +7,7 @@ pub struct ModelConfig {
     pub hidden: usize,
     pub heads: usize,
     pub kv_heads: usize,
-    pub hd: usize,        // dim / heads
+    pub hd: usize, // dim / heads
     pub seq: usize,
     pub nlayers: usize,
     pub vocab: usize,

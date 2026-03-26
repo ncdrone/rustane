@@ -17,13 +17,20 @@ fn bench_sgemm(label: &str, m: usize, n: usize, k: usize, reps: usize) {
     for _ in 0..3 {
         unsafe {
             vdsp::cblas_sgemm(
-                101, 111, 111,  // row-major, no-trans, no-trans
-                m as i32, n as i32, k as i32,
+                101,
+                111,
+                111, // row-major, no-trans, no-trans
+                m as i32,
+                n as i32,
+                k as i32,
                 1.0,
-                a.as_ptr(), k as i32,
-                b.as_ptr(), n as i32,
+                a.as_ptr(),
+                k as i32,
+                b.as_ptr(),
+                n as i32,
                 0.0,
-                c.as_mut_ptr(), n as i32,
+                c.as_mut_ptr(),
+                n as i32,
             );
         }
     }
@@ -33,13 +40,20 @@ fn bench_sgemm(label: &str, m: usize, n: usize, k: usize, reps: usize) {
     for _ in 0..reps {
         unsafe {
             vdsp::cblas_sgemm(
-                101, 111, 111,
-                m as i32, n as i32, k as i32,
+                101,
+                111,
+                111,
+                m as i32,
+                n as i32,
+                k as i32,
                 1.0,
-                a.as_ptr(), k as i32,
-                b.as_ptr(), n as i32,
+                a.as_ptr(),
+                k as i32,
+                b.as_ptr(),
+                n as i32,
                 0.0,
-                c.as_mut_ptr(), n as i32,
+                c.as_mut_ptr(),
+                n as i32,
             );
         }
     }
@@ -97,16 +111,16 @@ fn sweep4_sgemm_600m() {
     let reps = 10;
     let ops: Vec<(usize, usize, usize, usize)> = vec![
         // FFN: 3 dW + 1 dx per layer
-        (dim, hidden, seq, 20),   // dW1
-        (dim, hidden, seq, 20),   // dW3
-        (hidden, dim, seq, 20),   // dW2
-        (seq, dim, hidden, 20),   // dx_ffn
+        (dim, hidden, seq, 20), // dW1
+        (dim, hidden, seq, 20), // dW3
+        (hidden, dim, seq, 20), // dW2
+        (seq, dim, hidden, 20), // dx_ffn
         // Attention: 4 dW + 1 dx per layer
-        (dim, dim, seq, 20),      // dWq
-        (dim, dim, seq, 20),      // dWk
-        (dim, dim, seq, 20),      // dWv
-        (dim, dim, seq, 20),      // dWo
-        (seq, dim, dim, 20),      // dx_attn
+        (dim, dim, seq, 20), // dWq
+        (dim, dim, seq, 20), // dWk
+        (dim, dim, seq, 20), // dWv
+        (dim, dim, seq, 20), // dWo
+        (seq, dim, dim, 20), // dx_attn
     ];
 
     let mut total_ms = 0.0;
@@ -119,13 +133,20 @@ fn sweep4_sgemm_600m() {
         for _ in 0..reps {
             unsafe {
                 vdsp::cblas_sgemm(
-                    101, 111, 111,
-                    *m as i32, *n as i32, *k as i32,
+                    101,
+                    111,
+                    111,
+                    *m as i32,
+                    *n as i32,
+                    *k as i32,
                     1.0,
-                    a.as_ptr(), *k as i32,
-                    b.as_ptr(), *n as i32,
+                    a.as_ptr(),
+                    *k as i32,
+                    b.as_ptr(),
+                    *n as i32,
                     0.0,
-                    c_buf.as_mut_ptr(), *n as i32,
+                    c_buf.as_mut_ptr(),
+                    *n as i32,
                 );
             }
         }
@@ -137,8 +158,8 @@ fn sweep4_sgemm_600m() {
 
     // Add logits
     let logit_ops: Vec<(usize, usize, usize)> = vec![
-        (8192, dim, seq),  // dembed
-        (dim, seq, 8192),  // dx_final
+        (8192, dim, seq), // dembed
+        (dim, seq, 8192), // dx_final
     ];
     for (m, n, k) in &logit_ops {
         let a = vec![0.01f32; m * k];
@@ -148,13 +169,20 @@ fn sweep4_sgemm_600m() {
         for _ in 0..reps {
             unsafe {
                 vdsp::cblas_sgemm(
-                    101, 111, 111,
-                    *m as i32, *n as i32, *k as i32,
+                    101,
+                    111,
+                    111,
+                    *m as i32,
+                    *n as i32,
+                    *k as i32,
                     1.0,
-                    a.as_ptr(), *k as i32,
-                    b.as_ptr(), *n as i32,
+                    a.as_ptr(),
+                    *k as i32,
+                    b.as_ptr(),
+                    *n as i32,
                     0.0,
-                    c_buf.as_mut_ptr(), *n as i32,
+                    c_buf.as_mut_ptr(),
+                    *n as i32,
                 );
             }
         }
@@ -170,6 +198,12 @@ fn sweep4_sgemm_600m() {
     println!("  Backward fraction:    {:.0}%", total_ms / 710.0 * 100.0);
     println!();
     println!("  M4 Max GPU fp16:      ~15 TFLOP/s (measured)");
-    println!("  If GPU backward:      {:.1}ms (at 15 TFLOP/s fp16)", total_flops / 15e12 * 1000.0);
-    println!("  Speedup potential:    {:.1}x", total_ms / (total_flops / 15e12 * 1000.0));
+    println!(
+        "  If GPU backward:      {:.1}ms (at 15 TFLOP/s fp16)",
+        total_flops / 15e12 * 1000.0
+    );
+    println!(
+        "  Speedup potential:    {:.1}x",
+        total_ms / (total_flops / 15e12 * 1000.0)
+    );
 }
