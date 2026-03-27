@@ -483,7 +483,7 @@ fn diagnose_ffn_fused_output() {
     let out_shape = Shape { batch: 1, channels: ffn_out_ch, height: 1, width: seq };
     let input_td = TensorData::with_f32(&ffn_in, in_shape);
     let output_td = TensorData::new(out_shape);
-    kernels.ffn_fused.run(&[&input_td], &[&output_td]).expect("ffnFused eval");
+    kernels.ffn_fused.as_ref().unwrap().run(&[&input_td], &[&output_td]).expect("ffnFused eval");
     let ane_out = output_td.read_f32().to_vec();
 
     // Extract x_next from ANE output (first dim channels)
