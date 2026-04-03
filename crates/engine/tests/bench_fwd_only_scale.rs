@@ -6,23 +6,33 @@
 //! Run all:   cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture
 //! Run one:   cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b
 
-use engine::full_model::{self, ModelWeights, ModelForwardWorkspace, TrainConfig};
-use engine::layer::CompiledKernels;
-use engine::model::ModelConfig;
 use engine::bench_result;
+use engine::full_model::{self, ModelForwardWorkspace, ModelWeights, TrainConfig};
+use engine::layer::CompiledKernels;
+use engine::model::{FfnActivation, ModelConfig};
 use std::time::Instant;
 
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
-        dim, hidden, heads,
+        dim,
+        hidden,
+        heads,
         kv_heads: heads,
         hd: 128,
-        seq, nlayers,
+        seq,
+        nlayers,
         vocab: 8192,
         q_dim: heads * 128,
         kv_dim: heads * 128,
         gqa_ratio: 1,
+        ffn_activation: FfnActivation::SwiGlu,
     }
 }
 
@@ -43,13 +53,22 @@ struct FwdResult {
 fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     let params_b = cfg.param_count() as f64 / 1e9;
     // Estimate: weights (4B/param) + fwd workspace (caches + buffers)
-    let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3
-        + cfg.heads * cfg.seq * cfg.seq * 4) as f64 / 1e6;
+    let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5
+        + cfg.hidden * cfg.seq * 4 * 3
+        + cfg.heads * cfg.seq * cfg.seq * 4) as f64
+        / 1e6;
     let mem_est_gb = params_b * 4.0 + cfg.nlayers as f64 * per_layer_cache_mb / 1000.0 + 0.5;
 
     println!("\n{}", "=".repeat(70));
-    println!("  {name} — {d}d/{h}h/{nl}L/seq{s} — {p:.2}B params — est. {m:.1}GB",
-             d=cfg.dim, h=cfg.hidden, nl=cfg.nlayers, s=cfg.seq, p=params_b, m=mem_est_gb);
+    println!(
+        "  {name} — {d}d/{h}h/{nl}L/seq{s} — {p:.2}B params — est. {m:.1}GB",
+        d = cfg.dim,
+        h = cfg.hidden,
+        nl = cfg.nlayers,
+        s = cfg.seq,
+        p = params_b,
+        m = mem_est_gb
+    );
     println!("{}", "=".repeat(70));
 
     // 1. Compile
@@ -68,18 +87,38 @@ fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     println!("{alloc_s:.1}s");
 
     let tc = TrainConfig::default();
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     // 3. Forward passes (1 warmup + 3 timed)
     print!("  [3/3] Forward pass (1 warmup + 3 timed)... ");
-    let _warmup_loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let _warmup_loss = full_model::forward_ws(
+        cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        tc.softcap,
+        &mut fwd_ws,
+    );
 
     let mut times = Vec::with_capacity(3);
     let mut loss = 0.0f32;
     for _ in 0..3 {
         let t0 = Instant::now();
-        loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        loss = full_model::forward_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &tokens,
+            &targets,
+            tc.softcap,
+            &mut fwd_ws,
+        );
         times.push(t0.elapsed().as_secs_f32() * 1000.0);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -122,25 +161,46 @@ fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     bench.fingerprint = bench_result::compute_fingerprint(&bench);
     bench_result::write_result(&bench);
 
-    FwdResult { name: name.to_string(), params_b, dim: cfg.dim, hidden: cfg.hidden,
-                nlayers: cfg.nlayers, compile_s, alloc_s, fwd_ms, loss, mem_est_gb }
+    FwdResult {
+        name: name.to_string(),
+        params_b,
+        dim: cfg.dim,
+        hidden: cfg.hidden,
+        nlayers: cfg.nlayers,
+        compile_s,
+        alloc_s,
+        fwd_ms,
+        loss,
+        mem_est_gb,
+    }
 }
 
 fn print_fwd_table(results: &[FwdResult]) {
     println!("\n{}", "=".repeat(100));
     println!("  FORWARD-ONLY SCALE RESULTS");
     println!("{}", "=".repeat(100));
-    println!("  {:<12} {:>8} {:>6} {:>6} {:>4} {:>8} {:>8} {:>10} {:>8} {:>8}",
-             "name", "params", "dim", "hid", "nl", "compile", "alloc", "fwd", "loss", "est.RAM");
+    println!(
+        "  {:<12} {:>8} {:>6} {:>6} {:>4} {:>8} {:>8} {:>10} {:>8} {:>8}",
+        "name", "params", "dim", "hid", "nl", "compile", "alloc", "fwd", "loss", "est.RAM"
+    );
     println!("  {}", "-".repeat(95));
     for r in results {
-        println!("  {:<12} {:>7.2}B {:>6} {:>6} {:>4} {:>7.1}s {:>7.1}s {:>9.0}ms {:>8.4} {:>7.1}GB",
-                 r.name, r.params_b, r.dim, r.hidden, r.nlayers,
-                 r.compile_s, r.alloc_s, r.fwd_ms, r.loss, r.mem_est_gb);
+        println!(
+            "  {:<12} {:>7.2}B {:>6} {:>6} {:>4} {:>7.1}s {:>7.1}s {:>9.0}ms {:>8.4} {:>7.1}GB",
+            r.name,
+            r.params_b,
+            r.dim,
+            r.hidden,
+            r.nlayers,
+            r.compile_s,
+            r.alloc_s,
+            r.fwd_ms,
+            r.loss,
+            r.mem_est_gb
+        );
     }
     println!();
 }
-
 
 // ── Individual probes ──────────────────────────────────────────────────
 
@@ -188,7 +248,6 @@ fn fwd_20b() {
     assert!(r.loss.is_finite());
 }
 
-
 // ── Grouped probes ─────────────────────────────────────────────────────
 
 /// Progressive scale test: 5B → 7B → 10B → 13B → 15B → 20B.
@@ -196,7 +255,7 @@ fn fwd_20b() {
 #[ignore]
 fn fwd_scale_ladder() {
     let configs: Vec<(ModelConfig, &str)> = vec![
-        (custom_config(3072,  8192, 24, 44, 512), "5B"),
+        (custom_config(3072, 8192, 24, 44, 512), "5B"),
         (custom_config(4096, 11008, 32, 32, 512), "7B"),
         (custom_config(4096, 11008, 32, 48, 512), "10B"),
         (custom_config(5120, 13824, 40, 40, 512), "13B"),

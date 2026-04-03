@@ -21,14 +21,23 @@
 //!   The optimization changed the numerical output of backward_into. Gradients would
 //!   be wrong, potentially causing training divergence over many steps.
 
-use engine::layer::{self, CompiledKernels, LayerWeights, LayerGrads, BackwardWorkspace, ForwardCache};
+use engine::layer::{
+    self, BackwardWorkspace, CompiledKernels, ForwardCache, LayerGrads, LayerWeights,
+};
 use engine::model::ModelConfig;
 
 fn assert_exact(a: &[f32], b: &[f32], label: &str) {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch ({} vs {})", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch ({} vs {})",
+        a.len(),
+        b.len()
+    );
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert_eq!(
-            x.to_bits(), y.to_bits(),
+            x.to_bits(),
+            y.to_bits(),
             "{label}[{i}]: backward={x} vs backward_into={y} (not bit-identical)"
         );
     }
@@ -46,7 +55,9 @@ fn presig_overlap_backward_matches_reference() {
 
     // Fixed deterministic input (channel-first [dim, seq])
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     // Forward to get cache (needed for both backward paths)
     let mut cache = ForwardCache::new(&cfg);
@@ -54,18 +65,37 @@ fn presig_overlap_backward_matches_reference() {
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
     // Gradient signal from next layer (deterministic)
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
 
     // ── Reference: backward (sequential sigmoid, allocating) ──
     let mut grads_ref = LayerGrads::zeros(&cfg);
     let mut ws_ref = BackwardWorkspace::new(&cfg);
-    let dx_ref = layer::backward(&cfg, &kernels, &weights, &cache, &dy, &mut grads_ref, &mut ws_ref);
+    let dx_ref = layer::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_ref,
+        &mut ws_ref,
+    );
 
     // ── Optimized: backward_into (sigmoid pre-computed in async overlap) ──
     let mut grads_opt = LayerGrads::zeros(&cfg);
     let mut ws_opt = BackwardWorkspace::new(&cfg);
     let mut dx_opt = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads_opt, &mut ws_opt, &mut dx_opt);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_opt,
+        &mut ws_opt,
+        &mut dx_opt,
+    );
 
     // dx must match exactly
     assert_exact(&dx_ref, &dx_opt, "dx");
@@ -90,22 +120,44 @@ fn presig_overlap_back_to_back_idempotent() {
     let kernels = CompiledKernels::compile(&cfg);
     let weights = LayerWeights::random(&cfg);
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.002) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.002) - 0.5) * 0.1)
+        .collect();
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; n_in];
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.005) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.005) - 0.5) * 0.01)
+        .collect();
 
     let mut grads1 = LayerGrads::zeros(&cfg);
     let mut ws = BackwardWorkspace::new(&cfg);
     let mut dx1 = vec![0.0f32; n_in];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads1, &mut ws, &mut dx1);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads1,
+        &mut ws,
+        &mut dx1,
+    );
 
     // Reset grads and workspace, run again
     let mut grads2 = LayerGrads::zeros(&cfg);
     ws = BackwardWorkspace::new(&cfg);
     let mut dx2 = vec![0.0f32; n_in];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads2, &mut ws, &mut dx2);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads2,
+        &mut ws,
+        &mut dx2,
+    );
 
     assert_exact(&dx1, &dx2, "dx back-to-back");
     assert_exact(&grads1.dw1, &grads2.dw1, "dw1 back-to-back");

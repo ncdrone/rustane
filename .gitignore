@@ -1,4 +1,4 @@
-/target
+target/
 leaderboard/worker/node_modules/
 dev/
 viz/
@@ -12,3 +12,5 @@ models/
 .env
 .DS_Store
 data/
+gpu_ffn_reference.md
+crates/engine/tests/manual_split_w13t.rs

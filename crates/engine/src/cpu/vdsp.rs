@@ -15,25 +15,34 @@ unsafe extern "C" {
 
     /// C = A * B (element-wise)
     pub fn vDSP_vmul(
-        a: *const f32, ia: Stride,
-        b: *const f32, ib: Stride,
-        c: *mut f32, ic: Stride,
+        a: *const f32,
+        ia: Stride,
+        b: *const f32,
+        ib: Stride,
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
     /// C = A + B (element-wise)
     pub fn vDSP_vadd(
-        a: *const f32, ia: Stride,
-        b: *const f32, ib: Stride,
-        c: *mut f32, ic: Stride,
+        a: *const f32,
+        ia: Stride,
+        b: *const f32,
+        ib: Stride,
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
     /// C = A - B (element-wise)
     pub fn vDSP_vsub(
-        a: *const f32, ia: Stride,  // subtracted FROM result
-        b: *const f32, ib: Stride,  // subtracted from THIS
-        c: *mut f32, ic: Stride,
+        a: *const f32,
+        ia: Stride, // subtracted FROM result
+        b: *const f32,
+        ib: Stride, // subtracted from THIS
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
@@ -41,53 +50,54 @@ unsafe extern "C" {
 
     /// C = A * scalar (element-wise)
     pub fn vDSP_vsmul(
-        a: *const f32, ia: Stride,
+        a: *const f32,
+        ia: Stride,
         scalar: *const f32,
-        c: *mut f32, ic: Stride,
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
     /// C = A + scalar (element-wise)
     pub fn vDSP_vsadd(
-        a: *const f32, ia: Stride,
+        a: *const f32,
+        ia: Stride,
         scalar: *const f32,
-        c: *mut f32, ic: Stride,
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
     /// C = A * scalar + B (fused multiply-add, scalar)
     pub fn vDSP_vsma(
-        a: *const f32, ia: Stride,
+        a: *const f32,
+        ia: Stride,
         scalar: *const f32,
-        b: *const f32, ib: Stride,
-        c: *mut f32, ic: Stride,
+        b: *const f32,
+        ib: Stride,
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
     /// C = A * scalar_mul + scalar_add (fused scale + offset)
     pub fn vDSP_vsmsa(
-        a: *const f32, ia: Stride,
+        a: *const f32,
+        ia: Stride,
         scalar_mul: *const f32,
         scalar_add: *const f32,
-        c: *mut f32, ic: Stride,
+        c: *mut f32,
+        ic: Stride,
         n: Length,
     );
 
     // ── Reductions ───────────────────────────────────────────────
 
     /// result = max(A)
-    pub fn vDSP_maxv(
-        a: *const f32, ia: Stride,
-        result: *mut f32,
-        n: Length,
-    );
+    pub fn vDSP_maxv(a: *const f32, ia: Stride, result: *mut f32, n: Length);
 
     /// result = sum(A)
-    pub fn vDSP_sve(
-        a: *const f32, ia: Stride,
-        result: *mut f32,
-        n: Length,
-    );
+    pub fn vDSP_sve(a: *const f32, ia: Stride, result: *mut f32, n: Length);
 
     // ── vecLib math functions ────────────────────────────────────
 
@@ -106,18 +116,10 @@ unsafe extern "C" {
     // ── Matrix operations ──────────────────────────────────────────
 
     /// Transpose an M×N matrix A into N×M matrix C.
-    pub fn vDSP_mtrans(
-        a: *const f32, ia: Stride,
-        c: *mut f32, ic: Stride,
-        m: Length, n: Length,
-    );
+    pub fn vDSP_mtrans(a: *const f32, ia: Stride, c: *mut f32, ic: Stride, m: Length, n: Length);
 
     /// Sum of squares: result = sum(A[i]^2)
-    pub fn vDSP_svesq(
-        a: *const f32, ia: Stride,
-        result: *mut f32,
-        n: Length,
-    );
+    pub fn vDSP_svesq(a: *const f32, ia: Stride, result: *mut f32, n: Length);
 
     /// In-place scale: X *= alpha
     pub fn cblas_sscal(n: c_int, alpha: f32, x: *mut f32, incx: c_int);
@@ -126,13 +128,20 @@ unsafe extern "C" {
 
     /// C = alpha * op(A) @ op(B) + beta * C
     pub fn cblas_sgemm(
-        order: c_int, transA: c_int, transB: c_int,
-        m: c_int, n: c_int, k: c_int,
+        order: c_int,
+        transA: c_int,
+        transB: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
         alpha: f32,
-        a: *const f32, lda: c_int,
-        b: *const f32, ldb: c_int,
+        a: *const f32,
+        lda: c_int,
+        b: *const f32,
+        ldb: c_int,
         beta: f32,
-        c: *mut f32, ldc: c_int,
+        c: *mut f32,
+        ldc: c_int,
     );
 }
 
@@ -141,19 +150,49 @@ unsafe extern "C" {
 /// Element-wise multiply: out = a * b
 pub fn vmul(a: &[f32], b: &[f32], out: &mut [f32]) {
     let n = a.len().min(b.len()).min(out.len());
-    unsafe { vDSP_vmul(a.as_ptr(), 1, b.as_ptr(), 1, out.as_mut_ptr(), 1, n as Length) }
+    unsafe {
+        vDSP_vmul(
+            a.as_ptr(),
+            1,
+            b.as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            1,
+            n as Length,
+        )
+    }
 }
 
 /// Element-wise add: out = a + b
 pub fn vadd(a: &[f32], b: &[f32], out: &mut [f32]) {
     let n = a.len().min(b.len()).min(out.len());
-    unsafe { vDSP_vadd(a.as_ptr(), 1, b.as_ptr(), 1, out.as_mut_ptr(), 1, n as Length) }
+    unsafe {
+        vDSP_vadd(
+            a.as_ptr(),
+            1,
+            b.as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            1,
+            n as Length,
+        )
+    }
 }
 
 /// Element-wise subtract: out = b - a  (note vDSP_vsub order)
 pub fn vsub(a: &[f32], b: &[f32], out: &mut [f32]) {
     let n = a.len().min(b.len()).min(out.len());
-    unsafe { vDSP_vsub(a.as_ptr(), 1, b.as_ptr(), 1, out.as_mut_ptr(), 1, n as Length) }
+    unsafe {
+        vDSP_vsub(
+            a.as_ptr(),
+            1,
+            b.as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            1,
+            n as Length,
+        )
+    }
 }
 
 /// Scalar multiply: out = a * scalar
@@ -177,7 +216,18 @@ pub fn vsadd_inplace(v: &mut [f32], scalar: f32) {
 /// Fused multiply-add: out = a * scalar + b
 pub fn vsma(a: &[f32], scalar: f32, b: &[f32], out: &mut [f32]) {
     let n = a.len().min(b.len()).min(out.len());
-    unsafe { vDSP_vsma(a.as_ptr(), 1, &scalar, b.as_ptr(), 1, out.as_mut_ptr(), 1, n as Length) }
+    unsafe {
+        vDSP_vsma(
+            a.as_ptr(),
+            1,
+            &scalar,
+            b.as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            1,
+            n as Length,
+        )
+    }
 }
 
 /// Max element
@@ -243,8 +293,18 @@ pub fn recf_inplace(v: &mut [f32]) {
 /// Matrix transpose: C[n,m] = A[m,n]^T
 /// A is m rows × n cols, C is n rows × m cols.
 pub fn mtrans(a: &[f32], a_cols: usize, c: &mut [f32], c_cols: usize, m: usize, n: usize) {
-    assert!(a.len() >= m * n, "mtrans: a too small ({} < {})", a.len(), m * n);
-    assert!(c.len() >= n * m, "mtrans: c too small ({} < {})", c.len(), n * m);
+    assert!(
+        a.len() >= m * n,
+        "mtrans: a too small ({} < {})",
+        a.len(),
+        m * n
+    );
+    assert!(
+        c.len() >= n * m,
+        "mtrans: c too small ({} < {})",
+        c.len(),
+        n * m
+    );
     assert_eq!(a_cols, n, "mtrans: a_cols must equal n");
     assert_eq!(c_cols, m, "mtrans: c_cols must equal m");
     unsafe { vDSP_mtrans(a.as_ptr(), 1, c.as_mut_ptr(), 1, n as Length, m as Length) }
@@ -254,7 +314,14 @@ pub fn mtrans(a: &[f32], a_cols: usize, c: &mut [f32], c_cols: usize, m: usize, 
 pub fn svesq_strided(a: &[f32], offset: usize, stride: usize, n: usize) -> f32 {
     let mut result: f32 = 0.0;
     if n > 0 {
-        unsafe { vDSP_svesq(a.as_ptr().add(offset), stride as Stride, &mut result, n as Length) }
+        unsafe {
+            vDSP_svesq(
+                a.as_ptr().add(offset),
+                stride as Stride,
+                &mut result,
+                n as Length,
+            )
+        }
     }
     result
 }
@@ -290,13 +357,20 @@ pub fn sgemm_at(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, c: &mut [f32
     assert!(c.len() >= m * n);
     unsafe {
         cblas_sgemm(
-            CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
-            m as c_int, n as c_int, k as c_int,
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            m as c_int,
+            n as c_int,
+            k as c_int,
             1.0,
-            a.as_ptr(), k as c_int,
-            b.as_ptr(), k as c_int,
+            a.as_ptr(),
+            k as c_int,
+            b.as_ptr(),
+            k as c_int,
             1.0,
-            c.as_mut_ptr(), n as c_int,
+            c.as_mut_ptr(),
+            n as c_int,
         );
     }
 }
@@ -309,13 +383,20 @@ pub fn sgemm_ta(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, c: &mut [f32
     assert!(c.len() >= m * n);
     unsafe {
         cblas_sgemm(
-            CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
-            m as c_int, n as c_int, k as c_int,
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            m as c_int,
+            n as c_int,
+            k as c_int,
             1.0,
-            a.as_ptr(), m as c_int,
-            b.as_ptr(), n as c_int,
+            a.as_ptr(),
+            m as c_int,
+            b.as_ptr(),
+            n as c_int,
             0.0,
-            c.as_mut_ptr(), n as c_int,
+            c.as_mut_ptr(),
+            n as c_int,
         );
     }
 }

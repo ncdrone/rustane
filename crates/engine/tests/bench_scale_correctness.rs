@@ -3,16 +3,24 @@
 //! Run all:   cargo test -p engine --test bench_scale_correctness --release -- --ignored --nocapture
 //! Run one:   cargo test -p engine --test bench_scale_correctness --release -- --ignored --nocapture test_600m
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig};
+use engine::full_model::{
+    self, ModelBackwardWorkspace, ModelForwardWorkspace, ModelGrads, ModelOptState, ModelWeights,
+    TrainConfig,
+};
 use engine::layer::CompiledKernels;
-use engine::model::ModelConfig;
 use engine::metal_adam::MetalAdam;
+use engine::model::ModelConfig;
 use std::time::Instant;
 
 fn test_config(cfg: &ModelConfig, name: &str) {
-    println!("\n=== {name} — {}d/{}h/{}L/seq{} — ~{:.0}M params ===",
-             cfg.dim, cfg.hidden, cfg.nlayers, cfg.seq,
-             cfg.param_count() as f64 / 1e6);
+    println!(
+        "\n=== {name} — {}d/{}h/{}L/seq{} — ~{:.0}M params ===",
+        cfg.dim,
+        cfg.hidden,
+        cfg.nlayers,
+        cfg.seq,
+        cfg.param_count() as f64 / 1e6
+    );
 
     // 1. Compile all 10 kernels
     print!("  [1/4] Compiling 10 ANE kernels... ");
@@ -24,10 +32,22 @@ fn test_config(cfg: &ModelConfig, name: &str) {
     print!("  [2/4] Forward pass... ");
     let weights = ModelWeights::random(cfg);
     let tc = TrainConfig::default();
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     let mut fwd_ws = ModelForwardWorkspace::new(cfg);
-    let loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let loss = full_model::forward_ws(
+        cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        tc.softcap,
+        &mut fwd_ws,
+    );
     assert!(loss.is_finite(), "loss is not finite: {loss}");
     assert!(loss > 0.0, "loss should be positive: {loss}");
     println!("OK (loss={loss:.4})");
@@ -43,17 +63,57 @@ fn test_config(cfg: &ModelConfig, name: &str) {
     let mut losses = Vec::with_capacity(11);
     for step in 0..10u32 {
         grads.zero_out();
-        let loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let loss = full_model::forward_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &tokens,
+            &targets,
+            tc.softcap,
+            &mut fwd_ws,
+        );
         losses.push(loss);
-        full_model::backward_ws(cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        full_model::backward_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &fwd_ws,
+            &tokens,
+            tc.softcap,
+            tc.loss_scale,
+            &mut grads,
+            &mut bwd_ws,
+        );
         let gsc = 1.0 / tc.loss_scale;
         let raw_norm = full_model::grad_norm(&grads);
-        let combined_scale = if raw_norm * gsc > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
+        let combined_scale = if raw_norm * gsc > tc.grad_clip {
+            tc.grad_clip / raw_norm
+        } else {
+            gsc
+        };
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, combined_scale);
+        full_model::update_weights(
+            cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            combined_scale,
+        );
     }
     // Final loss
-    let final_loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let final_loss = full_model::forward_ws(
+        cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        tc.softcap,
+        &mut fwd_ws,
+    );
     losses.push(final_loss);
 
     let delta = final_loss - losses[0];
@@ -68,13 +128,45 @@ fn test_config(cfg: &ModelConfig, name: &str) {
     for step in 10..13u32 {
         grads.zero_out();
         let t = Instant::now();
-        let _loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
-        full_model::backward_ws(cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        let _loss = full_model::forward_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &tokens,
+            &targets,
+            tc.softcap,
+            &mut fwd_ws,
+        );
+        full_model::backward_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &fwd_ws,
+            &tokens,
+            tc.softcap,
+            tc.loss_scale,
+            &mut grads,
+            &mut bwd_ws,
+        );
         let gsc = 1.0 / tc.loss_scale;
         let raw_norm = full_model::grad_norm(&grads);
-        let combined_scale = if raw_norm * gsc > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
+        let combined_scale = if raw_norm * gsc > tc.grad_clip {
+            tc.grad_clip / raw_norm
+        } else {
+            gsc
+        };
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, combined_scale);
+        full_model::update_weights(
+            cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            combined_scale,
+        );
         step_times.push(t.elapsed().as_secs_f32() * 1000.0);
     }
     step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());

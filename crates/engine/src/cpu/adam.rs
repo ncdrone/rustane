@@ -131,6 +131,58 @@ pub fn step_fused(
     }
 }
 
+/// Fused AdamW step that also writes a cached transposed view inline.
+///
+/// `param` is laid out row-major as [rows * cols]. `transpose` receives the
+/// updated values in row-major [cols * rows] order.
+pub fn step_fused_transpose(
+    param: &mut [f32],
+    transpose: &mut [f32],
+    rows: usize,
+    cols: usize,
+    grad: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    t: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32,
+) {
+    let n = rows * cols;
+    debug_assert_eq!(param.len(), n);
+    debug_assert_eq!(transpose.len(), n);
+    debug_assert_eq!(grad.len(), n);
+    debug_assert_eq!(m.len(), n);
+    debug_assert_eq!(v.len(), n);
+    debug_assert!(t > 0);
+
+    let bc1 = 1.0f32 / (1.0 - beta1.powi(t as i32));
+    let bc2 = 1.0f32 / (1.0 - beta2.powi(t as i32));
+    let one_minus_beta1 = 1.0 - beta1;
+    let one_minus_beta2 = 1.0 - beta2;
+
+    for row in 0..rows {
+        let row_off = row * cols;
+        for col in 0..cols {
+            let i = row_off + col;
+            let g = grad[i] * grad_scale;
+            let mi = beta1 * m[i] + one_minus_beta1 * g;
+            let vi = beta2 * v[i] + one_minus_beta2 * g * g;
+            m[i] = mi;
+            v[i] = vi;
+            let m_hat = mi * bc1;
+            let v_hat = vi * bc2;
+            let update = m_hat / (v_hat.sqrt() + eps);
+            let new_param = param[i] - lr * (update + weight_decay * param[i]);
+            param[i] = new_param;
+            transpose[col * rows + row] = new_param;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,7 +201,10 @@ mod tests {
             step(&mut param, &grad, &mut m, &mut v, t, &cfg);
         }
         let final_sum: f32 = param.iter().sum();
-        assert!(final_sum < initial, "param should decrease: {initial} -> {final_sum}");
+        assert!(
+            final_sum < initial,
+            "param should decrease: {initial} -> {final_sum}"
+        );
     }
 
     #[test]
@@ -158,7 +213,10 @@ mod tests {
         let grad = [0.0f32; 2];
         let mut m = [0.0f32; 2];
         let mut v = [0.0f32; 2];
-        let cfg = AdamConfig { weight_decay: 0.1, ..Default::default() };
+        let cfg = AdamConfig {
+            weight_decay: 0.1,
+            ..Default::default()
+        };
 
         let before = param[0];
         step(&mut param, &grad, &mut m, &mut v, 1, &cfg);
@@ -172,7 +230,10 @@ mod tests {
         let grad = [1.0f32; 2];
         let mut m = [0.0f32; 2];
         let mut v = [0.0f32; 2];
-        let cfg = AdamConfig { weight_decay: 0.0, ..Default::default() };
+        let cfg = AdamConfig {
+            weight_decay: 0.0,
+            ..Default::default()
+        };
 
         step(&mut param, &grad, &mut m, &mut v, 1, &cfg);
         // m should be (1-beta1)*grad = 0.1

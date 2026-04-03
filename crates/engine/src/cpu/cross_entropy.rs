@@ -148,7 +148,8 @@ mod tests {
             let numerical = (loss_plus - loss_minus) / (2.0 * eps);
             assert!(
                 (d_logits[i] - numerical).abs() < 5e-3,
-                "d_logits[{i}]: analytical={} vs numerical={numerical}", d_logits[i]
+                "d_logits[{i}]: analytical={} vs numerical={numerical}",
+                d_logits[i]
             );
         }
     }

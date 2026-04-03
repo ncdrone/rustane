@@ -21,10 +21,12 @@
 //!   Thread scheduling changed the summation order, causing different FP rounding.
 //!   This would indicate the grouping doesn't match the expected split.
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig};
+use engine::cpu::vdsp;
+use engine::full_model::{
+    self, ModelBackwardWorkspace, ModelForwardWorkspace, ModelGrads, ModelWeights, TrainConfig,
+};
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
-use engine::cpu::vdsp;
 
 /// Reference sequential grad_norm implementation (pre-optimization).
 fn grad_norm_sequential(grads: &ModelGrads) -> f32 {
@@ -32,7 +34,17 @@ fn grad_norm_sequential(grads: &ModelGrads) -> f32 {
     sum += vdsp::svesq(&grads.dembed);
     sum += vdsp::svesq(&grads.dgamma_final);
     for lg in &grads.layers {
-        for g in [&lg.dwq, &lg.dwk, &lg.dwv, &lg.dwo, &lg.dw1, &lg.dw3, &lg.dw2, &lg.dgamma1, &lg.dgamma2] {
+        for g in [
+            &lg.dwq,
+            &lg.dwk,
+            &lg.dwv,
+            &lg.dwo,
+            &lg.dw1,
+            &lg.dw3,
+            &lg.dw2,
+            &lg.dgamma1,
+            &lg.dgamma2,
+        ] {
             sum += vdsp::svesq(g);
         }
     }
@@ -47,15 +59,37 @@ fn parallel_grad_norm_matches_sequential() {
     let weights = ModelWeights::random(&cfg);
     let tc = TrainConfig::default();
 
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
 
-    let _loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
-    full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+    let _loss = full_model::forward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        tc.softcap,
+        &mut fwd_ws,
+    );
+    full_model::backward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_ws,
+        &tokens,
+        tc.softcap,
+        tc.loss_scale,
+        &mut grads,
+        &mut bwd_ws,
+    );
 
     let norm_parallel = full_model::grad_norm(&grads);
     let norm_sequential = grad_norm_sequential(&grads);
@@ -69,7 +103,9 @@ fn parallel_grad_norm_matches_sequential() {
         "parallel={norm_parallel} vs sequential={norm_sequential}, rel_err={rel_err} (expected < 1e-6)"
     );
 
-    println!("PASS: parallel grad_norm matches sequential (rel_err={rel_err:.2e}, norm={norm_parallel:.4})");
+    println!(
+        "PASS: parallel grad_norm matches sequential (rel_err={rel_err:.2e}, norm={norm_parallel:.4})"
+    );
 }
 
 /// Test 2: Two consecutive calls return the same value (deterministic).
@@ -80,21 +116,44 @@ fn parallel_grad_norm_deterministic() {
     let weights = ModelWeights::random(&cfg);
     let tc = TrainConfig::default();
 
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
 
-    let _loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
-    full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+    let _loss = full_model::forward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        tc.softcap,
+        &mut fwd_ws,
+    );
+    full_model::backward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_ws,
+        &tokens,
+        tc.softcap,
+        tc.loss_scale,
+        &mut grads,
+        &mut bwd_ws,
+    );
 
     let norm1 = full_model::grad_norm(&grads);
     let norm2 = full_model::grad_norm(&grads);
 
     assert_eq!(
-        norm1.to_bits(), norm2.to_bits(),
+        norm1.to_bits(),
+        norm2.to_bits(),
         "Two calls should return identical results: {norm1} vs {norm2}"
     );
 
@@ -109,24 +168,52 @@ fn parallel_grad_norm_basic_properties() {
     let weights = ModelWeights::random(&cfg);
     let tc = TrainConfig::default();
 
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
     let mut grads = ModelGrads::zeros(&cfg);
 
-    let _loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
-    full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+    let _loss = full_model::forward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &tokens,
+        &targets,
+        tc.softcap,
+        &mut fwd_ws,
+    );
+    full_model::backward_ws(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_ws,
+        &tokens,
+        tc.softcap,
+        tc.loss_scale,
+        &mut grads,
+        &mut bwd_ws,
+    );
 
     let norm = full_model::grad_norm(&grads);
-    assert!(norm > 0.0, "Norm should be positive for non-zero gradients: {norm}");
+    assert!(
+        norm > 0.0,
+        "Norm should be positive for non-zero gradients: {norm}"
+    );
     assert!(norm.is_finite(), "Norm should be finite: {norm}");
 
     // Also check zero gradients
     let zero_grads = ModelGrads::zeros(&cfg);
     let zero_norm = full_model::grad_norm(&zero_grads);
-    assert_eq!(zero_norm, 0.0, "Norm of zero gradients should be 0: {zero_norm}");
+    assert_eq!(
+        zero_norm, 0.0,
+        "Norm of zero gradients should be 0: {zero_norm}"
+    );
 
     println!("PASS: grad_norm basic properties (norm={norm:.4}, zero={zero_norm})");
 }

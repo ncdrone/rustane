@@ -57,8 +57,8 @@ fn silu_bwd_recip(
     let n = h1.len();
     vdsp::vsmul(h1, -1.0, neg_h1);
     vdsp::expf(neg_h1, exp_neg);
-    vdsp::vsadd(exp_neg, 1.0, neg_h1);  // neg_h1 = 1 + exp(-h1)
-    vdsp::recf_inplace(neg_h1);          // neg_h1 = sig
+    vdsp::vsadd(exp_neg, 1.0, neg_h1); // neg_h1 = 1 + exp(-h1)
+    vdsp::recf_inplace(neg_h1); // neg_h1 = sig
     for i in 0..n {
         let sig = neg_h1[i];
         let silu_val = h1[i] * sig;
@@ -91,8 +91,24 @@ fn run_test(n: usize, h1: &[f32], h3: &[f32], dsilu_raw: &[f32], label: &str) {
     let mut dh1_r = vec![0.0f32; n];
     let mut dh3_r = vec![0.0f32; n];
 
-    silu_bwd_scalar(h1, h3, dsilu_raw, &mut exp_neg_s, &mut neg_h1_s, &mut dh1_s, &mut dh3_s);
-    silu_bwd_recip(h1, h3, dsilu_raw, &mut exp_neg_r, &mut neg_h1_r, &mut dh1_r, &mut dh3_r);
+    silu_bwd_scalar(
+        h1,
+        h3,
+        dsilu_raw,
+        &mut exp_neg_s,
+        &mut neg_h1_s,
+        &mut dh1_s,
+        &mut dh3_s,
+    );
+    silu_bwd_recip(
+        h1,
+        h3,
+        dsilu_raw,
+        &mut exp_neg_r,
+        &mut neg_h1_r,
+        &mut dh1_r,
+        &mut dh3_r,
+    );
 
     assert_close(&dh1_s, &dh1_r, 1e-5, &format!("{label}/dh1"));
     assert_close(&dh3_s, &dh3_r, 1e-5, &format!("{label}/dh3"));
@@ -144,8 +160,14 @@ fn silu_recip_matches_scalar_model_size() {
     // Tests that at production scale the two paths agree.
     let n = 2048 * 512;
     // Pseudo-random inputs using deterministic formula.
-    let h1: Vec<f32> = (0..n).map(|i| ((i as f32 * 6.28318 / 1000.0).sin()) * 2.0).collect();
-    let h3: Vec<f32> = (0..n).map(|i| ((i as f32 * 3.14159 / 1000.0).cos()) * 1.5).collect();
-    let dsilu_raw: Vec<f32> = (0..n).map(|i| ((i as f32 * 2.71828 / 500.0).sin()) * 0.1).collect();
+    let h1: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 * 6.28318 / 1000.0).sin()) * 2.0)
+        .collect();
+    let h3: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 * 3.14159 / 1000.0).cos()) * 1.5)
+        .collect();
+    let dsilu_raw: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 * 2.71828 / 500.0).sin()) * 0.1)
+        .collect();
     run_test(n, &h1, &h3, &dsilu_raw, "model_size");
 }

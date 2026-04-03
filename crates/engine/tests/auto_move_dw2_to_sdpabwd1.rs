@@ -21,14 +21,23 @@
 //!   The dW2 sgemm received different input data at its new position, or a buffer
 //!   was overwritten between step 5 and step 9 that dW2 depends on.
 
-use engine::layer::{self, CompiledKernels, LayerWeights, LayerGrads, BackwardWorkspace, ForwardCache};
+use engine::layer::{
+    self, BackwardWorkspace, CompiledKernels, ForwardCache, LayerGrads, LayerWeights,
+};
 use engine::model::ModelConfig;
 
 fn assert_exact(a: &[f32], b: &[f32], label: &str) {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch ({} vs {})", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch ({} vs {})",
+        a.len(),
+        b.len()
+    );
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert_eq!(
-            x.to_bits(), y.to_bits(),
+            x.to_bits(),
+            y.to_bits(),
             "{label}[{i}]: backward={x} vs backward_into={y} (not bit-identical)"
         );
     }
@@ -44,25 +53,46 @@ fn move_dw2_backward_matches_reference() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     // Forward to get cache
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
 
     // ── Reference: backward (sequential-ish path) ──
     let mut grads_ref = LayerGrads::zeros(&cfg);
     let mut ws_ref = BackwardWorkspace::new(&cfg);
-    let dx_ref = layer::backward(&cfg, &kernels, &weights, &cache, &dy, &mut grads_ref, &mut ws_ref);
+    let dx_ref = layer::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_ref,
+        &mut ws_ref,
+    );
 
     // ── Optimized: backward_into (dW2 in sdpaBwd1 overlap) ──
     let mut grads_opt = LayerGrads::zeros(&cfg);
     let mut ws_opt = BackwardWorkspace::new(&cfg);
     let mut dx_opt = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads_opt, &mut ws_opt, &mut dx_opt);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_opt,
+        &mut ws_opt,
+        &mut dx_opt,
+    );
 
     // Compare dx
     assert_exact(&dx_ref, &dx_opt, "dx");
@@ -91,25 +121,47 @@ fn move_dw2_idempotent() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
 
     // First call
     let mut grads1 = LayerGrads::zeros(&cfg);
     let mut ws1 = BackwardWorkspace::new(&cfg);
     let mut dx1 = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads1, &mut ws1, &mut dx1);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads1,
+        &mut ws1,
+        &mut dx1,
+    );
 
     // Second call (fresh grads/ws, reuses same KernelBuffers IOSurfaces)
     let mut grads2 = LayerGrads::zeros(&cfg);
     let mut ws2 = BackwardWorkspace::new(&cfg);
     let mut dx2 = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads2, &mut ws2, &mut dx2);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads2,
+        &mut ws2,
+        &mut dx2,
+    );
 
     assert_exact(&dx1, &dx2, "dx (idempotent)");
     assert_exact(&grads1.dw2, &grads2.dw2, "dw2 (idempotent)");
@@ -129,32 +181,72 @@ fn move_dw2_accumulation() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
 
     // Single call — grads for 1 microbatch
     let mut grads_single = LayerGrads::zeros(&cfg);
     let mut ws = BackwardWorkspace::new(&cfg);
     let mut dx = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads_single, &mut ws, &mut dx);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_single,
+        &mut ws,
+        &mut dx,
+    );
 
     // Two calls into same grads — grads for 2 microbatches (accumulating via beta=1.0)
     let mut grads_double = LayerGrads::zeros(&cfg);
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads_double, &mut ws, &mut dx);
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads_double, &mut ws, &mut dx);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_double,
+        &mut ws,
+        &mut dx,
+    );
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_double,
+        &mut ws,
+        &mut dx,
+    );
 
     // dw2 after 2 calls should be ~2× dw2 after 1 call
     // Tolerance 1e-4: sgemm with beta=1.0 accumulation has FP rounding differences
     // when C starts at 0 (first call) vs non-zero (second call)
     let tol = 1e-4;
-    for (i, (s, d)) in grads_single.dw2.iter().zip(grads_double.dw2.iter()).enumerate() {
+    for (i, (s, d)) in grads_single
+        .dw2
+        .iter()
+        .zip(grads_double.dw2.iter())
+        .enumerate()
+    {
         let expected = 2.0 * s;
-        let rel_err = if expected.abs() > 1e-10 { (d - expected).abs() / expected.abs() } else { (d - expected).abs() };
+        let rel_err = if expected.abs() > 1e-10 {
+            (d - expected).abs() / expected.abs()
+        } else {
+            (d - expected).abs()
+        };
         assert!(
             rel_err < tol,
             "dw2[{i}]: 2×single={expected} vs double={d} (rel_err={rel_err:.2e}, tol={tol})"
@@ -162,9 +254,18 @@ fn move_dw2_accumulation() {
     }
 
     // Also check dw1, dw3, dwo (dw1/dw3 remain in step 5, dwo remains in step 9)
-    for (i, (s, d)) in grads_single.dw1.iter().zip(grads_double.dw1.iter()).enumerate() {
+    for (i, (s, d)) in grads_single
+        .dw1
+        .iter()
+        .zip(grads_double.dw1.iter())
+        .enumerate()
+    {
         let expected = 2.0 * s;
-        let rel_err = if expected.abs() > 1e-10 { (d - expected).abs() / expected.abs() } else { (d - expected).abs() };
+        let rel_err = if expected.abs() > 1e-10 {
+            (d - expected).abs() / expected.abs()
+        } else {
+            (d - expected).abs()
+        };
         assert!(
             rel_err < tol,
             "dw1[{i}]: 2×single={expected} vs double={d} (rel_err={rel_err:.2e})"

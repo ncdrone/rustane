@@ -6,7 +6,7 @@
 //! Run only non-hardware tests:
 //!   cargo test -p ane-bridge --test phase0_verify
 
-use ane::{Graph, Shape, NSQualityOfService, TensorData};
+use ane::{Graph, NSQualityOfService, Shape, TensorData};
 
 // =========================================================
 // Test 0.2: Multiple weight blobs → distinct BLOBFILE offsets
@@ -28,15 +28,30 @@ fn multiple_constants_produce_valid_graph() {
     // 3 constant tensors (like mask, rope_cos, rope_sin)
     let mask = g.constant(
         &vec![0.0f32; 4 * 64],
-        Shape { batch: 1, channels: 4, height: 1, width: 64 },
+        Shape {
+            batch: 1,
+            channels: 4,
+            height: 1,
+            width: 64,
+        },
     );
     let rope_cos = g.constant(
         &vec![1.0f32; 4 * 64],
-        Shape { batch: 1, channels: 4, height: 1, width: 64 },
+        Shape {
+            batch: 1,
+            channels: 4,
+            height: 1,
+            width: 64,
+        },
     );
     let rope_sin = g.constant(
         &vec![0.5f32; 4 * 64],
-        Shape { batch: 1, channels: 4, height: 1, width: 64 },
+        Shape {
+            batch: 1,
+            channels: 4,
+            height: 1,
+            width: 64,
+        },
     );
 
     // Use all constants in operations
@@ -67,17 +82,28 @@ fn compile_graph_with_multiple_constants_on_ane() {
 
     let c1 = g.constant(
         &vec![1.0f32; 4 * 64],
-        Shape { batch: 1, channels: 4, height: 1, width: 64 },
+        Shape {
+            batch: 1,
+            channels: 4,
+            height: 1,
+            width: 64,
+        },
     );
     let c2 = g.constant(
         &vec![2.0f32; 4 * 64],
-        Shape { batch: 1, channels: 4, height: 1, width: 64 },
+        Shape {
+            batch: 1,
+            channels: 4,
+            height: 1,
+            width: 64,
+        },
     );
 
     let x1 = g.addition(x, c1);
     let _out = g.multiplication(x1, c2);
 
-    let executable = g.compile(NSQualityOfService::Default)
+    let executable = g
+        .compile(NSQualityOfService::Default)
         .expect("ANE compilation failed — is AppleNeuralEngine.framework available?");
 
     // If we got here, compilation succeeded — tmpdir was created correctly (0.3 verified)
@@ -87,7 +113,12 @@ fn compile_graph_with_multiple_constants_on_ane() {
     // Evaluate to verify it actually runs
     let input = TensorData::with_f32(
         &vec![1.0f32; 4 * 64],
-        Shape { batch: 1, channels: 4, height: 1, width: 64 },
+        Shape {
+            batch: 1,
+            channels: 4,
+            height: 1,
+            width: 64,
+        },
     );
     let output = TensorData::new(Shape {
         batch: 1,
@@ -96,13 +127,17 @@ fn compile_graph_with_multiple_constants_on_ane() {
         width: 64,
     });
 
-    executable.run(&[&input], &[&output])
+    executable
+        .run(&[&input], &[&output])
         .expect("ANE evaluation failed");
 
     // Read output and verify it's not all zeros
     let result = output.read_f32();
     let sum: f32 = result.iter().sum();
-    assert!(sum.abs() > 0.0, "Output should not be all zeros after add+mul");
+    assert!(
+        sum.abs() > 0.0,
+        "Output should not be all zeros after add+mul"
+    );
 
     // Expected: (1.0 + 1.0) * 2.0 = 4.0 for each element
     // Check a few values (fp16 tolerance)
@@ -145,7 +180,10 @@ fn iosurface_write_read_roundtrip() {
             "Mismatch at {i}: expected {expected}, got {got}"
         );
     }
-    eprintln!("IOSurface write/read roundtrip: {} elements verified ✓", data.len());
+    eprintln!(
+        "IOSurface write/read roundtrip: {} elements verified ✓",
+        data.len()
+    );
 }
 
 #[test]

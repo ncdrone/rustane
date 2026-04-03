@@ -23,6 +23,7 @@ libc = "0.2"
 thiserror = "2.0"
 memmap2 = "0.9"
 objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary", "MTLResource", "MTLBuffer", "MTLTypes"] }
+objc2-metal-performance-shaders = { version = "0.3", features = ["MPSCore", "MPSCoreTypes", "MPSKernel", "MPSMatrix", "MPSMatrixMultiplication", "MPSMatrixTypes"] }
 
 [profile.release]
 lto = "thin"

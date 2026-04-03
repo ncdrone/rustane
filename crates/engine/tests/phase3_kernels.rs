@@ -5,12 +5,18 @@
 //! against reference implementations comes later.
 
 use ane_bridge::ane::{Graph, Shape, TensorData};
-use engine::kernels::{dyn_matmul, sdpa_fwd, sdpa_bwd, ffn_fused};
+use engine::kernels::{dyn_matmul, ffn_fused, sdpa_bwd, sdpa_fwd};
 use engine::model::ModelConfig;
 use objc2_foundation::NSQualityOfService;
 
-fn compile_and_eval(graph: Graph, input_data: &[f32], input_shape: Shape, output_shape: Shape) -> Vec<f32> {
-    let exe = graph.compile(NSQualityOfService::UserInteractive)
+fn compile_and_eval(
+    graph: Graph,
+    input_data: &[f32],
+    input_shape: Shape,
+    output_shape: Shape,
+) -> Vec<f32> {
+    let exe = graph
+        .compile(NSQualityOfService::UserInteractive)
         .expect("ANE compilation failed");
 
     let input_td = TensorData::with_f32(input_data, input_shape);
@@ -31,8 +37,18 @@ fn wo_fwd_compiles_and_runs() {
     let graph = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq);
 
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-    let input_shape = Shape { batch: 1, channels: cfg.q_dim, height: 1, width: sp };
-    let output_shape = Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: cfg.q_dim,
+        height: 1,
+        width: sp,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: cfg.seq,
+    };
 
     // Fill with small values to avoid fp16 overflow
     let input_data: Vec<f32> = (0..input_shape.total_elements())
@@ -55,8 +71,18 @@ fn ffn_bwd_w2t_compiles_and_runs() {
     let graph = dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq);
 
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.hidden);
-    let input_shape = Shape { batch: 1, channels: cfg.dim, height: 1, width: sp };
-    let output_shape = Shape { batch: 1, channels: cfg.hidden, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: sp,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: cfg.hidden,
+        height: 1,
+        width: cfg.seq,
+    };
 
     let input_data: Vec<f32> = (0..input_shape.total_elements())
         .map(|i| (i % 100) as f32 * 0.01)
@@ -76,8 +102,18 @@ fn dual_dyn_matmul_compiles_and_runs() {
     let graph = dyn_matmul::build_dual(cfg.kv_dim, cfg.dim, cfg.seq);
 
     let sp = dyn_matmul::dual_spatial_width(cfg.seq, cfg.dim);
-    let input_shape = Shape { batch: 1, channels: cfg.kv_dim, height: 1, width: sp };
-    let output_shape = Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: cfg.kv_dim,
+        height: 1,
+        width: sp,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: cfg.seq,
+    };
 
     let input_data: Vec<f32> = (0..input_shape.total_elements())
         .map(|i| (i % 100) as f32 * 0.01)
@@ -95,8 +131,18 @@ fn sdpa_fwd_compiles_and_runs() {
 
     let sp_in = sdpa_fwd::input_spatial_width(&cfg);
     let out_ch = sdpa_fwd::output_channels(&cfg);
-    let input_shape = Shape { batch: 1, channels: cfg.dim, height: 1, width: sp_in };
-    let output_shape = Shape { batch: 1, channels: out_ch, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: sp_in,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: out_ch,
+        height: 1,
+        width: cfg.seq,
+    };
 
     // Small random-ish values
     let input_data: Vec<f32> = (0..input_shape.total_elements())
@@ -117,8 +163,18 @@ fn ffn_fused_compiles_and_runs() {
 
     let sp_in = ffn_fused::input_spatial_width(&cfg);
     let out_ch = ffn_fused::output_channels(&cfg);
-    let input_shape = Shape { batch: 1, channels: cfg.dim, height: 1, width: sp_in };
-    let output_shape = Shape { batch: 1, channels: out_ch, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: sp_in,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: out_ch,
+        height: 1,
+        width: cfg.seq,
+    };
 
     let input_data: Vec<f32> = (0..input_shape.total_elements())
         .map(|i| ((i % 200) as f32 - 100.0) * 0.001)
@@ -138,8 +194,18 @@ fn sdpa_bwd1_compiles_and_runs() {
 
     let in_ch = sdpa_bwd::bwd1_input_channels(&cfg);
     let out_ch = sdpa_bwd::bwd1_output_channels(&cfg);
-    let input_shape = Shape { batch: 1, channels: in_ch, height: 1, width: cfg.seq };
-    let output_shape = Shape { batch: 1, channels: out_ch, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: in_ch,
+        height: 1,
+        width: cfg.seq,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: out_ch,
+        height: 1,
+        width: cfg.seq,
+    };
 
     let input_data: Vec<f32> = (0..input_shape.total_elements())
         .map(|i| ((i % 200) as f32 - 100.0) * 0.0001)
@@ -159,8 +225,18 @@ fn sdpa_bwd2_compiles_and_runs() {
 
     let in_ch = sdpa_bwd::bwd2_input_channels(&cfg);
     let out_ch = sdpa_bwd::bwd2_output_channels(&cfg);
-    let input_shape = Shape { batch: 1, channels: in_ch, height: 1, width: cfg.seq };
-    let output_shape = Shape { batch: 1, channels: out_ch, height: 1, width: cfg.seq };
+    let input_shape = Shape {
+        batch: 1,
+        channels: in_ch,
+        height: 1,
+        width: cfg.seq,
+    };
+    let output_shape = Shape {
+        batch: 1,
+        channels: out_ch,
+        height: 1,
+        width: cfg.seq,
+    };
 
     // Use small positive values (probs should be softmax-like, dp small)
     let input_data: Vec<f32> = (0..input_shape.total_elements())
@@ -188,18 +264,48 @@ fn all_forward_kernels_1000_iters() {
 
     // Allocate IOSurfaces
     let wo_sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-    let wo_in = TensorData::new(Shape { batch: 1, channels: cfg.q_dim, height: 1, width: wo_sp });
-    let wo_out = TensorData::new(Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq });
+    let wo_in = TensorData::new(Shape {
+        batch: 1,
+        channels: cfg.q_dim,
+        height: 1,
+        width: wo_sp,
+    });
+    let wo_out = TensorData::new(Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: cfg.seq,
+    });
 
     let sdpa_sp = sdpa_fwd::input_spatial_width(&cfg);
     let sdpa_out_ch = sdpa_fwd::output_channels(&cfg);
-    let sdpa_in = TensorData::new(Shape { batch: 1, channels: cfg.dim, height: 1, width: sdpa_sp });
-    let sdpa_out = TensorData::new(Shape { batch: 1, channels: sdpa_out_ch, height: 1, width: cfg.seq });
+    let sdpa_in = TensorData::new(Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: sdpa_sp,
+    });
+    let sdpa_out = TensorData::new(Shape {
+        batch: 1,
+        channels: sdpa_out_ch,
+        height: 1,
+        width: cfg.seq,
+    });
 
     let ffn_sp = ffn_fused::input_spatial_width(&cfg);
     let ffn_out_ch = ffn_fused::output_channels(&cfg);
-    let ffn_in = TensorData::new(Shape { batch: 1, channels: cfg.dim, height: 1, width: ffn_sp });
-    let ffn_out = TensorData::new(Shape { batch: 1, channels: ffn_out_ch, height: 1, width: cfg.seq });
+    let ffn_in = TensorData::new(Shape {
+        batch: 1,
+        channels: cfg.dim,
+        height: 1,
+        width: ffn_sp,
+    });
+    let ffn_out = TensorData::new(Shape {
+        batch: 1,
+        channels: ffn_out_ch,
+        height: 1,
+        width: cfg.seq,
+    });
 
     // Run 1000 iterations
     for i in 0..1000 {

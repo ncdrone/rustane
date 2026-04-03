@@ -29,8 +29,15 @@ const TOL: f32 = 1e-5;
 
 fn assert_close(a: &[f32], b: &[f32], label: &str) {
     assert_eq!(a.len(), b.len(), "{label}: length mismatch");
-    let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < TOL, "{label}: max_diff={max_diff} exceeds tolerance={TOL}");
+    let max_diff = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < TOL,
+        "{label}: max_diff={max_diff} exceeds tolerance={TOL}"
+    );
 }
 
 // CPU Adam reference for a single step
@@ -47,7 +54,13 @@ fn cpu_adam_step(
     wd: f32,
     grad_scale: f32,
 ) {
-    let cfg = AdamConfig { lr, beta1, beta2, eps, weight_decay: wd };
+    let cfg = AdamConfig {
+        lr,
+        beta1,
+        beta2,
+        eps,
+        weight_decay: wd,
+    };
     // Apply grad_scale manually before cpu step (matches Metal shader: g = grad[id] * gscale)
     let scaled_grad: Vec<f32> = grad.iter().map(|&g| g * grad_scale).collect();
     adam::step(param, &scaled_grad, m, v, t, &cfg);
@@ -55,10 +68,14 @@ fn cpu_adam_step(
 
 fn make_grad(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        })
+        .collect()
 }
 
 /// Test 1: single-tensor step via new begin_batch API matches CPU Adam.
@@ -79,7 +96,19 @@ fn cache_scalars_single_tensor_no_wd() {
     let mut v_gpu = v_cpu.clone();
 
     let t = 1u32;
-    cpu_adam_step(&mut param_cpu, &grad, &mut m_cpu, &mut v_cpu, t, lr, beta1, beta2, eps, wd, gs);
+    cpu_adam_step(
+        &mut param_cpu,
+        &grad,
+        &mut m_cpu,
+        &mut v_cpu,
+        t,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        gs,
+    );
 
     let mut batch = metal.begin_batch(t, beta1, beta2, eps, gs);
     batch.add(&mut param_gpu, &grad, &mut m_gpu, &mut v_gpu, lr, wd);
@@ -95,7 +124,8 @@ fn cache_scalars_single_tensor_no_wd() {
 fn cache_scalars_single_tensor_with_wd() {
     let metal = MetalAdam::new().expect("Metal required");
     let n = 4096;
-    let (beta1, beta2, eps, matrix_lr, wd, gs) = (0.9f32, 0.95, 1e-8, 3e-4 * 0.05, 0.1, 1.0 / 256.0);
+    let (beta1, beta2, eps, matrix_lr, wd, gs) =
+        (0.9f32, 0.95, 1e-8, 3e-4 * 0.05, 0.1, 1.0 / 256.0);
     let grad = make_grad(n, 99);
 
     let mut param_cpu = vec![0.3f32; n];
@@ -106,7 +136,19 @@ fn cache_scalars_single_tensor_with_wd() {
     let mut v_gpu = v_cpu.clone();
 
     let t = 5u32;
-    cpu_adam_step(&mut param_cpu, &grad, &mut m_cpu, &mut v_cpu, t, matrix_lr, beta1, beta2, eps, wd, gs);
+    cpu_adam_step(
+        &mut param_cpu,
+        &grad,
+        &mut m_cpu,
+        &mut v_cpu,
+        t,
+        matrix_lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        gs,
+    );
 
     let mut batch = metal.begin_batch(t, beta1, beta2, eps, gs);
     batch.add(&mut param_gpu, &grad, &mut m_gpu, &mut v_gpu, matrix_lr, wd);
@@ -139,23 +181,92 @@ fn cache_scalars_multi_tensor_mixed_lr_wd() {
     let grad_norm = make_grad(n, 3);
 
     // CPU reference for each
-    let mut p_embed_cpu = vec![0.1f32; n]; let mut m_e = vec![0.0f32; n]; let mut v_e = vec![0.0f32; n];
-    let mut p_matrix_cpu = vec![0.2f32; n]; let mut m_m = vec![0.0f32; n]; let mut v_m = vec![0.0f32; n];
-    let mut p_norm_cpu = vec![1.0f32; n]; let mut m_n = vec![0.0f32; n]; let mut v_n = vec![0.0f32; n];
+    let mut p_embed_cpu = vec![0.1f32; n];
+    let mut m_e = vec![0.0f32; n];
+    let mut v_e = vec![0.0f32; n];
+    let mut p_matrix_cpu = vec![0.2f32; n];
+    let mut m_m = vec![0.0f32; n];
+    let mut v_m = vec![0.0f32; n];
+    let mut p_norm_cpu = vec![1.0f32; n];
+    let mut m_n = vec![0.0f32; n];
+    let mut v_n = vec![0.0f32; n];
 
-    cpu_adam_step(&mut p_embed_cpu, &grad_embed, &mut m_e, &mut v_e, t, embed_lr, beta1, beta2, eps, 0.0, gs);
-    cpu_adam_step(&mut p_matrix_cpu, &grad_matrix, &mut m_m, &mut v_m, t, matrix_lr, beta1, beta2, eps, wd, gs);
-    cpu_adam_step(&mut p_norm_cpu, &grad_norm, &mut m_n, &mut v_n, t, norm_lr, beta1, beta2, eps, 0.0, gs);
+    cpu_adam_step(
+        &mut p_embed_cpu,
+        &grad_embed,
+        &mut m_e,
+        &mut v_e,
+        t,
+        embed_lr,
+        beta1,
+        beta2,
+        eps,
+        0.0,
+        gs,
+    );
+    cpu_adam_step(
+        &mut p_matrix_cpu,
+        &grad_matrix,
+        &mut m_m,
+        &mut v_m,
+        t,
+        matrix_lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        gs,
+    );
+    cpu_adam_step(
+        &mut p_norm_cpu,
+        &grad_norm,
+        &mut m_n,
+        &mut v_n,
+        t,
+        norm_lr,
+        beta1,
+        beta2,
+        eps,
+        0.0,
+        gs,
+    );
 
     // GPU batch (new API): single begin_batch, three add() calls with different lr/wd
-    let mut p_embed_gpu = vec![0.1f32; n]; let mut mg_e = vec![0.0f32; n]; let mut vg_e = vec![0.0f32; n];
-    let mut p_matrix_gpu = vec![0.2f32; n]; let mut mg_m = vec![0.0f32; n]; let mut vg_m = vec![0.0f32; n];
-    let mut p_norm_gpu = vec![1.0f32; n]; let mut mg_n = vec![0.0f32; n]; let mut vg_n = vec![0.0f32; n];
+    let mut p_embed_gpu = vec![0.1f32; n];
+    let mut mg_e = vec![0.0f32; n];
+    let mut vg_e = vec![0.0f32; n];
+    let mut p_matrix_gpu = vec![0.2f32; n];
+    let mut mg_m = vec![0.0f32; n];
+    let mut vg_m = vec![0.0f32; n];
+    let mut p_norm_gpu = vec![1.0f32; n];
+    let mut mg_n = vec![0.0f32; n];
+    let mut vg_n = vec![0.0f32; n];
 
     let mut batch = metal.begin_batch(t, beta1, beta2, eps, gs);
-    batch.add(&mut p_embed_gpu, &grad_embed, &mut mg_e, &mut vg_e, embed_lr, 0.0);
-    batch.add(&mut p_matrix_gpu, &grad_matrix, &mut mg_m, &mut vg_m, matrix_lr, wd);
-    batch.add(&mut p_norm_gpu, &grad_norm, &mut mg_n, &mut vg_n, norm_lr, 0.0);
+    batch.add(
+        &mut p_embed_gpu,
+        &grad_embed,
+        &mut mg_e,
+        &mut vg_e,
+        embed_lr,
+        0.0,
+    );
+    batch.add(
+        &mut p_matrix_gpu,
+        &grad_matrix,
+        &mut mg_m,
+        &mut vg_m,
+        matrix_lr,
+        wd,
+    );
+    batch.add(
+        &mut p_norm_gpu,
+        &grad_norm,
+        &mut mg_n,
+        &mut vg_n,
+        norm_lr,
+        0.0,
+    );
     batch.execute();
 
     assert_close(&p_embed_cpu, &p_embed_gpu, "embed param");
@@ -176,11 +287,27 @@ fn cache_scalars_multi_step_bc_advances() {
     let (beta1, beta2, eps, lr, wd, gs) = (0.9f32, 0.95, 1e-8, 3e-4, 0.1, 1.0);
     let grad = make_grad(n, 7);
 
-    let mut param_cpu = vec![0.5f32; n]; let mut m_c = vec![0.0f32; n]; let mut v_c = vec![0.0f32; n];
-    let mut param_gpu = param_cpu.clone(); let mut m_g = vec![0.0f32; n]; let mut v_g = vec![0.0f32; n];
+    let mut param_cpu = vec![0.5f32; n];
+    let mut m_c = vec![0.0f32; n];
+    let mut v_c = vec![0.0f32; n];
+    let mut param_gpu = param_cpu.clone();
+    let mut m_g = vec![0.0f32; n];
+    let mut v_g = vec![0.0f32; n];
 
     for t in 1u32..=5 {
-        cpu_adam_step(&mut param_cpu, &grad, &mut m_c, &mut v_c, t, lr, beta1, beta2, eps, wd, gs);
+        cpu_adam_step(
+            &mut param_cpu,
+            &grad,
+            &mut m_c,
+            &mut v_c,
+            t,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            gs,
+        );
 
         let mut batch = metal.begin_batch(t, beta1, beta2, eps, gs);
         batch.add(&mut param_gpu, &grad, &mut m_g, &mut v_g, lr, wd);

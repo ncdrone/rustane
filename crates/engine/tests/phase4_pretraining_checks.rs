@@ -3,11 +3,12 @@
 //! These catch bugs BEFORE burning 88 hours on a full training run.
 //! Every test uses the actual gpt_karpathy config on ANE hardware.
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelBackwardWorkspace, TrainConfig};
+use engine::full_model::{
+    self, ModelBackwardWorkspace, ModelGrads, ModelOptState, ModelWeights, TrainConfig,
+};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
-
 
 /// Helper: one forward+backward pass on fixed tokens, no loss_scale, no softcap.
 fn forward_backward_simple(
@@ -21,7 +22,17 @@ fn forward_backward_simple(
     grads.zero_out();
     let fwd = full_model::forward(cfg, kernels, weights, &tokens, &targets, 0.0);
     let mut bwd_ws = ModelBackwardWorkspace::new(cfg);
-    full_model::backward(cfg, kernels, weights, &fwd, &tokens, 0.0, 1.0, grads, &mut bwd_ws);
+    full_model::backward(
+        cfg,
+        kernels,
+        weights,
+        &fwd,
+        &tokens,
+        0.0,
+        1.0,
+        grads,
+        &mut bwd_ws,
+    );
     fwd.loss
 }
 
@@ -66,8 +77,12 @@ fn all_weight_groups_have_nonzero_gradient() {
             // (from the output projection), while dwq/dwk/dwv/dw1/dw3 are zero
             // because their outputs are multiplied by zero weights downstream.
             // This is correct — weights move off zero via dwo/dw2 first.
-            let zero_init_expected = *name == "dwq" || *name == "dwk"
-                || *name == "dwv" || *name == "dw1" || *name == "dw3";
+            let zero_init_expected = *name == "dwq"
+                || *name == "dwk"
+                || *name == "dwv"
+                || *name == "dw1"
+                || *name == "dw3"
+                || *name == "dgamma2";
             if !zero_init_expected {
                 assert!(*norm > 0.0, "layer {l} {name} gradient is zero");
             }
@@ -110,9 +125,29 @@ fn all_weights_move_after_training() {
         grads.zero_out();
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 0.0);
         let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads, &mut bwd_ws);
+        full_model::backward(
+            &cfg,
+            &kernels,
+            &weights,
+            &fwd,
+            &tokens,
+            0.0,
+            1.0,
+            &mut grads,
+            &mut bwd_ws,
+        );
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
+        full_model::update_weights(
+            &cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            1.0,
+        );
     }
 
     // Check that weights moved
@@ -145,16 +180,25 @@ fn loss_scale_invariance() {
     let kernels = CompiledKernels::compile(&cfg);
     let metal_adam = MetalAdam::new().expect("Metal GPU required");
 
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     // Run 3 steps with loss_scale=1.0
     let mut w1 = ModelWeights::random(&cfg);
     let mut g1 = ModelGrads::zeros(&cfg);
     let mut o1 = ModelOptState::zeros(&cfg);
     let tc1 = TrainConfig {
-        accum_steps: 1, warmup_steps: 0, total_steps: 10,
-        max_lr: 1e-4, loss_scale: 1.0, softcap: 0.0, grad_clip: f32::MAX,
+        accum_steps: 1,
+        warmup_steps: 0,
+        total_steps: 10,
+        max_lr: 1e-4,
+        loss_scale: 1.0,
+        softcap: 0.0,
+        grad_clip: f32::MAX,
         ..Default::default()
     };
     let mut losses_1 = Vec::new();
@@ -163,9 +207,29 @@ fn loss_scale_invariance() {
         let fwd = full_model::forward(&cfg, &kernels, &w1, &tokens, &targets, 0.0);
         losses_1.push(fwd.loss);
         let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
-        full_model::backward(&cfg, &kernels, &w1, &fwd, &tokens, 0.0, 1.0, &mut g1, &mut bwd_ws);
+        full_model::backward(
+            &cfg,
+            &kernels,
+            &w1,
+            &fwd,
+            &tokens,
+            0.0,
+            1.0,
+            &mut g1,
+            &mut bwd_ws,
+        );
         let lr = full_model::learning_rate(step, &tc1);
-        full_model::update_weights(&cfg, &mut w1, &g1, &mut o1, step + 1, lr, &tc1, &metal_adam, 1.0);
+        full_model::update_weights(
+            &cfg,
+            &mut w1,
+            &g1,
+            &mut o1,
+            step + 1,
+            lr,
+            &tc1,
+            &metal_adam,
+            1.0,
+        );
     }
 
     // Run 3 steps with loss_scale=256.0
@@ -173,8 +237,13 @@ fn loss_scale_invariance() {
     let mut g2 = ModelGrads::zeros(&cfg);
     let mut o2 = ModelOptState::zeros(&cfg);
     let tc2 = TrainConfig {
-        accum_steps: 1, warmup_steps: 0, total_steps: 10,
-        max_lr: 1e-4, loss_scale: 256.0, softcap: 0.0, grad_clip: f32::MAX,
+        accum_steps: 1,
+        warmup_steps: 0,
+        total_steps: 10,
+        max_lr: 1e-4,
+        loss_scale: 256.0,
+        softcap: 0.0,
+        grad_clip: f32::MAX,
         ..Default::default()
     };
     let mut losses_2 = Vec::new();
@@ -183,17 +252,39 @@ fn loss_scale_invariance() {
         let fwd = full_model::forward(&cfg, &kernels, &w2, &tokens, &targets, 0.0);
         losses_2.push(fwd.loss);
         let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
-        full_model::backward(&cfg, &kernels, &w2, &fwd, &tokens, 0.0, 256.0, &mut g2, &mut bwd_ws);
+        full_model::backward(
+            &cfg,
+            &kernels,
+            &w2,
+            &fwd,
+            &tokens,
+            0.0,
+            256.0,
+            &mut g2,
+            &mut bwd_ws,
+        );
         // Scale gradients by 1/loss_scale fused into Adam GPU kernel
         let lr = full_model::learning_rate(step, &tc2);
-        full_model::update_weights(&cfg, &mut w2, &g2, &mut o2, step + 1, lr, &tc2, &metal_adam, 1.0 / 256.0);
+        full_model::update_weights(
+            &cfg,
+            &mut w2,
+            &g2,
+            &mut o2,
+            step + 1,
+            lr,
+            &tc2,
+            &metal_adam,
+            1.0 / 256.0,
+        );
     }
 
     // Losses at each step should be identical (same initial weights, same data)
     for i in 0..3 {
         let diff = (losses_1[i] - losses_2[i]).abs();
-        println!("step {i}: loss_scale=1 → {:.6}, loss_scale=256 → {:.6}, diff = {diff:.8}",
-                 losses_1[i], losses_2[i]);
+        println!(
+            "step {i}: loss_scale=1 → {:.6}, loss_scale=256 → {:.6}, diff = {diff:.8}",
+            losses_1[i], losses_2[i]
+        );
         // Tolerance accounts for fp16 rounding in ANE kernels: 256x-scaled
         // gradients quantize differently than 1x-scaled, causing ~0.03 drift/step.
         assert!(diff < 0.1, "loss diverged at step {i}: {diff:.6}");
@@ -206,7 +297,10 @@ fn loss_scale_invariance() {
     println!("layer0.wq max diff: {l0_wq_diff:.8}");
     // fp16 rounding causes ~0.003 embed drift over 3 steps at different loss scales
     assert!(embed_diff < 0.01, "embed weights diverged: {embed_diff}");
-    assert!(l0_wq_diff < 0.01, "layer0.wq weights diverged: {l0_wq_diff}");
+    assert!(
+        l0_wq_diff < 0.01,
+        "layer0.wq weights diverged: {l0_wq_diff}"
+    );
 }
 
 // ── Test 4: Softcap overfit test ──
@@ -222,13 +316,22 @@ fn softcap_overfit_loss_decreases() {
     let mut opt = ModelOptState::zeros(&cfg);
 
     let tc = TrainConfig {
-        accum_steps: 1, warmup_steps: 0, total_steps: 20,
-        max_lr: 1e-4, loss_scale: 1.0, softcap: 15.0, grad_clip: 1.0,
+        accum_steps: 1,
+        warmup_steps: 0,
+        total_steps: 20,
+        max_lr: 1e-4,
+        loss_scale: 1.0,
+        softcap: 15.0,
+        grad_clip: 1.0,
         ..Default::default()
     };
 
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     let mut losses = Vec::new();
     for step in 0..10 {
@@ -236,17 +339,43 @@ fn softcap_overfit_loss_decreases() {
         let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 15.0);
         let loss = fwd.loss;
         let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
-        full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 15.0, 1.0, &mut grads, &mut bwd_ws);
+        full_model::backward(
+            &cfg,
+            &kernels,
+            &weights,
+            &fwd,
+            &tokens,
+            15.0,
+            1.0,
+            &mut grads,
+            &mut bwd_ws,
+        );
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
+        full_model::update_weights(
+            &cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            1.0,
+        );
         losses.push(loss);
         println!("step {step}: loss = {loss:.4} (softcap=15)");
     }
 
     let first = losses[0];
     let last = *losses.last().unwrap();
-    println!("\nsoftcap=15 overfit: {first:.4} → {last:.4} (delta = {:.4})", last - first);
-    assert!(last < first, "loss should decrease with softcap=15: {first:.4} → {last:.4}");
+    println!(
+        "\nsoftcap=15 overfit: {first:.4} → {last:.4} (delta = {:.4})",
+        last - first
+    );
+    assert!(
+        last < first,
+        "loss should decrease with softcap=15: {first:.4} → {last:.4}"
+    );
 }
 
 // ── Test 5: No NaN/Inf in full training config ──
@@ -273,47 +402,96 @@ fn no_nan_inf_in_training_config() {
 
     for step in 0..3 {
         grads.zero_out();
-        let fwd = full_model::forward(
-            &cfg, &kernels, &weights, &tokens, &targets, tc.softcap,
-        );
+        let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap);
         assert!(!fwd.loss.is_nan(), "loss is NaN at step {step}");
         assert!(!fwd.loss.is_infinite(), "loss is Inf at step {step}");
 
         let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
         full_model::backward(
-            &cfg, &kernels, &weights, &fwd, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws,
+            &cfg,
+            &kernels,
+            &weights,
+            &fwd,
+            &tokens,
+            tc.softcap,
+            tc.loss_scale,
+            &mut grads,
+            &mut bwd_ws,
         );
 
         // Check gradients for NaN/Inf
-        assert!(!has_nan_inf(&grads.dembed), "dembed has NaN/Inf at step {step}");
-        assert!(!has_nan_inf(&grads.dgamma_final), "dgamma_final has NaN/Inf at step {step}");
+        assert!(
+            !has_nan_inf(&grads.dembed),
+            "dembed has NaN/Inf at step {step}"
+        );
+        assert!(
+            !has_nan_inf(&grads.dgamma_final),
+            "dgamma_final has NaN/Inf at step {step}"
+        );
         for (l, lg) in grads.layers.iter().enumerate() {
             for (name, g) in [
-                ("dwq", &lg.dwq), ("dwk", &lg.dwk), ("dwv", &lg.dwv),
-                ("dwo", &lg.dwo), ("dw1", &lg.dw1), ("dw3", &lg.dw3),
-                ("dw2", &lg.dw2), ("dgamma1", &lg.dgamma1), ("dgamma2", &lg.dgamma2),
+                ("dwq", &lg.dwq),
+                ("dwk", &lg.dwk),
+                ("dwv", &lg.dwv),
+                ("dwo", &lg.dwo),
+                ("dw1", &lg.dw1),
+                ("dw3", &lg.dw3),
+                ("dw2", &lg.dw2),
+                ("dgamma1", &lg.dgamma1),
+                ("dgamma2", &lg.dgamma2),
             ] {
-                assert!(!has_nan_inf(g), "layer {l} {name} has NaN/Inf at step {step}");
+                assert!(
+                    !has_nan_inf(g),
+                    "layer {l} {name} has NaN/Inf at step {step}"
+                );
             }
         }
 
         let lr = full_model::learning_rate(step, &tc);
-        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, 1.0);
+        full_model::update_weights(
+            &cfg,
+            &mut weights,
+            &grads,
+            &mut opt,
+            step + 1,
+            lr,
+            &tc,
+            &metal_adam,
+            1.0,
+        );
 
         // Check weights for NaN/Inf after update
-        assert!(!has_nan_inf(&weights.embed), "embed weights NaN/Inf at step {step}");
-        assert!(!has_nan_inf(&weights.gamma_final), "gamma_final NaN/Inf at step {step}");
+        assert!(
+            !has_nan_inf(&weights.embed),
+            "embed weights NaN/Inf at step {step}"
+        );
+        assert!(
+            !has_nan_inf(&weights.gamma_final),
+            "gamma_final NaN/Inf at step {step}"
+        );
         for (l, lw) in weights.layers.iter().enumerate() {
             for (name, w) in [
-                ("wq", &lw.wq), ("wk", &lw.wk), ("wv", &lw.wv),
-                ("wo", &lw.wo), ("w1", &lw.w1), ("w3", &lw.w3),
-                ("w2", &lw.w2), ("gamma1", &lw.gamma1), ("gamma2", &lw.gamma2),
+                ("wq", &lw.wq),
+                ("wk", &lw.wk),
+                ("wv", &lw.wv),
+                ("wo", &lw.wo),
+                ("w1", &lw.w1),
+                ("w3", &lw.w3),
+                ("w2", &lw.w2),
+                ("gamma1", &lw.gamma1),
+                ("gamma2", &lw.gamma2),
             ] {
-                assert!(!has_nan_inf(w), "layer {l} {name} weight NaN/Inf at step {step}");
+                assert!(
+                    !has_nan_inf(w),
+                    "layer {l} {name} weight NaN/Inf at step {step}"
+                );
             }
         }
 
-        println!("step {step}: loss = {:.4}, lr = {lr:.2e} — no NaN/Inf ✓", fwd.loss);
+        println!(
+            "step {step}: loss = {:.4}, lr = {lr:.2e} — no NaN/Inf ✓",
+            fwd.loss
+        );
     }
 }
 
@@ -326,24 +504,54 @@ fn gradient_accumulation_matches_manual() {
     let kernels = CompiledKernels::compile(&cfg);
     let weights = ModelWeights::random(&cfg);
 
-    let tokens_a: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets_a: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let tokens_b: Vec<u32> = (0..cfg.seq).map(|i| ((i * 17 + 3) % cfg.vocab) as u32).collect();
-    let targets_b: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 17 + 3) % cfg.vocab) as u32).collect();
+    let tokens_a: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets_a: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let tokens_b: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 17 + 3) % cfg.vocab) as u32)
+        .collect();
+    let targets_b: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 17 + 3) % cfg.vocab) as u32)
+        .collect();
 
     // Manual: two forward/backward passes, sum gradients
     let mut grads_manual = ModelGrads::zeros(&cfg);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
     let fwd_a = full_model::forward(&cfg, &kernels, &weights, &tokens_a, &targets_a, 0.0);
-    full_model::backward(&cfg, &kernels, &weights, &fwd_a, &tokens_a, 0.0, 1.0, &mut grads_manual, &mut bwd_ws);
+    full_model::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_a,
+        &tokens_a,
+        0.0,
+        1.0,
+        &mut grads_manual,
+        &mut bwd_ws,
+    );
     let fwd_b = full_model::forward(&cfg, &kernels, &weights, &tokens_b, &targets_b, 0.0);
-    full_model::backward(&cfg, &kernels, &weights, &fwd_b, &tokens_b, 0.0, 1.0, &mut grads_manual, &mut bwd_ws);
+    full_model::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_b,
+        &tokens_b,
+        0.0,
+        1.0,
+        &mut grads_manual,
+        &mut bwd_ws,
+    );
 
     let manual_loss = (fwd_a.loss + fwd_b.loss) / 2.0;
     let manual_embed_norm = l2_norm(&grads_manual.dembed);
     let manual_l0_wq_norm = l2_norm(&grads_manual.layers[0].dwq);
 
-    println!("manual: loss = {manual_loss:.6}, dembed norm = {manual_embed_norm:.6}, l0.dwq norm = {manual_l0_wq_norm:.6}");
+    println!(
+        "manual: loss = {manual_loss:.6}, dembed norm = {manual_embed_norm:.6}, l0.dwq norm = {manual_l0_wq_norm:.6}"
+    );
 
     // Verify embedding gradients are non-zero (dwq is zero with DeepNet zero-init)
     assert!(manual_embed_norm > 0.0, "manual dembed gradient is zero");
@@ -351,15 +559,31 @@ fn gradient_accumulation_matches_manual() {
 
     // The key check: gradients from two passes should be ~2x single pass
     let mut grads_single = ModelGrads::zeros(&cfg);
-    full_model::backward(&cfg, &kernels, &weights, &fwd_a, &tokens_a, 0.0, 1.0, &mut grads_single, &mut bwd_ws);
+    full_model::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd_a,
+        &tokens_a,
+        0.0,
+        1.0,
+        &mut grads_single,
+        &mut bwd_ws,
+    );
     let single_embed_norm = l2_norm(&grads_single.dembed);
     let single_l0_wq_norm = l2_norm(&grads_single.layers[0].dwq);
     println!("single: dembed norm = {single_embed_norm:.6}, l0.dwq norm = {single_l0_wq_norm:.6}");
     // Use embed norms for the ratio check (dwq may be zero with DeepNet zero-init)
-    println!("ratio:  dembed = {:.3}", manual_embed_norm / single_embed_norm);
+    println!(
+        "ratio:  dembed = {:.3}",
+        manual_embed_norm / single_embed_norm
+    );
     // Not exactly 2x since different data, but should be in (1, 3) range
     let ratio = manual_embed_norm / single_embed_norm;
-    assert!(ratio > 0.5 && ratio < 4.0, "gradient accumulation ratio unexpected: {ratio}");
+    assert!(
+        ratio > 0.5 && ratio < 4.0,
+        "gradient accumulation ratio unexpected: {ratio}"
+    );
 }
 
 // ── Helpers ──
@@ -369,7 +593,10 @@ fn l2_norm(v: &[f32]) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn has_nan_inf(v: &[f32]) -> bool {
@@ -414,7 +641,17 @@ fn diagnose_ffn_backward_intermediates() {
     grads.zero_out();
     let fwd = full_model::forward(&cfg, &kernels, &weights, &tokens, &targets, 0.0);
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
-    full_model::backward(&cfg, &kernels, &weights, &fwd, &tokens, 0.0, 1.0, &mut grads, &mut bwd_ws);
+    full_model::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &fwd,
+        &tokens,
+        0.0,
+        1.0,
+        &mut grads,
+        &mut bwd_ws,
+    );
 
     // Print all layer 0 gradient norms (extended: dw2 and dw3 too)
     let lg = &grads.layers[0];
@@ -442,7 +679,7 @@ fn diagnose_ffn_backward_intermediates() {
 
 #[test]
 fn diagnose_ffn_fused_output() {
-    use ane_bridge::ane::{TensorData, Shape};
+    use ane_bridge::ane::{Shape, TensorData};
     use engine::kernels::ffn_fused;
 
     let cfg = ModelConfig::gpt_karpathy();
@@ -465,25 +702,36 @@ fn diagnose_ffn_fused_output() {
         }
     }
 
-    // Stage into ffnFused format
-    let ffn_sp = ffn_fused::input_spatial_width(&cfg);
-    let mut ffn_in = vec![0.0f32; dim * ffn_sp];
-    // stage_spatial manually:
-    for c in 0..dim {
-        for s in 0..seq { ffn_in[c * ffn_sp + s] = x2norm[c * seq + s]; }
-        for s in 0..seq { ffn_in[c * ffn_sp + seq + s] = x2[c * seq + s]; }
-        for h in 0..hidden { ffn_in[c * ffn_sp + 2*seq + h] = weights.layers[0].w1[c * hidden + h]; }
-        for h in 0..hidden { ffn_in[c * ffn_sp + 2*seq + hidden + h] = weights.layers[0].w3[c * hidden + h]; }
-        for h in 0..hidden { ffn_in[c * ffn_sp + 2*seq + 2*hidden + h] = weights.layers[0].w2[c * hidden + h]; }
-    }
-
-    // Run on ANE
+    // Run on ANE using the split-input kernel variant used by training.
     let ffn_out_ch = ffn_fused::output_channels(&cfg);
-    let in_shape = Shape { batch: 1, channels: dim, height: 1, width: ffn_sp };
-    let out_shape = Shape { batch: 1, channels: ffn_out_ch, height: 1, width: seq };
-    let input_td = TensorData::with_f32(&ffn_in, in_shape);
+    let out_shape = Shape {
+        batch: 1,
+        channels: ffn_out_ch,
+        height: 1,
+        width: seq,
+    };
+    let x_shape = Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: seq,
+    };
+    let w_shape = Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: hidden,
+    };
+    let x2norm_td = TensorData::with_f32(&x2norm, x_shape);
+    let x2_td = TensorData::with_f32(&x2, x_shape);
+    let w1_td = TensorData::with_f32(&weights.layers[0].w1, w_shape);
+    let w3_td = TensorData::with_f32(&weights.layers[0].w3, w_shape);
+    let w2_td = TensorData::with_f32(&weights.layers[0].w2, w_shape);
     let output_td = TensorData::new(out_shape);
-    kernels.ffn_fused.run(&[&input_td], &[&output_td]).expect("ffnFused eval");
+    kernels
+        .ffn_fused
+        .run(&[&x2norm_td, &x2_td, &w1_td, &w3_td, &w2_td], &[&output_td])
+        .expect("ffnFused eval");
     let ane_out = output_td.read_f32().to_vec();
 
     // Extract x_next from ANE output (first dim channels)
@@ -548,7 +796,10 @@ fn diagnose_ffn_fused_output() {
 
     // Check first 5 elements
     for i in 0..5 {
-        println!("  x_next[{i}]: ANE={:.6} CPU={:.6}", ane_x_next[i], cpu_x_next[i]);
+        println!(
+            "  x_next[{i}]: ANE={:.6} CPU={:.6}",
+            ane_x_next[i], cpu_x_next[i]
+        );
     }
 
     // Check x2 passthrough (if ffn_out were zero, x_next should equal x2)
@@ -556,27 +807,31 @@ fn diagnose_ffn_fused_output() {
     println!("x2 norm: {x2_norm:.4}");
     println!("alpha * ffn_out_cpu norm: {:.4}", alpha * ffn_out_cpu_norm);
 
-    let max_diff: f32 = ane_x_next.iter().zip(cpu_x_next.iter())
+    let max_diff: f32 = ane_x_next
+        .iter()
+        .zip(cpu_x_next.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("max |ANE - CPU| = {max_diff:.6}");
 
-    assert!(max_diff < 10.0, "FFN fused kernel diverges from CPU: max_diff={max_diff:.4}");
+    assert!(
+        max_diff < 10.0,
+        "FFN fused kernel diverges from CPU: max_diff={max_diff:.4}"
+    );
 }
 
 // ── Test 9: Diagnose ffnBwdW2t kernel — does it produce non-zero output? ──
 
 #[test]
 fn diagnose_ffn_bwd_w2t_kernel() {
-    use ane_bridge::ane::{TensorData, Shape};
-    use engine::kernels::dyn_matmul;
+    use ane_bridge::ane::{Shape, TensorData};
 
     let cfg = ModelConfig::gpt_karpathy();
     let kernels = CompiledKernels::compile(&cfg);
 
-    let dim = cfg.dim;     // 768
+    let dim = cfg.dim; // 768
     let hidden = cfg.hidden; // 2048
-    let seq = cfg.seq;     // 512
+    let seq = cfg.seq; // 512
 
     // Create known activations (dffn) and weights (W2)
     // dffn[dim, seq] — fill with small but non-zero values
@@ -601,24 +856,32 @@ fn diagnose_ffn_bwd_w2t_kernel() {
     println!("dffn norm: {dffn_norm:.4}");
     println!("w2 norm: {w2_norm:.4}");
 
-    // Stage into DynMatmul format: [dim, seq + hidden]
-    let sp = dyn_matmul::spatial_width(seq, hidden);
-    let mut staged = vec![0.0f32; dim * sp];
-    for c in 0..dim {
-        for s in 0..seq {
-            staged[c * sp + s] = dffn[c * seq + s];
-        }
-        for h in 0..hidden {
-            staged[c * sp + seq + h] = w2[c * hidden + h];
-        }
-    }
-
     // Run ANE kernel
-    let in_shape = Shape { batch: 1, channels: dim, height: 1, width: sp };
-    let out_shape = Shape { batch: 1, channels: hidden, height: 1, width: seq };
-    let input_td = TensorData::with_f32(&staged, in_shape);
+    let acts_shape = Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: seq,
+    };
+    let wts_shape = Shape {
+        batch: 1,
+        channels: dim,
+        height: 1,
+        width: hidden,
+    };
+    let out_shape = Shape {
+        batch: 1,
+        channels: hidden,
+        height: 1,
+        width: seq,
+    };
+    let acts_td = TensorData::with_f32(&dffn, acts_shape);
+    let wts_td = TensorData::with_f32(&w2, wts_shape);
     let output_td = TensorData::new(out_shape);
-    kernels.ffn_bwd_w2t.run(&[&input_td], &[&output_td]).expect("ffnBwdW2t eval");
+    kernels
+        .ffn_bwd_w2t
+        .run(&[&acts_td, &wts_td], &[&output_td])
+        .expect("ffnBwdW2t eval");
     let ane_out = output_td.read_f32().to_vec();
 
     let ane_norm = l2_norm(&ane_out);
@@ -653,5 +916,8 @@ fn diagnose_ffn_bwd_w2t_kernel() {
     let dot: f32 = ane_out.iter().zip(cpu_out.iter()).map(|(a, b)| a * b).sum();
     let cosine = dot / (ane_norm * cpu_norm + 1e-12);
     println!("ANE vs CPU cosine similarity: {cosine:.6}");
-    assert!(cosine > 0.9, "ANE and CPU outputs don't match: cosine={cosine:.6}");
+    assert!(
+        cosine > 0.9,
+        "ANE and CPU outputs don't match: cosine={cosine:.6}"
+    );
 }

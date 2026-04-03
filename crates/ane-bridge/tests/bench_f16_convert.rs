@@ -22,7 +22,10 @@ fn bench_f32_to_f16_conversion() {
         (768 * 3072, "DIM×HIDDEN (768×3072 = 2.4M)"),
     ];
 
-    println!("{:<45} {:>10} {:>10} {:>10}", "Buffer", "half (ms)", "ane (ms)", "ratio");
+    println!(
+        "{:<45} {:>10} {:>10} {:>10}",
+        "Buffer", "half (ms)", "ane (ms)", "ratio"
+    );
     println!("{}", "-".repeat(85));
 
     for (count, label) in sizes {
@@ -61,9 +64,14 @@ fn bench_f32_to_f16_conversion() {
     let half_ms = bench_half_crate_f32_to_f16(&big_data);
     let bytes = big_count * 4; // f32 input bytes
     let gb_per_sec = (bytes as f64 / 1e9) / (half_ms / 1000.0);
-    println!("Peak throughput (half crate, f32→f16): {gb_per_sec:.2} GB/s ({big_count} elements in {half_ms:.3}ms)");
+    println!(
+        "Peak throughput (half crate, f32→f16): {gb_per_sec:.2} GB/s ({big_count} elements in {half_ms:.3}ms)"
+    );
     println!("Memory bandwidth: 546 GB/s (M4 Max shared)");
-    println!("Conversion overhead: {:.1}% of bandwidth", (1.0 - gb_per_sec / 546.0) * 100.0);
+    println!(
+        "Conversion overhead: {:.1}% of bandwidth",
+        (1.0 - gb_per_sec / 546.0) * 100.0
+    );
 }
 
 fn bench_half_crate_f32_to_f16(data: &[f32]) -> f64 {

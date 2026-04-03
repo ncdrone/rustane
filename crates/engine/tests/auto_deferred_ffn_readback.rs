@@ -18,14 +18,21 @@
 //!   - The readback read from wrong channel offsets
 //!   - The split_at_mut indexing was wrong (wrote to wrong cache)
 
-use engine::layer::{self, CompiledKernels, LayerWeights, ForwardCache};
+use engine::layer::{self, CompiledKernels, ForwardCache, LayerWeights};
 use engine::model::ModelConfig;
 
 fn assert_exact(a: &[f32], b: &[f32], label: &str) {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch ({} vs {})", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch ({} vs {})",
+        a.len(),
+        b.len()
+    );
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert_eq!(
-            x.to_bits(), y.to_bits(),
+            x.to_bits(),
+            y.to_bits(),
             "{label}[{i}]: ref={x} vs opt={y} (not bit-identical)"
         );
     }
@@ -39,17 +46,34 @@ fn deferred_readback_single_layer_matches() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     // Reference: forward_into (reads h1/h3/gate immediately)
     let mut cache_ref = ForwardCache::new(&cfg);
     let mut x_next_ref = vec![0.0f32; n_in];
-    layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache_ref, &mut x_next_ref);
+    layer::forward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &x,
+        &mut cache_ref,
+        &mut x_next_ref,
+    );
 
     // Optimized: forward_into_pipelined(None) + read_ffn_cache
     let mut cache_opt = ForwardCache::new(&cfg);
     let mut x_next_opt = vec![0.0f32; n_in];
-    layer::forward_into_pipelined(&cfg, &kernels, &weights, &x, &mut cache_opt, &mut x_next_opt, None);
+    layer::forward_into_pipelined(
+        &cfg,
+        &kernels,
+        &weights,
+        &x,
+        &mut cache_opt,
+        &mut x_next_opt,
+        None,
+    );
     layer::read_ffn_cache(&cfg, &kernels, &mut cache_opt);
 
     assert_exact(&x_next_ref, &x_next_opt, "x_next");
@@ -61,7 +85,9 @@ fn deferred_readback_single_layer_matches() {
     assert_exact(&cache_ref.attn_out, &cache_opt.attn_out, "cache.attn_out");
     assert_exact(&cache_ref.x2norm, &cache_opt.x2norm, "cache.x2norm");
 
-    println!("PASS: pipelined(None) + read_ffn_cache matches forward_into (all fields bit-identical)");
+    println!(
+        "PASS: pipelined(None) + read_ffn_cache matches forward_into (all fields bit-identical)"
+    );
 }
 
 /// Test 2: Two layers — pipelined pipeline correctly reads previous layer's cache.
@@ -75,7 +101,9 @@ fn deferred_readback_two_layer_pipeline() {
     let w1 = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     // Reference: two forward_into calls
     let mut cache0_ref = ForwardCache::new(&cfg);
@@ -83,7 +111,14 @@ fn deferred_readback_two_layer_pipeline() {
     let mut x_mid = vec![0.0f32; n_in];
     let mut x_next_ref = vec![0.0f32; n_in];
     layer::forward_into(&cfg, &kernels, &w0, &x, &mut cache0_ref, &mut x_mid);
-    layer::forward_into(&cfg, &kernels, &w1, &x_mid, &mut cache1_ref, &mut x_next_ref);
+    layer::forward_into(
+        &cfg,
+        &kernels,
+        &w1,
+        &x_mid,
+        &mut cache1_ref,
+        &mut x_next_ref,
+    );
 
     // Optimized: pipelined chain
     let mut cache0_opt = ForwardCache::new(&cfg);
@@ -91,9 +126,25 @@ fn deferred_readback_two_layer_pipeline() {
     let mut x_mid_opt = vec![0.0f32; n_in];
     let mut x_next_opt = vec![0.0f32; n_in];
     // Layer 0: no prev cache
-    layer::forward_into_pipelined(&cfg, &kernels, &w0, &x, &mut cache0_opt, &mut x_mid_opt, None);
+    layer::forward_into_pipelined(
+        &cfg,
+        &kernels,
+        &w0,
+        &x,
+        &mut cache0_opt,
+        &mut x_mid_opt,
+        None,
+    );
     // Layer 1: reads layer 0's deferred h1/h3/gate during sdpaFwd overlap
-    layer::forward_into_pipelined(&cfg, &kernels, &w1, &x_mid_opt, &mut cache1_opt, &mut x_next_opt, Some(&mut cache0_opt));
+    layer::forward_into_pipelined(
+        &cfg,
+        &kernels,
+        &w1,
+        &x_mid_opt,
+        &mut cache1_opt,
+        &mut x_next_opt,
+        Some(&mut cache0_opt),
+    );
     // Read last layer's deferred cache
     layer::read_ffn_cache(&cfg, &kernels, &mut cache1_opt);
 
@@ -118,18 +169,36 @@ fn deferred_readback_idempotent() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     // Call 1
     let mut cache1 = ForwardCache::new(&cfg);
     let mut x_next1 = vec![0.0f32; n_in];
-    layer::forward_into_pipelined(&cfg, &kernels, &weights, &x, &mut cache1, &mut x_next1, None);
+    layer::forward_into_pipelined(
+        &cfg,
+        &kernels,
+        &weights,
+        &x,
+        &mut cache1,
+        &mut x_next1,
+        None,
+    );
     layer::read_ffn_cache(&cfg, &kernels, &mut cache1);
 
     // Call 2
     let mut cache2 = ForwardCache::new(&cfg);
     let mut x_next2 = vec![0.0f32; n_in];
-    layer::forward_into_pipelined(&cfg, &kernels, &weights, &x, &mut cache2, &mut x_next2, None);
+    layer::forward_into_pipelined(
+        &cfg,
+        &kernels,
+        &weights,
+        &x,
+        &mut cache2,
+        &mut x_next2,
+        None,
+    );
     layer::read_ffn_cache(&cfg, &kernels, &mut cache2);
 
     assert_exact(&x_next1, &x_next2, "x_next_idempotent");

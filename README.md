@@ -14,6 +14,160 @@ The engine trains transformer models at 3-5W power draw, leaving the GPU complet
 
 Run `make help` to see all available commands.
 
+## Checkpoint Inference
+
+Rustane can now load its own training checkpoints and run a minimal autoregressive
+generation loop from the `engine` crate.
+
+```bash
+# raw token IDs
+cargo run -p engine --bin generate --release -- \
+  --checkpoint /path/to/ckpt_001000.bin \
+  --prompt-ids 1,2,3,4 \
+  --steps 32
+
+# text prompt with a compatible tokenizer.json
+cargo run -p engine --bin generate --release -- \
+  --checkpoint /path/to/ckpt_001000.bin \
+  --tokenizer /path/to/tokenizer.json \
+  --prompt "Hello from Rustane" \
+  --steps 32
+
+# force the Metal-backed KV-cache decode path
+cargo run -p engine --bin generate --release -- \
+  --checkpoint /path/to/ckpt_001000.bin \
+  --prompt-ids 1,2,3,4 \
+  --steps 32 \
+  --kv-cache
+
+# explicitly choose the decode backend
+cargo run -p engine --bin generate --release -- \
+  --checkpoint /path/to/ckpt_001000.bin \
+  --prompt-ids 1,2,3,4 \
+  --steps 32 \
+  --decode-backend auto
+
+# sample multiple continuations from one shared prompt prefill
+cargo run -p engine --bin generate --release -- \
+  --checkpoint /path/to/ckpt_001000.bin \
+  --prompt "Hello from Rustane" \
+  --tokenizer /path/to/tokenizer.json \
+  --decode-backend metal \
+  --temperature 0.8 \
+  --top-k 8 \
+  --samples 4 \
+  --steps 64
+
+# keep one prompt/session hot and serve repeated JSONL requests over stdin/stdout
+printf '%s\n%s\n' \
+  '{"steps":32,"temperature":0.8,"top_k":8,"samples":2,"seed":11}' \
+  '{"steps":16,"decode_backend":"naive","temperature":0.0,"top_k":1,"samples":1,"seed":12}' \
+  | cargo run -p engine --bin generate --release -- \
+      --checkpoint /path/to/ckpt_001000.bin \
+      --prompt-ids 1,2,3,4 \
+      --decode-backend metal \
+      --jsonl-session
+```
+
+The CLI reports separate `prefill` and `decode` timings. Current decode mode is
+selected automatically. `auto` prefers `naive_full_context` for small checkpoints
+and `kv_cache_metal` for larger ones when the requested decode window stays within
+`cfg.seq`. `--kv-cache` is a shorthand for `--decode-backend metal`. When sampling
+is greedy (`temperature <= 0` or `top_k == 1`), the Metal KV-cache path also uses
+an on-GPU embedding lookup plus on-GPU argmax step, so it does not need to upload
+a full token embedding or read back a full logits vector each token. For bounded
+sampling (`top_k > 1`), Rustane also uses a GPU top-k candidate path for cached
+decode when `top_k <= 32`, and only reads back those candidates for CPU sampling.
+For full-vocab sampling (`top_k == 0`), cached decode uses an exact GPU block-stats
+path and only materializes one sampled vocab block instead of the whole logits row.
+`--samples N` reuses one prompt prefill across multiple continuations in a single
+run, and reports amortized decode / overall throughput across all samples. For a
+persistent process, `--jsonl-session` keeps one `InferenceSession` alive and reads
+one JSON request per stdin line. Startup metadata is written to stderr; stdout is
+reserved for JSONL responses so the process can be scripted cleanly.
+
+Tokenizer note: token IDs produced by the tokenizer must fit within the model
+checkpoint vocabulary. Rustane checkpoints currently use the training vocab baked
+into the checkpoint config.
+
+## HTTP Serving
+
+Rustane also has a minimal HTTP server for checkpoint-backed inference:
+
+```bash
+cargo run -p engine --bin serve --release -- \
+  --checkpoint /path/to/ckpt_001000.bin \
+  --tokenizer /path/to/tokenizer.json \
+  --bind 127.0.0.1:8080 \
+  --model-name rustane-local \
+  --max-cache-sessions 32
+```
+
+Available routes:
+- `GET /healthz`
+- `GET /v1/models`
+- `POST /v1/completions`
+- `POST /v1/chat/completions`
+
+Example completion request:
+
+```bash
+curl http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "rustane-local",
+    "prompt_ids": [1, 2, 3, 4],
+    "max_tokens": 16,
+    "temperature": 0.8,
+    "top_k": 8,
+    "n": 2
+  }'
+```
+
+Example chat request:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "rustane-local",
+    "messages": [
+      {"role": "system", "content": "Be terse."},
+      {"role": "user", "content": "Hello"}
+    ],
+    "max_tokens": 16,
+    "temperature": 0.0,
+    "top_k": 1
+  }'
+```
+
+Streaming is also supported with Server-Sent Events for `n=1`:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "rustane-local",
+    "prompt_ids": [1, 2, 3, 4],
+    "max_tokens": 8,
+    "temperature": 0.0,
+    "top_k": 1,
+    "stream": true
+  }'
+```
+
+Responses include a `rustane` metadata block with:
+- `effective_prompt_tokens`
+- `prompt_truncated`
+- `cache_prefix_tokens`
+- `base_prefill_ms`
+- `request_prefill_ms`
+- `decode_ms_total`
+
+The server keeps an in-memory prompt-session cache and reuses the deepest cached
+prefix for subsequent requests. This is intentionally minimal: non-streaming only,
+single-process, and best suited for local experimentation.
+
 ### Three Types of Tests
 
 | Test | What It Measures | Command | Time |

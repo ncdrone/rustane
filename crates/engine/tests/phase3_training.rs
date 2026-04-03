@@ -3,7 +3,7 @@
 //! Exit criteria: loss decreases over 10 training steps.
 
 use engine::cpu::adam::AdamConfig;
-use engine::layer::{CompiledKernels, LayerWeights, LayerGrads};
+use engine::layer::{CompiledKernels, LayerGrads, LayerWeights};
 use engine::model::ModelConfig;
 use engine::training::{self, LayerOptState};
 
@@ -35,7 +35,14 @@ fn single_layer_loss_decreases() {
 
     for t in 1..=steps {
         let loss = training::train_step(
-            &cfg, &kernels, &mut weights, &mut grads, &mut opt, &x, t, &adam_cfg,
+            &cfg,
+            &kernels,
+            &mut weights,
+            &mut grads,
+            &mut opt,
+            &x,
+            t,
+            &adam_cfg,
         );
         losses.push(loss);
         println!("step {t}: loss = {loss:.6}");
@@ -55,5 +62,7 @@ fn single_layer_loss_decreases() {
 fn all_10_kernels_compile() {
     let cfg = ModelConfig::gpt_karpathy();
     let _kernels = CompiledKernels::compile(&cfg);
-    println!("All 10 kernels compiled ✓ (sdpaFwd, woFwd, ffnFused, ffnBwdW2t, ffnBwdW13t, wotBwd, sdpaBwd1, sdpaBwd2, qBwd, kvBwd)");
+    println!(
+        "All 10 kernels compiled ✓ (sdpaFwd, woFwd, ffnFused, ffnBwdW2t, ffnBwdW13t, wotBwd, sdpaBwd1, sdpaBwd2, qBwd, kvBwd)"
+    );
 }

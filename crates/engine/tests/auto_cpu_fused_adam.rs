@@ -24,10 +24,14 @@ const TOL: f32 = 1e-5;
 
 fn make_grad(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        })
+        .collect()
 }
 
 /// Test 1: CPU fused matches Metal GPU for a single large tensor.
@@ -51,15 +55,35 @@ fn cpu_fused_vs_metal_single_tensor() {
     let mut param_cpu = vec![0.5f32; n];
     let mut m_cpu = vec![0.0f32; n];
     let mut v_cpu = vec![0.0f32; n];
-    adam::step_fused(&mut param_cpu, &grad, &mut m_cpu, &mut v_cpu,
-                     t, lr, beta1, beta2, eps, wd, gs);
+    adam::step_fused(
+        &mut param_cpu,
+        &grad,
+        &mut m_cpu,
+        &mut v_cpu,
+        t,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        wd,
+        gs,
+    );
 
-    let max_diff_param = param_gpu.iter().zip(param_cpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    let max_diff_m = m_gpu.iter().zip(m_cpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    let max_diff_v = v_gpu.iter().zip(v_cpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff_param = param_gpu
+        .iter()
+        .zip(param_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_diff_m = m_gpu
+        .iter()
+        .zip(m_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_diff_v = v_gpu
+        .iter()
+        .zip(v_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
     assert!(max_diff_param < TOL, "param max_diff={max_diff_param}");
     assert!(max_diff_m < TOL, "m max_diff={max_diff_m}");
@@ -86,11 +110,25 @@ fn cpu_fused_vs_metal_10_steps() {
         batch.add(&mut param_gpu, &grad, &mut m_gpu, &mut v_gpu, lr, wd);
         batch.execute();
 
-        adam::step_fused(&mut param_cpu, &grad, &mut m_cpu, &mut v_cpu,
-                         t, lr, beta1, beta2, eps, wd, gs);
+        adam::step_fused(
+            &mut param_cpu,
+            &grad,
+            &mut m_cpu,
+            &mut v_cpu,
+            t,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            gs,
+        );
 
-        let max_diff = param_gpu.iter().zip(param_cpu.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff = param_gpu
+            .iter()
+            .zip(param_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max_diff < TOL, "step {t}: param max_diff={max_diff}");
     }
 }
@@ -114,10 +152,24 @@ fn cpu_fused_vs_metal_no_weight_decay() {
     let mut param_cpu = vec![0.01f32; n];
     let mut m_cpu = vec![0.0f32; n];
     let mut v_cpu = vec![0.0f32; n];
-    adam::step_fused(&mut param_cpu, &grad, &mut m_cpu, &mut v_cpu,
-                     t, lr, beta1, beta2, eps, 0.0, gs);
+    adam::step_fused(
+        &mut param_cpu,
+        &grad,
+        &mut m_cpu,
+        &mut v_cpu,
+        t,
+        lr,
+        beta1,
+        beta2,
+        eps,
+        0.0,
+        gs,
+    );
 
-    let max_diff = param_gpu.iter().zip(param_cpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_diff = param_gpu
+        .iter()
+        .zip(param_cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_diff < TOL, "embed param max_diff={max_diff}");
 }

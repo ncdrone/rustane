@@ -3,7 +3,8 @@
 //! After a benchmark run, call `write_result()` to save a JSON file to
 //! `target/bench-result.json`. Users then run `make submit` to post it.
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -84,7 +85,7 @@ pub fn utc_timestamp() -> String {
 
 /// Compute SHA-256 fingerprint of the result (with fingerprint field empty).
 pub fn compute_fingerprint(result: &BenchResult) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut tmp = result.clone();
     tmp.fingerprint = String::new();
     let json = serde_json::to_string(&tmp).unwrap_or_default();
@@ -94,11 +95,23 @@ pub fn compute_fingerprint(result: &BenchResult) -> String {
 
 /// Write a bench result to `target/bench-result.json`.
 pub fn write_result(result: &BenchResult) {
-    let path = "target/bench-result.json";
+    let path = bench_result_path();
     let json = serde_json::to_string_pretty(result).unwrap();
-    std::fs::write(path, &json).unwrap();
-    println!("\n  📊 Result saved to {path}");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, &json).unwrap();
+    println!("\n  📊 Result saved to {}", path.display());
     println!("  Submit to leaderboard: make submit");
+}
+
+fn bench_result_path() -> PathBuf {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(manifest_dir);
+    workspace_root.join("target/bench-result.json")
 }
 
 fn sysctl_string(key: &str) -> String {

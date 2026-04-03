@@ -24,14 +24,23 @@
 //!   - A read order error (reading output before ANE finished)
 //!   - A buffer reuse conflict (stale data in pre-staged buffer)
 
-use engine::layer::{self, CompiledKernels, LayerWeights, LayerGrads, BackwardWorkspace, ForwardCache};
+use engine::layer::{
+    self, BackwardWorkspace, CompiledKernels, ForwardCache, LayerGrads, LayerWeights,
+};
 use engine::model::ModelConfig;
 
 fn assert_exact(a: &[f32], b: &[f32], label: &str) {
-    assert_eq!(a.len(), b.len(), "{label}: length mismatch ({} vs {})", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{label}: length mismatch ({} vs {})",
+        a.len(),
+        b.len()
+    );
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert_eq!(
-            x.to_bits(), y.to_bits(),
+            x.to_bits(),
+            y.to_bits(),
             "{label}[{i}]: backward={x} vs backward_into={y} (not bit-identical)"
         );
     }
@@ -46,7 +55,9 @@ fn fuse_qbwd_kvbwd_backward_matches_reference() {
 
     // Fixed deterministic input (channel-first [dim, seq])
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     // Forward to get cache
     let mut cache = ForwardCache::new(&cfg);
@@ -54,18 +65,37 @@ fn fuse_qbwd_kvbwd_backward_matches_reference() {
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
     // Gradient signal from next layer
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
 
     // ── Reference: backward (sequential path) ──
     let mut grads_ref = LayerGrads::zeros(&cfg);
     let mut ws_ref = BackwardWorkspace::new(&cfg);
-    let dx_ref = layer::backward(&cfg, &kernels, &weights, &cache, &dy, &mut grads_ref, &mut ws_ref);
+    let dx_ref = layer::backward(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_ref,
+        &mut ws_ref,
+    );
 
     // ── Optimized: backward_into (fused qBwd+kvBwd overlap) ──
     let mut grads_opt = LayerGrads::zeros(&cfg);
     let mut ws_opt = BackwardWorkspace::new(&cfg);
     let mut dx_opt = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads_opt, &mut ws_opt, &mut dx_opt);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads_opt,
+        &mut ws_opt,
+        &mut dx_opt,
+    );
 
     // Compare dx
     assert_exact(&dx_ref, &dx_opt, "dx");
@@ -94,24 +124,46 @@ fn fuse_qbwd_kvbwd_idempotent() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
-    let dy: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
+    let dy: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
 
     // Call 1
     let mut grads1 = LayerGrads::zeros(&cfg);
     let mut ws = BackwardWorkspace::new(&cfg);
     let mut dx1 = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads1, &mut ws, &mut dx1);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads1,
+        &mut ws,
+        &mut dx1,
+    );
 
     // Call 2 (reusing workspace — tests buffer reuse safety)
     let mut grads2 = LayerGrads::zeros(&cfg);
     let mut dx2 = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy, &mut grads2, &mut ws, &mut dx2);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy,
+        &mut grads2,
+        &mut ws,
+        &mut dx2,
+    );
 
     assert_exact(&dx1, &dx2, "dx_idempotent");
     assert_exact(&grads1.dwq, &grads2.dwq, "dwq_idempotent");
@@ -130,28 +182,57 @@ fn fuse_qbwd_kvbwd_different_inputs() {
     let weights = LayerWeights::random(&cfg);
 
     let n_in = cfg.dim * cfg.seq;
-    let x: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.001) - 0.5) * 0.1).collect();
+    let x: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.001) - 0.5) * 0.1)
+        .collect();
 
     let mut cache = ForwardCache::new(&cfg);
     let mut x_next = vec![0.0f32; cfg.dim * cfg.seq];
     layer::forward_into(&cfg, &kernels, &weights, &x, &mut cache, &mut x_next);
 
     // Two different gradient signals
-    let dy_a: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.003) - 0.5) * 0.01).collect();
-    let dy_b: Vec<f32> = (0..n_in).map(|i| ((i as f32 * 0.007) + 0.3) * 0.01).collect();
+    let dy_a: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.003) - 0.5) * 0.01)
+        .collect();
+    let dy_b: Vec<f32> = (0..n_in)
+        .map(|i| ((i as f32 * 0.007) + 0.3) * 0.01)
+        .collect();
 
     let mut grads_a = LayerGrads::zeros(&cfg);
     let mut ws = BackwardWorkspace::new(&cfg);
     let mut dx_a = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy_a, &mut grads_a, &mut ws, &mut dx_a);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy_a,
+        &mut grads_a,
+        &mut ws,
+        &mut dx_a,
+    );
 
     let mut grads_b = LayerGrads::zeros(&cfg);
     let mut dx_b = vec![0.0f32; cfg.dim * cfg.seq];
-    layer::backward_into(&cfg, &kernels, &weights, &cache, &dy_b, &mut grads_b, &mut ws, &mut dx_b);
+    layer::backward_into(
+        &cfg,
+        &kernels,
+        &weights,
+        &cache,
+        &dy_b,
+        &mut grads_b,
+        &mut ws,
+        &mut dx_b,
+    );
 
     // dx values should differ
-    let differ = dx_a.iter().zip(dx_b.iter()).any(|(a, b)| a.to_bits() != b.to_bits());
+    let differ = dx_a
+        .iter()
+        .zip(dx_b.iter())
+        .any(|(a, b)| a.to_bits() != b.to_bits());
     assert!(differ, "Different inputs should produce different dx");
 
-    println!("PASS: different inputs produce different outputs (optimization isn't ignoring inputs)");
+    println!(
+        "PASS: different inputs produce different outputs (optimization isn't ignoring inputs)"
+    );
 }

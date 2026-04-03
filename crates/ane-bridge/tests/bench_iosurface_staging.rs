@@ -81,7 +81,10 @@ fn iosurface_staging_bandwidth() {
 
     // ── 3. Channel-interleaved weight-only write ───────────────────
     println!("--- Weight-Only Staging (channel-interleaved) ---");
-    println!("{:<45} {:>10} {:>10} {:>10}", "Config (IC×OC)", "µs", "Weight MB", "GB/s");
+    println!(
+        "{:<45} {:>10} {:>10} {:>10}",
+        "Config (IC×OC)", "µs", "Weight MB", "GB/s"
+    );
     println!("{}", "-".repeat(80));
 
     let staging_configs = [
@@ -135,7 +138,10 @@ fn iosurface_staging_bandwidth() {
     println!("=== Summary ===");
     println!("FFN weight staging (768×3072): {ffn_staging_us:.1} µs");
     println!("ANE conv1x1 compute (768→3072): ~330 µs (from bench_ane_tflops)");
-    println!("Staging as % of compute: {:.1}%", ffn_staging_us / 330.0 * 100.0);
+    println!(
+        "Staging as % of compute: {:.1}%",
+        ffn_staging_us / 330.0 * 100.0
+    );
     println!("M4 Max memory bandwidth: 546 GB/s");
     println!();
 }

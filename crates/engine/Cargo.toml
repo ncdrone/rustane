@@ -9,10 +9,13 @@ metal-decode = { path = "../metal-decode" }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-metal = { workspace = true }
+objc2-metal-performance-shaders = { workspace = true }
 memmap2 = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tokenizers = "0.22"
 
 [dev-dependencies]
 objc2-foundation = { workspace = true }
+half = { workspace = true }
